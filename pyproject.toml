@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentic-os"
+version = "0.1.0"
+description = "Week 4 OpenClaw-first backend for durable task, approval, execution, artifact, and audit operations"
+requires-python = ">=3.9"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
