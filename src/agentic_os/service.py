@@ -9,17 +9,31 @@ from uuid import uuid4
 from .artifacts import ArtifactRecord, ArtifactStore
 from .adapters import execute_custom_adapter
 from .audit import AuditLog
-from .config import Paths, load_policy_rules
+from .config import AppConfig, Paths, load_app_config, load_policy_rules
+from .daily_routine import (
+    DailyRoutineInput,
+    FollowUpAction,
+    YesterdayRecap,
+    build_daily_recap,
+    extract_follow_up_actions,
+    infer_domain,
+    prepare_email_payload,
+    render_plaintext_email,
+    summarize_task_for_yesterday,
+)
 from .models import ACTION_SOURCES, ApprovalRecord, OperatorError, RequestClassification, TaskRecord, validate_choice
+from .notion import NotionAdapter, NotionTask
 from .storage import Database
 
 
 class AgenticOSService:
-    def __init__(self, paths: Paths) -> None:
+    def __init__(self, paths: Paths, config: Optional[AppConfig] = None) -> None:
         self.paths = paths
+        self.config = config or load_app_config(paths)
         self.db = Database(paths.db_path)
         self.audit = AuditLog(paths.audit_log_path)
         self.artifacts = ArtifactStore(paths.artifacts_dir)
+        self._notion_adapter: Optional[NotionAdapter] = None
 
     def initialize(self) -> None:
         self.db.initialize()
@@ -480,6 +494,111 @@ class AgenticOSService:
             "items": items[:limit],
         }
 
+    def run_daily_routine(
+        self,
+        *,
+        payload: dict[str, Any],
+        create_notion_tasks: bool = True,
+    ) -> dict[str, Any]:
+        routine_input = DailyRoutineInput.from_dict(payload)
+        classification = RequestClassification(
+            domain="system",
+            intent_type="recap",
+            risk_level="low",
+        ).validate()
+        request_payload = self.create_request(
+            user_request=f"Generate daily routine recap for {routine_input.date}",
+            classification=classification,
+            target="daily_routine",
+            request_metadata={
+                "date": routine_input.date,
+                "timezone": routine_input.timezone,
+                "recipient": routine_input.recipient,
+                "delivery_time": routine_input.delivery_time,
+            },
+            action_source="custom_adapter",
+        )
+        task = request_payload["task"]
+
+        yesterday = self._build_yesterday_recap(routine_input.date)
+        recap = build_daily_recap(routine_input, yesterday)
+        email_body = render_plaintext_email(recap)
+        email_payload = prepare_email_payload(recap, email_body)
+        artifact = self._create_artifact(
+            task_id=task.id,
+            artifact_type="daily_routine_recap",
+            artifact_content={
+                "input": payload,
+                "recap": recap.to_dict(),
+                "email_payload": email_payload,
+            },
+            event_type="daily_routine_recap_created",
+        )
+        task = self.db.update_task(
+            task.id,
+            artifact_ref=artifact.id,
+            result_summary=f"Generated daily recap for {routine_input.date}.",
+            status="completed",
+        )
+        self._append_event(
+            task_id=task.id,
+            event_type="daily_routine_email_prepared",
+            payload=email_payload,
+        )
+
+        created_followups = []
+        created_notion_tasks = []
+        skipped_followups = []
+        for action in extract_follow_up_actions(routine_input):
+            existing = self.db.get_task_by_operation_key(action.operation_key)
+            if existing is not None:
+                skipped_followups.append(
+                    {
+                        "operation_key": action.operation_key,
+                        "reason": f"existing task {existing.id}",
+                    }
+                )
+                continue
+            followup = self._create_daily_followup_task(action=action, parent_task_id=task.id)
+            created_followups.append({"task": asdict(followup), "action": self._serialize_follow_up_action(action)})
+            if create_notion_tasks and action.notion_title is not None:
+                notion_result = self._create_daily_followup_notion_task(
+                    action=action,
+                    parent_task_id=task.id,
+                    backend_task_id=followup.id,
+                )
+                if notion_result is not None:
+                    created_notion_tasks.append(notion_result)
+
+        summary = (
+            f"Generated daily recap for {routine_input.date} with "
+            f"{len(created_followups)} follow-up task(s)."
+        )
+        task = self.db.update_task(task.id, result_summary=summary, status="completed")
+        self._append_event(
+            task_id=task.id,
+            event_type="daily_routine_followups_created",
+            payload={
+                "follow_up_count": len(created_followups),
+                "notion_task_count": len(created_notion_tasks),
+                "skipped_follow_up_count": len(skipped_followups),
+            },
+        )
+        self._append_event(
+            task_id=task.id,
+            event_type="task_completed",
+            payload={"result_summary": summary},
+        )
+        return {
+            "task": task,
+            "recap": recap.to_dict(),
+            "email_payload": email_payload,
+            "email_body": email_body,
+            "created_followups": created_followups,
+            "created_notion_tasks": created_notion_tasks,
+            "skipped_followups": skipped_followups,
+        }
+
     def revise_artifact(
         self,
         task_id: str,
@@ -731,6 +850,356 @@ class AgenticOSService:
     def execute_custom_adapter_action(self, *, adapter_name: str, action_name: str) -> None:
         execute_custom_adapter(adapter_name=adapter_name, action_name=action_name)
 
+    def create_notion_task(
+        self,
+        *,
+        user_request: str,
+        classification: RequestClassification,
+        title: str,
+        status: Optional[str] = None,
+        task_type: Optional[str] = None,
+        area: Optional[str] = None,
+        target: str = "notion_task",
+        request_metadata: Optional[dict[str, Any]] = None,
+        operation_key: Optional[str] = None,
+    ) -> dict[str, Any]:
+        payload = self.create_request(
+            user_request=user_request,
+            classification=classification,
+            target=target,
+            request_metadata=request_metadata,
+            external_write=True,
+            operation_key=operation_key,
+            action_source="custom_adapter",
+        )
+        task = payload["task"]
+        adapter = self._require_notion_adapter()
+        adapter_payload = {
+            "adapter_name": "notion",
+            "action_name": "create_task",
+            "database_id": self.config.notion.database_id if self.config.notion else None,
+            "title": title,
+            "status": status,
+            "task_type": task_type,
+            "area": area or classification.domain,
+            "backend_task_id": task.id,
+            "operation_key": operation_key,
+        }
+        self._append_event(task_id=task.id, event_type="adapter_called", payload=adapter_payload)
+        try:
+            notion_task = adapter.create_task(
+                title=title,
+                status=status,
+                task_type=task_type,
+                area=area or classification.domain,
+                backend_task_id=task.id,
+                operation_key=operation_key,
+                last_agent_update=f"Created by agentic-os task {task.id}",
+            )
+        except Exception as exc:
+            return self._fail_adapter_task(task, adapter_payload, exc)
+        task = self.db.update_task(
+            task.id,
+            external_ref=notion_task.page_id,
+            result_summary=f"Created Notion task {notion_task.page_id}.",
+            status="completed",
+            external_write=True,
+        )
+        self._append_event(
+            task_id=task.id,
+            event_type="adapter_result",
+            payload={**adapter_payload, "page": self._serialize_notion_task(notion_task)},
+        )
+        self._append_event(
+            task_id=task.id,
+            event_type="task_completed",
+            payload={"result_summary": task.result_summary},
+        )
+        return {"task": task, "notion_task": self._serialize_notion_task(notion_task)}
+
+    def query_notion_tasks(
+        self,
+        *,
+        user_request: str,
+        classification: RequestClassification,
+        status: Optional[str] = None,
+        updated_since: Optional[str] = None,
+        limit: int = 20,
+        target: str = "notion_task_query",
+        request_metadata: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        payload = self.create_request(
+            user_request=user_request,
+            classification=classification,
+            target=target,
+            request_metadata=request_metadata,
+            external_write=False,
+            action_source="custom_adapter",
+        )
+        task = payload["task"]
+        adapter = self._require_notion_adapter()
+        adapter_payload = {
+            "adapter_name": "notion",
+            "action_name": "query_tasks",
+            "status": status,
+            "updated_since": updated_since,
+            "limit": limit,
+        }
+        self._append_event(task_id=task.id, event_type="adapter_called", payload=adapter_payload)
+        try:
+            notion_tasks = adapter.query_tasks(status=status, updated_since=updated_since, limit=limit)
+        except Exception as exc:
+            return self._fail_adapter_task(task, adapter_payload, exc)
+        summary = f"Queried {len(notion_tasks)} Notion task(s)."
+        task = self.db.update_task(task.id, result_summary=summary, status="completed")
+        self._append_event(
+            task_id=task.id,
+            event_type="adapter_result",
+            payload={
+                **adapter_payload,
+                "items": [self._serialize_notion_task(item) for item in notion_tasks],
+            },
+        )
+        self._append_event(task_id=task.id, event_type="task_completed", payload={"result_summary": summary})
+        return {
+            "task": task,
+            "items": [self._serialize_notion_task(item) for item in notion_tasks],
+        }
+
+    def sync_notion_tasks(
+        self,
+        *,
+        user_request: str,
+        classification: RequestClassification,
+        statuses: Optional[list[str]] = None,
+        updated_since: Optional[str] = None,
+        limit: int = 50,
+        target: str = "notion_task_sync",
+        request_metadata: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        status_filters = self._resolve_notion_sync_statuses(statuses)
+        payload = self.create_request(
+            user_request=user_request,
+            classification=classification,
+            target=target,
+            request_metadata=request_metadata,
+            external_write=False,
+            action_source="custom_adapter",
+        )
+        task = payload["task"]
+        adapter = self._require_notion_adapter()
+        adapter_payload = {
+            "adapter_name": "notion",
+            "action_name": "sync_tasks",
+            "statuses": status_filters,
+            "updated_since": updated_since,
+            "limit_per_status": limit,
+        }
+        self._append_event(task_id=task.id, event_type="adapter_called", payload=adapter_payload)
+        try:
+            notion_by_page_id: dict[str, NotionTask] = {}
+            for status in status_filters:
+                for notion_task in adapter.query_tasks(
+                    status=status,
+                    updated_since=updated_since,
+                    limit=limit,
+                ):
+                    notion_by_page_id[notion_task.page_id] = notion_task
+        except Exception as exc:
+            return self._fail_adapter_task(task, adapter_payload, exc)
+
+        imported: list[dict[str, Any]] = []
+        existing: list[dict[str, Any]] = []
+        for notion_task in notion_by_page_id.values():
+            existing_task = self.db.get_task_by_external_ref(notion_task.page_id)
+            if existing_task is not None:
+                existing.append(
+                    {
+                        "task": asdict(existing_task),
+                        "notion_task": self._serialize_notion_task(notion_task),
+                        "match": "external_ref",
+                    }
+                )
+                continue
+
+            if notion_task.operation_key:
+                operation_key_task = self.db.get_task_by_operation_key(notion_task.operation_key)
+                if operation_key_task is not None:
+                    if operation_key_task.external_ref != notion_task.page_id:
+                        operation_key_task = self.db.update_task(
+                            operation_key_task.id,
+                            external_ref=notion_task.page_id,
+                        )
+                    existing.append(
+                        {
+                            "task": asdict(operation_key_task),
+                            "notion_task": self._serialize_notion_task(notion_task),
+                            "match": "operation_key",
+                        }
+                    )
+                    continue
+
+            synced_task = self._create_synced_notion_capture_task(
+                notion_task=notion_task,
+                parent_task_id=task.id,
+            )
+            imported.append(
+                {
+                    "task": asdict(synced_task),
+                    "notion_task": self._serialize_notion_task(notion_task),
+                }
+            )
+
+        summary = (
+            f"Synced {len(notion_by_page_id)} Notion task(s): "
+            f"{len(imported)} imported, {len(existing)} already linked."
+        )
+        task = self.db.update_task(task.id, result_summary=summary, status="completed")
+        self._append_event(
+            task_id=task.id,
+            event_type="adapter_result",
+            payload={
+                **adapter_payload,
+                "queried_count": len(notion_by_page_id),
+                "imported_count": len(imported),
+                "existing_count": len(existing),
+                "imported_task_ids": [item["task"]["id"] for item in imported],
+                "existing_task_ids": [item["task"]["id"] for item in existing],
+            },
+        )
+        self._append_event(task_id=task.id, event_type="task_completed", payload={"result_summary": summary})
+        return {
+            "task": task,
+            "statuses": status_filters,
+            "updated_since": updated_since,
+            "limit_per_status": limit,
+            "queried_count": len(notion_by_page_id),
+            "imported_count": len(imported),
+            "existing_count": len(existing),
+            "imported": imported,
+            "existing": existing,
+        }
+
+    def get_notion_task(
+        self,
+        *,
+        user_request: str,
+        classification: RequestClassification,
+        page_id: str,
+        target: str = "notion_task_detail",
+        request_metadata: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        payload = self.create_request(
+            user_request=user_request,
+            classification=classification,
+            target=target,
+            request_metadata=request_metadata,
+            external_write=False,
+            action_source="custom_adapter",
+        )
+        task = payload["task"]
+        adapter = self._require_notion_adapter()
+        adapter_payload = {
+            "adapter_name": "notion",
+            "action_name": "get_task",
+            "page_id": page_id,
+        }
+        self._append_event(task_id=task.id, event_type="adapter_called", payload=adapter_payload)
+        try:
+            notion_task = adapter.get_task(page_id)
+        except Exception as exc:
+            return self._fail_adapter_task(task, adapter_payload, exc)
+        summary = f"Fetched Notion task {page_id}."
+        task = self.db.update_task(task.id, result_summary=summary, status="completed", external_ref=page_id)
+        self._append_event(
+            task_id=task.id,
+            event_type="adapter_result",
+            payload={**adapter_payload, "page": self._serialize_notion_task(notion_task)},
+        )
+        self._append_event(task_id=task.id, event_type="task_completed", payload={"result_summary": summary})
+        return {"task": task, "notion_task": self._serialize_notion_task(notion_task)}
+
+    def update_notion_task_status(
+        self,
+        *,
+        task_id: str,
+        notion_page_id: Optional[str] = None,
+        backend_status: str,
+        note: Optional[str] = None,
+        target: str = "notion_task_status",
+    ) -> dict[str, Any]:
+        task = self.db.get_task(task_id)
+        adapter = self._require_notion_adapter()
+        page_id = notion_page_id or task.external_ref
+        if not page_id:
+            raise ValueError(f"task {task_id} has no Notion external_ref and no page id was provided")
+        notion_status = self._map_backend_status_to_notion(backend_status)
+        adapter_payload = {
+            "adapter_name": "notion",
+            "action_name": "update_task_status",
+            "page_id": page_id,
+            "backend_status": backend_status,
+            "notion_status": notion_status,
+        }
+        self._append_event(task_id=task.id, event_type="adapter_called", payload=adapter_payload)
+        try:
+            notion_task = adapter.update_task_status(
+                page_id=page_id,
+                status=notion_status,
+                last_agent_update=note or f"Backend task {task.id} moved to {backend_status}.",
+            )
+        except Exception as exc:
+            return self._fail_adapter_task(task, adapter_payload, exc)
+        self._append_event(
+            task_id=task.id,
+            event_type="adapter_result",
+            payload={**adapter_payload, "page": self._serialize_notion_task(notion_task)},
+        )
+        return {"task": task, "notion_task": self._serialize_notion_task(notion_task)}
+
+    def append_notion_task_note(
+        self,
+        *,
+        task_id: str,
+        note: str,
+        notion_page_id: Optional[str] = None,
+        target: str = "notion_task_note",
+    ) -> dict[str, Any]:
+        task = self.db.get_task(task_id)
+        adapter = self._require_notion_adapter()
+        page_id = notion_page_id or task.external_ref
+        if not page_id:
+            raise ValueError(f"task {task_id} has no Notion external_ref and no page id was provided")
+        adapter_payload = {
+            "adapter_name": "notion",
+            "action_name": "append_note",
+            "page_id": page_id,
+            "target": target,
+        }
+        self._append_event(task_id=task.id, event_type="adapter_called", payload=adapter_payload)
+        try:
+            append_result = adapter.append_note(page_id=page_id, note=note)
+            notion_task = adapter.update_task_properties(
+                page_id=page_id,
+                last_agent_update=note[:500],
+            )
+        except Exception as exc:
+            return self._fail_adapter_task(task, adapter_payload, exc)
+        self._append_event(
+            task_id=task.id,
+            event_type="adapter_result",
+            payload={
+                **adapter_payload,
+                "append_result": append_result,
+                "page": self._serialize_notion_task(notion_task),
+            },
+        )
+        return {
+            "task": task,
+            "append_result": append_result,
+            "notion_task": self._serialize_notion_task(notion_task),
+        }
+
     def complete_task(self, task_id: str, result_summary: str) -> TaskRecord:
         task = self.db.get_task(task_id)
         if task.status in {"completed", "cancelled"}:
@@ -944,6 +1413,209 @@ class AgenticOSService:
         )
         raise OperatorError(code=code, message=message, details={"task_id": task_id, "operation": operation, **details})
 
+    def _build_yesterday_recap(self, run_date: str) -> YesterdayRecap:
+        tasks = self.list_tasks(limit=500)
+        yesterday = self._date_offset(run_date, days=-1)
+        completed = [
+            summarize_task_for_yesterday(task.user_request, task.result_summary)
+            for task in tasks
+            if task.updated_at[:10] == yesterday and task.status == "completed"
+        ][:5]
+        blocked = [
+            summarize_task_for_yesterday(task.user_request, task.result_summary)
+            for task in tasks
+            if task.updated_at[:10] == yesterday and task.status in {"failed", "awaiting_input", "awaiting_approval"}
+        ][:5]
+        still_open = [
+            summarize_task_for_yesterday(task.user_request, task.result_summary)
+            for task in tasks
+            if task.status in {"new", "in_progress", "awaiting_input", "awaiting_approval", "approved", "executed"}
+            and task.created_at[:10] <= yesterday
+        ][:5]
+        return YesterdayRecap(completed=completed, blocked=blocked, still_open=still_open)
+
+    @staticmethod
+    def _date_offset(run_date: str, *, days: int) -> str:
+        return (datetime.fromisoformat(run_date).date()).fromordinal(
+            datetime.fromisoformat(run_date).date().toordinal() + days
+        ).isoformat()
+
+    def _create_daily_followup_task(self, *, action: FollowUpAction, parent_task_id: str) -> TaskRecord:
+        payload = self.create_request(
+            user_request=action.title,
+            classification=RequestClassification(
+                domain=action.domain,
+                intent_type="capture",
+                risk_level="low",
+            ).validate(),
+            target="daily_routine_followup",
+            request_metadata={
+                "source": "daily_routine",
+                "parent_task_id": parent_task_id,
+                "source_kind": action.source_kind,
+                "source_title": action.source_title,
+                "rationale": action.rationale,
+            },
+            external_write=False,
+            operation_key=action.operation_key,
+            result_summary=action.summary,
+            action_source="custom_adapter",
+        )
+        task = self.db.update_task(payload["task"].id, status="completed", result_summary=action.summary)
+        self._append_event(
+            task_id=task.id,
+            event_type="daily_routine_followup_created",
+            payload=self._serialize_follow_up_action(action),
+        )
+        self._append_event(
+            task_id=task.id,
+            event_type="task_completed",
+            payload={"result_summary": action.summary},
+        )
+        return task
+
+    def _create_daily_followup_notion_task(
+        self,
+        *,
+        action: FollowUpAction,
+        parent_task_id: str,
+        backend_task_id: str,
+    ) -> Optional[dict[str, Any]]:
+        if self.config.notion is None:
+            return None
+        notion_operation_key = f"{action.operation_key}-notion"
+        existing = self.db.get_task_by_operation_key(notion_operation_key)
+        if existing is not None:
+            return {
+                "task": asdict(existing),
+                "skipped": True,
+                "reason": "existing Notion task operation_key",
+            }
+        try:
+            result = self.create_notion_task(
+                user_request=f"Create Notion follow-up for {action.title}",
+                classification=RequestClassification(
+                    domain=infer_domain(action.source_kind, area=action.domain),
+                    intent_type="capture",
+                    risk_level="low",
+                ).validate(),
+                title=action.notion_title or action.title,
+                status="Inbox",
+                task_type="task",
+                area=action.domain,
+                target="notion_task",
+                request_metadata={
+                    "source": "daily_routine",
+                    "parent_task_id": parent_task_id,
+                    "backend_followup_task_id": backend_task_id,
+                    "source_kind": action.source_kind,
+                    "source_title": action.source_title,
+                },
+                operation_key=notion_operation_key,
+            )
+        except Exception as exc:
+            return {
+                "skipped": True,
+                "reason": str(exc),
+                "operation_key": notion_operation_key,
+            }
+        return {
+            "task": asdict(result["task"]),
+            "notion_task": result["notion_task"],
+            "skipped": False,
+        }
+
+    @staticmethod
+    def _resolve_notion_sync_statuses(statuses: Optional[list[str]]) -> list[str]:
+        if not statuses:
+            return ["Inbox"]
+        resolved: list[str] = []
+        seen: set[str] = set()
+        for status in statuses:
+            value = str(status).strip()
+            if not value:
+                continue
+            normalized = value.lower()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            resolved.append(value)
+        return resolved or ["Inbox"]
+
+    def _create_synced_notion_capture_task(
+        self,
+        *,
+        notion_task: NotionTask,
+        parent_task_id: str,
+    ) -> TaskRecord:
+        inferred_domain = self._infer_domain_from_notion_area(notion_task.area)
+        summary = (
+            f"Imported Notion task '{notion_task.title}' "
+            f"(status={notion_task.status or 'unknown'})."
+        )
+        payload = self.create_request(
+            user_request=notion_task.title or f"Synced Notion task {notion_task.page_id}",
+            classification=RequestClassification(
+                domain=inferred_domain,
+                intent_type="capture",
+                risk_level="low",
+            ).validate(),
+            target="notion_task_sync_item",
+            request_metadata={
+                "source": "notion_sync",
+                "parent_task_id": parent_task_id,
+                "notion_page_id": notion_task.page_id,
+                "notion_status": notion_task.status,
+                "notion_url": notion_task.url,
+                "notion_last_edited_time": notion_task.last_edited_time,
+            },
+            external_ref=notion_task.page_id,
+            operation_key=notion_task.operation_key,
+            result_summary=summary,
+            action_source="custom_adapter",
+        )
+        task = self.db.update_task(
+            payload["task"].id,
+            status="completed",
+            result_summary=summary,
+            external_ref=notion_task.page_id,
+        )
+        self._append_event(
+            task_id=task.id,
+            event_type="notion_sync_imported",
+            payload={
+                "parent_task_id": parent_task_id,
+                "notion_page_id": notion_task.page_id,
+                "notion_status": notion_task.status,
+                "notion_last_edited_time": notion_task.last_edited_time,
+            },
+        )
+        self._append_event(task_id=task.id, event_type="task_completed", payload={"result_summary": summary})
+        return task
+
+    @staticmethod
+    def _infer_domain_from_notion_area(area: Optional[str]) -> str:
+        if area is None:
+            return "technical"
+        normalized = area.strip().lower()
+        for domain in ("personal", "technical", "finance", "system"):
+            if domain in normalized:
+                return domain
+        return "technical"
+
+    @staticmethod
+    def _serialize_follow_up_action(action: FollowUpAction) -> dict[str, Any]:
+        return {
+            "title": action.title,
+            "summary": action.summary,
+            "domain": action.domain,
+            "source_kind": action.source_kind,
+            "source_title": action.source_title,
+            "operation_key": action.operation_key,
+            "notion_title": action.notion_title,
+            "rationale": action.rationale,
+        }
+
     @staticmethod
     def _task_snapshot(task: TaskRecord) -> dict[str, Any]:
         return {
@@ -977,6 +1649,51 @@ class AgenticOSService:
             group["total"] += 1
             group[task.status] = group.get(task.status, 0) + 1
         return groups
+
+    def _require_notion_adapter(self) -> NotionAdapter:
+        if self.config.notion is None:
+            raise ValueError(
+                f"Notion is not configured. Add {self.paths.config_path} with a notion block first."
+            )
+        if self._notion_adapter is None:
+            self._notion_adapter = NotionAdapter(self.config.notion)
+        return self._notion_adapter
+
+    def _fail_adapter_task(
+        self,
+        task: TaskRecord,
+        adapter_payload: dict[str, Any],
+        exc: Exception,
+    ) -> dict[str, Any]:
+        task = self.db.update_task(task.id, status="failed", result_summary=str(exc))
+        self._append_event(
+            task_id=task.id,
+            event_type="adapter_failed",
+            payload={**adapter_payload, "error": str(exc), "error_type": type(exc).__name__},
+        )
+        self._append_event(task_id=task.id, event_type="task_failed", payload={"reason": str(exc)})
+        raise exc
+
+    def _map_backend_status_to_notion(self, backend_status: str) -> str:
+        if backend_status not in self.config.notion.status_map:
+            raise ValueError(f"no Notion status mapping configured for backend status {backend_status}")
+        return self.config.notion.status_map[backend_status]
+
+    @staticmethod
+    def _serialize_notion_task(task: NotionTask) -> dict[str, Any]:
+        return {
+            "page_id": task.page_id,
+            "url": task.url,
+            "title": task.title,
+            "status": task.status,
+            "task_type": task.task_type,
+            "area": task.area,
+            "backend_task_id": task.backend_task_id,
+            "operation_key": task.operation_key,
+            "last_agent_update": task.last_agent_update,
+            "last_edited_time": task.last_edited_time,
+            "archived": task.archived,
+        }
 
     @staticmethod
     def _today_utc_date() -> str:

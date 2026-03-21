@@ -71,3 +71,27 @@ Cron target command:
 ```bash
 cd /Users/dara/.openclaw/workspace/agentic-os && python3 scripts/openclaw_daily_routine_bridge.py --input-file /tmp/openclaw_daily_payload.json
 ```
+
+## Notion intake sync (OpenClaw heartbeat/cron)
+
+To mirror manually created Notion tasks into durable backend state:
+
+```bash
+cd /Users/dara/.openclaw/workspace/agentic-os && \
+PYTHONPATH=src python3 -m agentic_os.cli notion sync-tasks \
+  --status Inbox \
+  --status Review \
+  --limit 50
+```
+
+Wrapper equivalent:
+
+```bash
+python3 /Users/dara/.openclaw/workspace/agentic-os/scripts/openclaw_notion_sync_bridge.py --status Inbox --status Review --limit 50
+```
+
+Optional recency filter:
+
+```bash
+--updated-since 2026-03-21T00:00:00Z
+```

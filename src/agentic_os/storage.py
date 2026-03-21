@@ -325,11 +325,29 @@ class Database:
             return None
         return tasks[0]
 
+    def get_task_by_external_ref(self, external_ref: str) -> Optional[TaskRecord]:
+        tasks = self.list_tasks_by_external_ref(external_ref)
+        if not tasks:
+            return None
+        return tasks[0]
+
     def list_tasks_by_operation_key(self, operation_key: str) -> list[TaskRecord]:
         with self.connect() as connection:
             rows = connection.execute(
                 "SELECT * FROM tasks WHERE operation_key = ?",
                 (operation_key,),
+            ).fetchall()
+        return [self._row_to_task(row) for row in rows]
+
+    def list_tasks_by_external_ref(self, external_ref: str) -> list[TaskRecord]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM tasks
+                WHERE external_ref = ?
+                ORDER BY created_at DESC, id DESC
+                """,
+                (external_ref,),
             ).fetchall()
         return [self._row_to_task(row) for row in rows]
 
