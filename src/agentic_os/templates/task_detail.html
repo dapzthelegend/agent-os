@@ -1,0 +1,136 @@
+{% extends "base.html" %}
+{% block title %}{{ task.id }} · agentic-os{% endblock %}
+{% block content %}
+<section class="section">
+  <div class="section-header">
+    <h1>{{ task.id }}</h1>
+    <p>{{ task.user_request }}</p>
+  </div>
+
+  <div class="grid two-up">
+    <article class="card">
+      <h2>Task metadata</h2>
+      <dl class="meta">
+        <dt>Status</dt><dd><span class="badge {{ task.status|status_tone }}">{{ task.status }}</span></dd>
+        <dt>Approval</dt><dd><span class="badge {{ task.approval_state|status_tone }}">{{ task.approval_state }}</span></dd>
+        <dt>Domain</dt><dd>{{ task.domain }}</dd>
+        <dt>Intent</dt><dd>{{ task.intent_type }}</dd>
+        <dt>Target</dt><dd>{{ task.target or "—" }}</dd>
+        <dt>Risk</dt><dd><span class="badge {{ task.risk_level|risk_tone }}">{{ task.risk_level }}</span></dd>
+        <dt>Action source</dt><dd><span class="badge accent">{{ task.action_source }}</span></dd>
+        <dt>Policy</dt><dd>{{ task.policy_decision or "—" }}</dd>
+        <dt>Operation key</dt><dd>{{ task.operation_key or "—" }}</dd>
+        <dt>Created</dt><dd>{{ task.created_at }}</dd>
+        <dt>Updated</dt><dd>{{ task.updated_at }}</dd>
+      </dl>
+      {% if task.result_summary %}
+      <h3>Result summary</h3>
+      <p>{{ task.result_summary }}</p>
+      {% endif %}
+      {% if request_metadata_pretty %}
+      <h3>Request metadata</h3>
+      <pre>{{ request_metadata_pretty }}</pre>
+      {% endif %}
+    </article>
+
+    <article class="card">
+      <h2>Related records</h2>
+      <ul class="list">
+        <li>Artifacts: {{ summary.artifact_count }}</li>
+        <li>Approvals: {{ summary.approval_count }}</li>
+        <li>Audit events: {{ summary.audit_event_count }}</li>
+        <li>
+          Execution:
+          {% if execution %}
+          <a href="/executions/{{ execution.operation_key }}">{{ execution.operation_key }}</a>
+          {% elif task.operation_key %}
+          <a href="/executions/{{ task.operation_key }}">{{ task.operation_key }}</a>
+          {% else %}
+          none
+          {% endif %}
+        </li>
+      </ul>
+
+      {% if operation_key_task_conflicts %}
+      <div class="banner banner-danger">
+        Operation key also appears on {{ operation_key_task_conflicts|length }} other task(s):
+        {{ operation_key_task_conflicts|join(", ") }}
+      </div>
+      {% endif %}
+
+      <h3>Approvals</h3>
+      <ul class="list">
+        {% for approval in approvals %}
+        <li>
+          <a href="/approvals/{{ approval.id }}">{{ approval.id }}</a>
+          <span class="badge {{ approval.status|status_tone }}">{{ approval.status }}</span>
+        </li>
+        {% else %}
+        <li class="muted">No approvals linked.</li>
+        {% endfor %}
+      </ul>
+    </article>
+  </div>
+
+  <div class="grid two-up">
+    <article class="card">
+      <div class="card-heading">
+        <h2>Artifacts</h2>
+        {% if selected_artifact %}
+        <span>Viewing {{ selected_artifact.id }} v{{ selected_artifact.version }}</span>
+        {% endif %}
+      </div>
+      <ul class="list">
+        {% for artifact in artifacts %}
+        <li>
+          <a href="/tasks/{{ task.id }}?artifact_id={{ artifact.id }}">{{ artifact.id }}</a>
+          <span>v{{ artifact.version }}</span>
+          <span>{{ artifact.artifact_type }}</span>
+          <span>{{ artifact.created_at }}</span>
+        </li>
+        {% else %}
+        <li class="muted">No artifacts.</li>
+        {% endfor %}
+      </ul>
+
+      {% if selected_artifact_content %}
+      <pre>{{ selected_artifact_content }}</pre>
+      {% endif %}
+    </article>
+
+    <article class="card">
+      <h2>Revise artifact</h2>
+      <form method="post" action="/tasks/{{ task.id }}/artifacts/revise" class="stack">
+        <label>
+          <span>Artifact type override</span>
+          <input type="text" name="artifact_type" placeholder="Leave blank to reuse current type">
+        </label>
+        <label>
+          <span>Artifact text</span>
+          <textarea name="artifact_text" rows="10" placeholder="Plain text revision"></textarea>
+        </label>
+        <label>
+          <span>Artifact JSON</span>
+          <textarea name="artifact_json" rows="10" placeholder='{"key":"value"}'></textarea>
+        </label>
+        <button type="submit">Create revision</button>
+      </form>
+    </article>
+  </div>
+
+  <article class="card">
+    <h2>Audit timeline</h2>
+    <ul class="timeline">
+      {% for event in audit_events|reverse %}
+      <li class="{% if event.is_important %}important{% endif %}">
+        <div class="timeline-head">
+          <span class="badge {{ event.event_type|event_tone }}">{{ event.event_type }}</span>
+          <span>{{ event.created_at }}</span>
+        </div>
+        <pre>{{ event.payload_pretty }}</pre>
+      </li>
+      {% endfor %}
+    </ul>
+  </article>
+</section>
+{% endblock %}

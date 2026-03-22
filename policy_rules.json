@@ -2,6 +2,30 @@
   "rules": [
     {
       "match": {
+        "target": "notion_task",
+        "intent_type": "capture",
+        "external_write": true
+      },
+      "action": "read_ok"
+    },
+    {
+      "match": {
+        "target": "notion_task_status",
+        "intent_type": "execute",
+        "external_write": true
+      },
+      "action": "read_ok"
+    },
+    {
+      "match": {
+        "target": "notion_task_note",
+        "intent_type": "execute",
+        "external_write": true
+      },
+      "action": "read_ok"
+    },
+    {
+      "match": {
         "external_write": true
       },
       "action": "approval_required"

@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}{{ approval.id }} · agentic-os{% endblock %}
+{% block content %}
+<section class="section">
+  <div class="section-header">
+    <h1>{{ approval.id }}</h1>
+    <p><a href="/tasks/{{ task.id }}">{{ task.id }}</a> · {{ task.user_request }}</p>
+  </div>
+
+  <div class="grid two-up">
+    <article class="card">
+      <h2>Approval record</h2>
+      <dl class="meta">
+        <dt>Status</dt><dd><span class="badge {{ approval.status|status_tone }}">{{ approval.status }}</span></dd>
+        <dt>Subject type</dt><dd>{{ approval.subject_type }}</dd>
+        <dt>Operation key</dt><dd>{{ approval.operation_key or "—" }}</dd>
+        <dt>Action target</dt><dd>{{ approval.action_target or "—" }}</dd>
+        <dt>Created</dt><dd>{{ approval.created_at }}</dd>
+        <dt>Updated</dt><dd>{{ approval.updated_at }}</dd>
+        <dt>Decided</dt><dd>{{ approval.decided_at or "—" }}</dd>
+        <dt>Decision note</dt><dd>{{ approval.decision_note or "—" }}</dd>
+      </dl>
+
+      {% if approval.status == "pending" %}
+      <form method="post" action="/approvals/{{ approval.id }}/approve" class="stack">
+        <input type="hidden" name="redirect_to" value="/approvals/{{ approval.id }}">
+        <textarea name="note" rows="3" placeholder="Optional approval note"></textarea>
+        <div class="action-row">
+          <button type="submit">Approve</button>
+          <button class="danger" formaction="/approvals/{{ approval.id }}/deny" type="submit">Deny</button>
+          <button class="muted-btn" formaction="/approvals/{{ approval.id }}/cancel" type="submit">Cancel</button>
+        </div>
+      </form>
+      {% endif %}
+    </article>
+
+    <article class="card">
+      <h2>Payload</h2>
+      <pre>{{ approval_payload_pretty }}</pre>
+      {% if artifact_content %}
+      <h3>Artifact content</h3>
+      <pre>{{ artifact_content }}</pre>
+      {% endif %}
+    </article>
+  </div>
+</section>
+{% endblock %}

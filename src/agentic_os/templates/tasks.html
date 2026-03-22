@@ -1,0 +1,91 @@
+{% extends "base.html" %}
+{% block title %}Tasks · agentic-os{% endblock %}
+{% block content %}
+<section class="section">
+  <div class="section-header">
+    <h1>Tasks</h1>
+    <p>Filter durable tasks by status, domain, target, and provenance.</p>
+  </div>
+
+  <form class="card filters" method="get">
+    <label>
+      <span>Status</span>
+      <select name="status">
+        <option value="">All</option>
+        {% for item in filter_options.statuses %}
+        <option value="{{ item }}" {% if filters.status == item %}selected{% endif %}>{{ item }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>
+      <span>Domain</span>
+      <select name="domain">
+        <option value="">All</option>
+        {% for item in filter_options.domains %}
+        <option value="{{ item }}" {% if filters.domain == item %}selected{% endif %}>{{ item }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>
+      <span>Target</span>
+      <select name="target">
+        <option value="">All</option>
+        {% for item in filter_options.targets %}
+        <option value="{{ item }}" {% if filters.target == item %}selected{% endif %}>{{ item }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>
+      <span>Action source</span>
+      <select name="action_source">
+        <option value="">All</option>
+        {% for item in filter_options.action_sources %}
+        <option value="{{ item }}" {% if filters.action_source == item %}selected{% endif %}>{{ item }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>
+      <span>Limit</span>
+      <input type="number" min="1" max="500" name="limit" value="{{ filters.limit }}">
+    </label>
+    <button type="submit">Apply filters</button>
+  </form>
+
+  <article class="card">
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Status</th>
+          <th>Domain</th>
+          <th>Intent</th>
+          <th>Target</th>
+          <th>Risk</th>
+          <th>Action source</th>
+          <th>Created</th>
+          <th>Updated</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for task in tasks %}
+        <tr>
+          <td><a href="/tasks/{{ task.id }}">{{ task.id }}</a></td>
+          <td><span class="badge {{ task.status|status_tone }}">{{ task.status }}</span></td>
+          <td>{{ task.domain }}</td>
+          <td>{{ task.intent_type }}</td>
+          <td>{{ task.target or "—" }}</td>
+          <td><span class="badge {{ task.risk_level|risk_tone }}">{{ task.risk_level }}</span></td>
+          <td><span class="badge accent">{{ task.action_source }}</span></td>
+          <td>{{ task.created_at }}</td>
+          <td>{{ task.updated_at }}</td>
+        </tr>
+        {% else %}
+        <tr>
+          <td colspan="9" class="muted">No tasks matched the current filters.</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </article>
+</section>
+{% endblock %}

@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}Error · agentic-os{% endblock %}
+{% block content %}
+<section class="section narrow">
+  <article class="card">
+    <h1>{{ status_code }}</h1>
+    <p>{{ detail }}</p>
+  </article>
+</section>
+{% endblock %}

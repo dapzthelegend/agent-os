@@ -7,9 +7,18 @@ name = "agentic-os"
 version = "0.1.0"
 description = "Week 4 OpenClaw-first backend for durable task, approval, execution, artifact, and audit operations"
 requires-python = ">=3.9"
+dependencies = [
+    "fastapi>=0.115,<1.0",
+    "jinja2>=3.1,<4.0",
+    "python-multipart>=0.0.9,<1.0",
+    "uvicorn>=0.30,<1.0",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
+
+[tool.setuptools.package-data]
+agentic_os = ["templates/*.html", "static/*"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

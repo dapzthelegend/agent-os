@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block title %}Approvals · agentic-os{% endblock %}
+{% block content %}
+<section class="section">
+  <div class="section-header">
+    <h1>Approvals</h1>
+    <p>Pending approvals stay prominent; historical decisions remain visible below.</p>
+  </div>
+
+  <article class="card focus-card">
+    <h2>Pending queue</h2>
+    {% if pending_details %}
+    <div class="approval-grid">
+      {% for item in pending_details %}
+      <section class="approval-card">
+        <div class="card-heading">
+          <h3><a href="/approvals/{{ item.approval.id }}">{{ item.approval.id }}</a></h3>
+          <span class="badge warning">{{ item.approval.status }}</span>
+        </div>
+        <p><a href="/tasks/{{ item.task.id }}">{{ item.task.id }}</a> · {{ item.task.user_request }}</p>
+        <p>
+          <span class="badge {{ item.task.risk_level|risk_tone }}">{{ item.task.risk_level }}</span>
+          <span class="badge accent">{{ item.task.action_source }}</span>
+          <span class="badge">{{ item.approval.subject_type }}</span>
+        </p>
+        <form method="post" action="/approvals/{{ item.approval.id }}/approve" class="stack compact">
+          <input type="hidden" name="redirect_to" value="/approvals">
+          <textarea name="note" rows="2" placeholder="Optional decision note"></textarea>
+          <div class="action-row">
+            <button type="submit">Approve</button>
+          </div>
+        </form>
+        <form method="post" action="/approvals/{{ item.approval.id }}/deny" class="stack compact">
+          <input type="hidden" name="redirect_to" value="/approvals">
+          <textarea name="note" rows="2" placeholder="Reason for denial"></textarea>
+          <div class="action-row">
+            <button class="danger" type="submit">Deny</button>
+            <button class="muted-btn" formaction="/approvals/{{ item.approval.id }}/cancel" type="submit">Cancel</button>
+          </div>
+        </form>
+      </section>
+      {% endfor %}
+    </div>
+    {% else %}
+    <p class="muted">No pending approvals.</p>
+    {% endif %}
+  </article>
+
+  <div class="grid three-up">
+    {% for status in ["approved", "denied", "cancelled"] %}
+    <article class="card">
+      <h2>{{ status|title }}</h2>
+      <ul class="list">
+        {% for approval in groups[status][:8] %}
+        <li>
+          <a href="/approvals/{{ approval.id }}">{{ approval.id }}</a>
+          <span><a href="/tasks/{{ approval.task_id }}">{{ approval.task_id }}</a></span>
+        </li>
+        {% else %}
+        <li class="muted">No {{ status }} approvals.</li>
+        {% endfor %}
+      </ul>
+    </article>
+    {% endfor %}
+  </div>
+</section>
+{% endblock %}
