@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+{% block title %}Recaps · agentic-os{% endblock %}
+{% block content %}
+<section class="section">
+  <div class="section-header">
+    <h1>Recaps</h1>
+    <p>Service-backed summary views over the durable state.</p>
+  </div>
+
+  <form class="card filters" method="get">
+    <label>
+      <span>Domain</span>
+      <select name="domain">
+        {% for item in domains %}
+        <option value="{{ item }}" {% if domain == item %}selected{% endif %}>{{ item or "All" }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <button type="submit">Apply domain filter</button>
+  </form>
+
+  <div class="grid two-up">
+    <article class="card">
+      <h2>Today</h2>
+      <p>Date: {{ recap_today.date }}</p>
+      <div class="badge-row">
+        {% for key, value in recap_today.counts.items() %}
+        <span class="badge">{{ key }} · {{ value }}</span>
+        {% endfor %}
+      </div>
+      <ul class="list">
+        {% for item in recap_today.items[:8] %}
+        <li><a href="/tasks/{{ item.task_id }}">{{ item.task_id }}</a> <span>{{ item.status }}</span></li>
+        {% else %}
+        <li class="muted">No tasks for the current day.</li>
+        {% endfor %}
+      </ul>
+    </article>
+
+    <article class="card focus-card">
+      <h2>Approvals</h2>
+      <p>{{ recap_approvals.count }} pending</p>
+      <ul class="list">
+        {% for item in recap_approvals.items[:8] %}
+        <li><a href="/approvals/{{ item.approval_id }}">{{ item.approval_id }}</a> <span>{{ item.user_request }}</span></li>
+        {% else %}
+        <li class="muted">No pending approvals.</li>
+        {% endfor %}
+      </ul>
+    </article>
+  </div>
+
+  <div class="grid two-up">
+    <article class="card">
+      <h2>Drafts</h2>
+      <p>{{ recap_drafts.count }} open drafts</p>
+      <ul class="list">
+        {% for item in recap_drafts.items[:8] %}
+        <li><a href="/tasks/{{ item.task_id }}">{{ item.task_id }}</a> <span>{{ item.user_request }}</span></li>
+        {% else %}
+        <li class="muted">No open drafts.</li>
+        {% endfor %}
+      </ul>
+    </article>
+
+    <article class="card">
+      <h2>Failures</h2>
+      <p>{{ recap_failures.count }} recent failures</p>
+      <ul class="list">
+        {% for item in recap_failures.items[:8] %}
+        <li><a href="/tasks/{{ item.task_id }}">{{ item.task_id }}</a> <span>{{ item.result_summary or "No summary" }}</span></li>
+        {% else %}
+        <li class="muted">No recent failures.</li>
+        {% endfor %}
+      </ul>
+    </article>
+  </div>
+
+  <article class="card">
+    <h2>External actions</h2>
+    <p>{{ recap_external_actions.count }} recorded action tasks</p>
+    <ul class="list">
+      {% for item in recap_external_actions.items %}
+      <li>
+        <a href="/tasks/{{ item.task_id }}">{{ item.task_id }}</a>
+        <span>{{ item.operation_key or "no operation key" }}</span>
+        <span class="badge accent">{{ item.action_source }}</span>
+      </li>
+      {% else %}
+      <li class="muted">No external actions recorded.</li>
+      {% endfor %}
+    </ul>
+  </article>
+</section>
+{% endblock %}

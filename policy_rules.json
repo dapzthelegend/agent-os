@@ -1,0 +1,64 @@
+{
+  "rules": [
+    {
+      "match": {
+        "target": "notion_task",
+        "intent_type": "capture",
+        "external_write": true
+      },
+      "action": "read_ok"
+    },
+    {
+      "match": {
+        "target": "notion_task_status",
+        "intent_type": "execute",
+        "external_write": true
+      },
+      "action": "read_ok"
+    },
+    {
+      "match": {
+        "target": "notion_task_note",
+        "intent_type": "execute",
+        "external_write": true
+      },
+      "action": "read_ok"
+    },
+    {
+      "match": {
+        "external_write": true
+      },
+      "action": "approval_required"
+    },
+    {
+      "match": {
+        "intent_type": "execute"
+      },
+      "action": "approval_required"
+    },
+    {
+      "match": {
+        "intent_type": "draft"
+      },
+      "action": "draft_required"
+    },
+    {
+      "match": {
+        "intent_type": "read"
+      },
+      "action": "read_ok"
+    },
+    {
+      "match": {
+        "intent_type": "capture"
+      },
+      "action": "read_ok"
+    },
+    {
+      "match": {
+        "intent_type": "recap"
+      },
+      "action": "read_ok"
+    }
+  ]
+}

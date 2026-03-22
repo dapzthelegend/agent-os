@@ -1,0 +1,124 @@
+{% extends "base.html" %}
+{% block title %}Overview · agentic-os{% endblock %}
+{% block content %}
+<section class="section">
+  <div class="section-header">
+    <h1>Overview</h1>
+    <p>Loopback-only console over the durable Week 4 state.</p>
+  </div>
+
+  <div class="grid cards">
+    <article class="card metric">
+      <span>Total tasks</span>
+      <strong>{{ overview.task_count }}</strong>
+    </article>
+    <article class="card metric warning">
+      <span>Pending approvals</span>
+      <strong>{{ overview.pending_approvals_count }}</strong>
+    </article>
+    <article class="card metric info">
+      <span>Open drafts</span>
+      <strong>{{ overview.open_drafts_count }}</strong>
+    </article>
+    <article class="card metric danger">
+      <span>Recent failures</span>
+      <strong>{{ overview.recent_failures_count }}</strong>
+    </article>
+    <article class="card metric accent">
+      <span>External actions</span>
+      <strong>{{ overview.recent_external_actions_count }}</strong>
+    </article>
+  </div>
+
+  <div class="grid two-up">
+    <article class="card">
+      <h2>Status counts</h2>
+      <div class="badge-row">
+        {% for status, count in overview.status_counts.items() %}
+        {% if count %}
+        <span class="badge {{ status|status_tone }}">{{ status }} · {{ count }}</span>
+        {% endif %}
+        {% endfor %}
+      </div>
+    </article>
+    <article class="card focus-card">
+      <h2>Pending approvals</h2>
+      {% if overview.pending_approvals %}
+      <ul class="list">
+        {% for item in overview.pending_approvals %}
+        <li>
+          <a href="/approvals/{{ item.approval_id }}">{{ item.approval_id }}</a>
+          <span>{{ item.target or "no-target" }}</span>
+          <span class="badge warning">{{ item.action_source }}</span>
+        </li>
+        {% endfor %}
+      </ul>
+      {% else %}
+      <p class="muted">No approvals waiting.</p>
+      {% endif %}
+    </article>
+  </div>
+
+  <div class="grid two-up">
+    <article class="card">
+      <div class="card-heading">
+        <h2>Recent tasks</h2>
+        <a href="/tasks">View all</a>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Status</th>
+            <th>Domain</th>
+            <th>Target</th>
+            <th>Risk</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for task in overview.recent_tasks %}
+          <tr>
+            <td><a href="/tasks/{{ task.id }}">{{ task.id }}</a></td>
+            <td><span class="badge {{ task.status|status_tone }}">{{ task.status }}</span></td>
+            <td>{{ task.domain }}</td>
+            <td>{{ task.target or "—" }}</td>
+            <td><span class="badge {{ task.risk_level|risk_tone }}">{{ task.risk_level }}</span></td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </article>
+
+    <article class="card">
+      <h2>Recent failures</h2>
+      {% if overview.recent_failures %}
+      <ul class="list">
+        {% for item in overview.recent_failures %}
+        <li>
+          <a href="/tasks/{{ item.task_id }}">{{ item.task_id }}</a>
+          <span>{{ item.result_summary or "No summary" }}</span>
+        </li>
+        {% endfor %}
+      </ul>
+      {% else %}
+      <p class="muted">No recent failures.</p>
+      {% endif %}
+
+      <h2>External actions</h2>
+      {% if overview.recent_external_actions %}
+      <ul class="list">
+        {% for item in overview.recent_external_actions %}
+        <li>
+          <a href="/tasks/{{ item.task_id }}">{{ item.task_id }}</a>
+          <span>{{ item.operation_key or "no operation key" }}</span>
+          <span class="badge accent">{{ item.action_source }}</span>
+        </li>
+        {% endfor %}
+      </ul>
+      {% else %}
+      <p class="muted">No external actions recorded.</p>
+      {% endif %}
+    </article>
+  </div>
+</section>
+{% endblock %}

@@ -1,0 +1,17 @@
+/data/*
+!/data/.gitkeep
+/artifacts/*
+!/artifacts/.gitkeep
+
+# Python bytecode and cache directories
+__pycache__/
+*.py[cod]
+
+# macOS Finder metadata
+.DS_Store
+
+# Common local test/tooling caches
+.coverage
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/

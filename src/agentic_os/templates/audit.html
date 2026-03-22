@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}Audit · agentic-os{% endblock %}
+{% block content %}
+<section class="section">
+  <div class="section-header">
+    <h1>Audit timeline</h1>
+    <p>Newest-first event stream from durable audit storage.</p>
+  </div>
+
+  <form class="card filters" method="get">
+    <label>
+      <span>Domain</span>
+      <select name="domain">
+        <option value="">All</option>
+        {% for item in filter_options.domains %}
+        <option value="{{ item }}" {% if audit.filters.domain == item %}selected{% endif %}>{{ item }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>
+      <span>Target</span>
+      <select name="target">
+        <option value="">All</option>
+        {% for item in filter_options.targets %}
+        <option value="{{ item }}" {% if audit.filters.target == item %}selected{% endif %}>{{ item }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>
+      <span>Limit</span>
+      <input type="number" name="limit" min="1" max="200" value="{{ audit.filters.limit }}">
+    </label>
+    <button type="submit">Apply filters</button>
+  </form>
+
+  <ul class="timeline">
+    {% for event in audit.events %}
+    <li class="{% if event.is_important %}important{% endif %}">
+      <div class="timeline-head">
+        <span class="badge {{ event.event_type|event_tone }}">{{ event.event_type }}</span>
+        <span>{{ event.created_at }}</span>
+      </div>
+      <div class="meta-inline">
+        <a href="/tasks/{{ event.task_id }}">{{ event.task_id }}</a>
+        <span>{{ event.domain }}</span>
+        <span>{{ event.target or "—" }}</span>
+        <span class="badge accent">{{ event.action_source }}</span>
+      </div>
+      <pre>{{ event.payload_pretty }}</pre>
+    </li>
+    {% else %}
+    <li class="muted">No audit events matched the current filters.</li>
+    {% endfor %}
+  </ul>
+</section>
+{% endblock %}

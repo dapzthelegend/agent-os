@@ -1,0 +1,31 @@
+{
+  "notion": {
+    "apiTokenEnv": "NOTION_API_KEY",
+    "databaseId": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "dataSourceId": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+    "properties": {
+      "title": "Title",
+      "status": "Status",
+      "type": "Type",
+      "area": "Area",
+      "backendTaskId": "OpenClaw Task ID",
+      "operationKey": "Operation Key",
+      "lastAgentUpdate": "Last Agent Update"
+    },
+    "propertyKinds": {
+      "type": "select",
+      "area": "select"
+    },
+    "statusMap": {
+      "new": "Inbox",
+      "in_progress": "In Progress",
+      "awaiting_input": "Waiting",
+      "awaiting_approval": "Review",
+      "approved": "In Progress",
+      "executed": "In Progress",
+      "completed": "Done",
+      "failed": "Blocked",
+      "cancelled": "Cancelled"
+    }
+  }
+}

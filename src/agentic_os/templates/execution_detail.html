@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% block title %}{{ operation_key }} · agentic-os{% endblock %}
+{% block content %}
+<section class="section">
+  <div class="section-header">
+    <h1>Execution {{ operation_key }}</h1>
+    {% if task %}
+    <p><a href="/tasks/{{ task.id }}">{{ task.id }}</a> · {{ task.user_request }}</p>
+    {% endif %}
+  </div>
+
+  <div class="grid two-up">
+    <article class="card">
+      <h2>Execution record</h2>
+      {% if execution %}
+      <dl class="meta">
+        <dt>Status</dt><dd><span class="badge {{ execution.status|status_tone }}">{{ execution.status }}</span></dd>
+        <dt>Result summary</dt><dd>{{ execution.result_summary or "—" }}</dd>
+        <dt>Created</dt><dd>{{ execution.created_at }}</dd>
+        <dt>Updated</dt><dd>{{ execution.updated_at }}</dd>
+        <dt>Approval</dt><dd>{% if approval %}<a href="/approvals/{{ approval.id }}">{{ approval.id }}</a>{% else %}—{% endif %}</dd>
+      </dl>
+      {% else %}
+      <div class="banner banner-warning">{{ message }}</div>
+      {% if status %}
+      <p>Status: {{ status }}</p>
+      {% endif %}
+      {% endif %}
+    </article>
+
+    {% if task %}
+    <article class="card">
+      <h2>Task context</h2>
+      <dl class="meta">
+        <dt>Task</dt><dd><a href="/tasks/{{ task.id }}">{{ task.id }}</a></dd>
+        <dt>Status</dt><dd><span class="badge {{ task.status|status_tone }}">{{ task.status }}</span></dd>
+        <dt>Target</dt><dd>{{ task.target or "—" }}</dd>
+        <dt>Action source</dt><dd><span class="badge accent">{{ task.action_source }}</span></dd>
+        <dt>Approval state</dt><dd>{{ task.approval_state }}</dd>
+      </dl>
+    </article>
+    {% endif %}
+  </div>
+
+  {% if audit_events %}
+  <article class="card">
+    <h2>Related audit events</h2>
+    <ul class="timeline">
+      {% for event in audit_events|reverse %}
+      <li class="{% if event.is_important %}important{% endif %}">
+        <div class="timeline-head">
+          <span class="badge {{ event.event_type|event_tone }}">{{ event.event_type }}</span>
+          <span>{{ event.created_at }}</span>
+        </div>
+        <pre>{{ event.payload_pretty }}</pre>
+      </li>
+      {% endfor %}
+    </ul>
+  </article>
+  {% endif %}
+</section>
+{% endblock %}
