@@ -75,6 +75,7 @@ CREATE TABLE IF NOT EXISTS executions (
     approval_id TEXT,
     status TEXT NOT NULL,
     result_summary TEXT,
+    session_key TEXT,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     FOREIGN KEY(task_id) REFERENCES tasks(id)
@@ -85,6 +86,7 @@ CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_domain ON tasks(domain, created_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_target ON tasks(target, created_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_action_source ON tasks(action_source, created_at);
+CREATE INDEX IF NOT EXISTS idx_tasks_ready ON tasks(status, policy_decision, created_at);
 CREATE INDEX IF NOT EXISTS idx_audit_events_task_id ON audit_events(task_id, id);
 CREATE INDEX IF NOT EXISTS idx_audit_events_created_at ON audit_events(created_at, id);
 CREATE INDEX IF NOT EXISTS idx_artifacts_task_id ON artifacts(task_id, created_at);
@@ -99,6 +101,16 @@ TASK_COLUMNS = {
     "external_write": "ALTER TABLE tasks ADD COLUMN external_write INTEGER NOT NULL DEFAULT 0",
     "policy_decision": "ALTER TABLE tasks ADD COLUMN policy_decision TEXT",
     "action_source": "ALTER TABLE tasks ADD COLUMN action_source TEXT NOT NULL DEFAULT 'manual'",
+    "retry_count": "ALTER TABLE tasks ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
+    # Phase 2 — dispatch tracking
+    "claimed_at":           "ALTER TABLE tasks ADD COLUMN claimed_at TEXT",
+    "claimed_by":           "ALTER TABLE tasks ADD COLUMN claimed_by TEXT",
+    "dispatch_session_key": "ALTER TABLE tasks ADD COLUMN dispatch_session_key TEXT",
+    "dispatch_attempts":    "ALTER TABLE tasks ADD COLUMN dispatch_attempts INTEGER NOT NULL DEFAULT 0",
+}
+
+EXECUTION_COLUMNS = {
+    "session_key": "ALTER TABLE executions ADD COLUMN session_key TEXT",
 }
 
 
@@ -117,6 +129,7 @@ class Database:
         with self.connect() as connection:
             connection.executescript(SCHEMA)
             self._ensure_task_columns(connection)
+            self._ensure_execution_columns(connection)
 
     @staticmethod
     def _ensure_task_columns(connection: sqlite3.Connection) -> None:
@@ -125,6 +138,20 @@ class Database:
             for row in connection.execute("PRAGMA table_info(tasks)").fetchall()
         }
         for name, ddl in TASK_COLUMNS.items():
+            if name not in existing:
+                try:
+                    connection.execute(ddl)
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column name" not in str(exc):
+                        raise
+
+    @staticmethod
+    def _ensure_execution_columns(connection: sqlite3.Connection) -> None:
+        existing = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(executions)").fetchall()
+        }
+        for name, ddl in EXECUTION_COLUMNS.items():
             if name not in existing:
                 try:
                     connection.execute(ddl)
@@ -207,6 +234,7 @@ class Database:
         external_write: Optional[bool] = None,
         policy_decision: Optional[str] = None,
         action_source: Optional[str] = None,
+        retry_count: Optional[int] = None,
     ) -> TaskRecord:
         updates: list[str] = []
         values: list[Any] = []
@@ -228,6 +256,9 @@ class Database:
         if external_write is not None:
             updates.append("external_write = ?")
             values.append(1 if external_write else 0)
+        if retry_count is not None:
+            updates.append("retry_count = ?")
+            values.append(retry_count)
         updates.append(f"updated_at = {utc_now_sql()}")
         values.append(task_id)
         query = f"UPDATE tasks SET {', '.join(updates)} WHERE id = ?"
@@ -311,6 +342,71 @@ class Database:
                 (*values, limit),
             ).fetchall()
         return [self._row_to_task(row) for row in rows]
+
+    def query_ready_tasks(self, *, limit: int = 20) -> list[TaskRecord]:
+        """
+        Return tasks eligible for execution (FIFO):
+          - status = 'approved'
+          - status = 'new' AND policy_decision = 'read_ok'
+        """
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM tasks
+                WHERE status = 'approved'
+                   OR (status = 'new' AND policy_decision = 'read_ok')
+                ORDER BY created_at ASC, id ASC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [self._row_to_task(row) for row in rows]
+
+    def pickup_task(self, task_id: str, *, claimed_by: str = "task_executor_cron") -> dict:
+        """
+        Atomically transition an eligible task to 'in_progress'.
+        Uses BEGIN IMMEDIATE to prevent concurrent cron double-dispatch.
+
+        Returns:
+            {"success": True, "task_id": task_id}
+            {"success": False, "task_id": task_id, "reason": str, "current_status": str}
+        """
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"unknown task_id: {task_id}")
+            task = self._row_to_task(row)
+            eligible = (
+                task.status == "approved"
+                or (task.status == "new" and task.policy_decision == "read_ok")
+            )
+            if not eligible:
+                return {
+                    "success": False,
+                    "task_id": task_id,
+                    "reason": "already_claimed" if task.status == "in_progress" else "not_eligible",
+                    "current_status": task.status,
+                }
+            connection.execute(
+                f"""UPDATE tasks
+                    SET status = 'in_progress',
+                        claimed_at = {utc_now_sql()},
+                        claimed_by = ?,
+                        dispatch_attempts = COALESCE(dispatch_attempts, 0) + 1,
+                        updated_at = {utc_now_sql()}
+                    WHERE id = ?""",
+                (claimed_by, task_id),
+            )
+        return {"success": True, "task_id": task_id}
+
+    def update_dispatch_session_key(self, task_id: str, session_key: str) -> None:
+        """Record the spawned session key on the task after successful dispatch."""
+        with self.connect() as connection:
+            connection.execute(
+                f"UPDATE tasks SET dispatch_session_key = ?, updated_at = {utc_now_sql()} WHERE id = ?",
+                (session_key, task_id),
+            )
 
     def get_task(self, task_id: str) -> TaskRecord:
         with self.connect() as connection:
@@ -570,6 +666,21 @@ class Database:
             ).fetchall()
         return [self._row_to_execution(row) for row in rows]
 
+    def update_execution_session_key(self, *, operation_key: str, session_key: str) -> ExecutionRecord:
+        """Update the session_key for an execution record."""
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE executions SET session_key = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE operation_key = ?",
+                (session_key, operation_key),
+            )
+            row = connection.execute(
+                "SELECT * FROM executions WHERE operation_key = ?",
+                (operation_key,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"execution with operation_key {operation_key} not found")
+        return self._row_to_execution(row)
+
     @staticmethod
     def _row_to_task(row: sqlite3.Row) -> TaskRecord:
         return TaskRecord(
@@ -591,6 +702,11 @@ class Database:
             external_write=bool(row["external_write"]),
             policy_decision=row["policy_decision"],
             action_source=row["action_source"],
+            retry_count=row["retry_count"] if "retry_count" in row.keys() else 0,
+            claimed_at=row["claimed_at"] if "claimed_at" in row.keys() else None,
+            claimed_by=row["claimed_by"] if "claimed_by" in row.keys() else None,
+            dispatch_session_key=row["dispatch_session_key"] if "dispatch_session_key" in row.keys() else None,
+            dispatch_attempts=row["dispatch_attempts"] if "dispatch_attempts" in row.keys() else 0,
         )
 
     @staticmethod
@@ -620,4 +736,5 @@ class Database:
             result_summary=row["result_summary"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            session_key=row["session_key"] if "session_key" in row.keys() else None,
         ).validate()

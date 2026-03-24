@@ -15,3 +15,12 @@ __pycache__/
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
+
+# Secrets and local config
+.env
+.env.*
+gog*.json
+agentic_os.config.json
+email_routing.json
+intake_routing.json
+policy_rules.json

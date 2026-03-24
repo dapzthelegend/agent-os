@@ -23,8 +23,8 @@ class OpenClawBridgeTests(unittest.TestCase):
                 "constraints": ["Morning is busy"],
             },
             "personal_inbox": {
-                "urgent": [{"subject": "Flight confirmation", "sender": "airline@example.com"}],
-                "needs_reply": [{"subject": "Partnership intro", "actionable": True}],
+                "urgent": [{"subject": "Flight confirmation", "sender": "airline@example.com", "message_id": "m1"}],
+                "needs_reply": [{"subject": "Partnership intro", "actionable": True, "message_id": "m2"}],
                 "important_fyi": [{"subject": "Monthly statement"}],
             },
             "agent_inbox": {
@@ -41,6 +41,7 @@ class OpenClawBridgeTests(unittest.TestCase):
         self.assertEqual(normalized["calendar"]["events"][0]["title"], "Product sync")
         self.assertEqual(normalized["calendar"]["events"][0]["prep_needed"], "Review notes")
         self.assertEqual(len(normalized["personal_inbox"]["urgent"]), 1)
+        self.assertEqual(normalized["personal_inbox"]["urgent"][0]["message_id"], "m1")
         self.assertEqual(len(normalized["agent_inbox"]["operational_items"]), 1)
         self.assertEqual(len(normalized["notion"]["blocked"]), 1)
 
@@ -62,6 +63,7 @@ class OpenClawBridgeTests(unittest.TestCase):
                         "subject": "Reply needed: legal review",
                         "category": "needs_reply",
                         "requestedAction": "Confirm legal timeline",
+                        "id": "msg-100",
                     },
                     {
                         "subject": "FYI: statement ready",
@@ -92,6 +94,7 @@ class OpenClawBridgeTests(unittest.TestCase):
         normalized = normalize_openclaw_daily_routine_payload(payload)
         self.assertEqual(normalized["calendar"]["events"][0]["title"], "Roadmap review")
         self.assertEqual(len(normalized["personal_inbox"]["needs_reply"]), 1)
+        self.assertEqual(normalized["personal_inbox"]["needs_reply"][0]["message_id"], "msg-100")
         self.assertEqual(len(normalized["personal_inbox"]["important_fyi"]), 1)
         self.assertEqual(len(normalized["agent_inbox"]["alerts"]), 1)
         self.assertEqual(len(normalized["agent_inbox"]["operational_items"]), 1)

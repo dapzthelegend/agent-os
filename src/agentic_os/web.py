@@ -90,3 +90,25 @@ def _event_tone(value: Optional[str]) -> str:
 
 
 app = create_app()
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "agentic_os.web:app",
+        host="127.0.0.1",
+        port=8000,
+        reload=False,
+    )
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "agentic_os.web:app",
+        host="127.0.0.1",
+        port=8000,
+        reload=False,
+    )

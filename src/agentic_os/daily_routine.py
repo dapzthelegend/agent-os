@@ -71,6 +71,8 @@ class CalendarEvent:
     summary: Optional[str] = None
     prep_needed: Optional[str] = None
     actionable: bool = False
+    calendar_account: Optional[str] = None  # e.g. "franchieinc", "dapz", "sola"
+    event_id: Optional[str] = None          # Google Calendar event ID (for mutations)
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "CalendarEvent":
@@ -82,6 +84,8 @@ class CalendarEvent:
             summary=payload.get("summary"),
             prep_needed=payload.get("prep_needed") or payload.get("prepNeeded"),
             actionable=_coerce_bool(payload.get("actionable"), default=False),
+            calendar_account=payload.get("calendar_account") or payload.get("calendarAccount"),
+            event_id=payload.get("event_id") or payload.get("eventId"),
         )
 
     def line(self) -> str:
@@ -277,6 +281,24 @@ class NotionRecap:
 
 
 @dataclass(frozen=True)
+class AttentionItem:
+    """An item that requires Dara's direct attention."""
+    category: str          # approval | overdue | blocked | failed
+    title: str
+    details: Optional[str] = None
+    age_hours: Optional[float] = None  # hours since last update / created
+
+    def line(self) -> str:
+        icon = {"approval": "⏳", "overdue": "🕐", "blocked": "🚫", "failed": "❌"}.get(self.category, "⚠️")
+        parts = [f"{icon} [{self.category.upper()}]", self.title]
+        if self.age_hours is not None:
+            parts.append(f"({self.age_hours:.0f}h old)")
+        if self.details:
+            parts.append(f"— {self.details}")
+        return " ".join(parts)
+
+
+@dataclass(frozen=True)
 class FollowUpAction:
     title: str
     summary: str
@@ -300,9 +322,25 @@ class DailyRecap:
     agent_inbox: InboxRecap
     notion: NotionRecap
     recommended_next_actions: list[str]
+    needs_attention: list[AttentionItem] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        # dataclass frozen=True means we use object.__setattr__
+        if self.needs_attention is None:
+            object.__setattr__(self, "needs_attention", [])
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+class DailyRoutineAbortError(RuntimeError):
+    """Raised when a required tool or provider is unavailable and the routine cannot continue."""
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+    def abort_message(self) -> str:
+        return f"DAILY_ROUTINE_ABORTED: {self.reason}"
 
 
 def infer_domain(source_kind: str, area: Optional[str] = None) -> str:
@@ -419,8 +457,60 @@ def extract_follow_up_actions(payload: DailyRoutineInput, *, limit: int = 5) -> 
     return deduped
 
 
-def build_daily_recap(payload: DailyRoutineInput, yesterday: YesterdayRecap) -> DailyRecap:
+def build_attention_items(
+    pending_approvals: Optional[list[dict[str, Any]]] = None,
+    overdue_tasks: Optional[list[dict[str, Any]]] = None,
+) -> list[AttentionItem]:
+    """
+    Build a list of AttentionItems from pending approvals and overdue tasks.
+
+    Args:
+        pending_approvals: list of dicts from service.recap_approvals()['records']
+        overdue_tasks: list of dicts with keys task_id, user_request, hours_since_update
+
+    Returns:
+        Sorted list of AttentionItems (approvals first, then overdue)
+    """
+    items: list[AttentionItem] = []
+
+    for approval in (pending_approvals or []):
+        age_hours: Optional[float] = None
+        if approval.get("hours_pending") is not None:
+            age_hours = float(approval["hours_pending"])
+        items.append(
+            AttentionItem(
+                category="approval",
+                title=_compact_text(approval.get("user_request", ""), fallback="Pending approval"),
+                details=f"approval_id={approval.get('approval_id', '?')}",
+                age_hours=age_hours,
+            )
+        )
+
+    for task in (overdue_tasks or []):
+        items.append(
+            AttentionItem(
+                category="overdue",
+                title=_compact_text(task.get("user_request", ""), fallback="Overdue task"),
+                details=f"task_id={task.get('task_id', '?')}  status={task.get('status', '?')}",
+                age_hours=task.get("hours_since_update"),
+            )
+        )
+
+    return items
+
+
+def build_daily_recap(
+    payload: DailyRoutineInput,
+    yesterday: YesterdayRecap,
+    *,
+    pending_approvals: Optional[list[dict[str, Any]]] = None,
+    overdue_tasks: Optional[list[dict[str, Any]]] = None,
+) -> DailyRecap:
     actions = extract_follow_up_actions(payload)
+    attention = build_attention_items(
+        pending_approvals=pending_approvals,
+        overdue_tasks=overdue_tasks,
+    )
     return DailyRecap(
         run_date=payload.date,
         recipient=payload.recipient,
@@ -452,6 +542,7 @@ def build_daily_recap(payload: DailyRoutineInput, yesterday: YesterdayRecap) -> 
             blocked_or_stale=[item.line() for item in (payload.notion.blocked + payload.notion.stale)],
         ),
         recommended_next_actions=[action.title for action in actions],
+        needs_attention=attention,
     )
 
 
@@ -460,6 +551,18 @@ def render_plaintext_email(recap: DailyRecap) -> str:
         f"Daily recap for {recap.run_date}",
         f"Recipient: {recap.recipient}",
         f"Scheduled send: {recap.delivery_time} {recap.timezone}",
+    ]
+
+    # "Needs your attention" — surface at the top if there are items
+    attention_items = recap.needs_attention or []
+    if attention_items:
+        sections += [
+            "",
+            "⚠️  NEEDS YOUR ATTENTION",
+            _render_list([item.line() for item in attention_items]),
+        ]
+
+    sections += [
         "",
         "Yesterday",
         _render_bullets("Completed", recap.yesterday.completed),
@@ -497,6 +600,69 @@ def prepare_email_payload(recap: DailyRecap, body: str) -> dict[str, str]:
         "subject": f"Daily recap - {recap.run_date}",
         "body_text": body,
     }
+
+
+def render_html_email(recap: DailyRecap) -> Optional[str]:
+    """
+    Render the daily recap as an HTML email using the email_recap.html template.
+
+    Returns the rendered HTML string, or None if Jinja2 is unavailable or
+    the template cannot be rendered (falls back to plain text gracefully).
+    """
+    try:
+        from jinja2 import Environment, FileSystemLoader, select_autoescape
+        from pathlib import Path
+    except ImportError:
+        return None
+
+    templates_dir = Path(__file__).parent / "templates"
+    env = Environment(
+        loader=FileSystemLoader(str(templates_dir)),
+        autoescape=select_autoescape(["html"]),
+    )
+
+    # Build a flat context dict the template can consume directly
+    attention_items = [
+        {
+            "kind": item.category,
+            "title": item.title,
+            "detail": item.details,
+        }
+        for item in (recap.needs_attention or [])
+    ]
+    yesterday_tasks = [{"summary": s} for s in (
+        recap.yesterday.completed + recap.yesterday.blocked + recap.yesterday.still_open
+    )]
+    calendar_lines = recap.today.calendar_events + recap.today.constraints
+    personal_inbox_lines = (
+        recap.personal_inbox.urgent
+        + recap.personal_inbox.needs_reply
+        + recap.personal_inbox.important_fyi
+    )
+    agent_inbox_lines = recap.agent_inbox.operational_items + recap.agent_inbox.alerts
+    notion_lines = (
+        recap.notion.inbox
+        + recap.notion.review
+        + recap.notion.blocked_or_stale
+    )
+
+    ctx = {
+        "run_date": recap.run_date,
+        "delivery_time": recap.delivery_time,
+        "timezone": recap.timezone,
+        "attention_items": attention_items,
+        "yesterday_tasks": yesterday_tasks,
+        "calendar_lines": calendar_lines,
+        "personal_inbox_lines": personal_inbox_lines,
+        "agent_inbox_lines": agent_inbox_lines,
+        "notion_lines": notion_lines,
+    }
+
+    try:
+        template = env.get_template("email_recap.html")
+        return template.render(recap=ctx)
+    except Exception:
+        return None
 
 
 def _render_bullets(title: str, items: list[str]) -> str:

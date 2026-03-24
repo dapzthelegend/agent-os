@@ -1,0 +1,104 @@
+{% extends "base.html" %}
+{% block title %}System Health · agentic-os{% endblock %}
+{% block content %}
+<section class="section">
+  <div class="section-header">
+    <h1>System Health</h1>
+    <p>Checked at {{ health.checked_at }}</p>
+    <span class="badge {% if health.status == 'ok' %}success{% elif health.status == 'degraded' %}warning{% else %}danger{% endif %}">
+      {{ health.status | upper }}
+    </span>
+  </div>
+
+  <div class="grid two-up">
+
+    <!-- DB -->
+    <article class="card">
+      <h2>Database</h2>
+      {% if health.db.reachable %}
+      <p class="badge success">reachable</p>
+      <table class="table-sm">
+        <tbody>
+          {% for table, count in health.db.row_counts.items() %}
+          <tr><td>{{ table }}</td><td>{{ count }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+      <p class="badge danger">unreachable</p>
+      <p class="muted">{{ health.db.error }}</p>
+      {% endif %}
+    </article>
+
+    <!-- Audit log -->
+    <article class="card">
+      <h2>Audit Log</h2>
+      {% if health.audit_log.exists %}
+      <p class="badge success">exists</p>
+      <p>Size: {{ (health.audit_log.size_bytes / 1024) | round(1) }} KB</p>
+      {% if health.audit_log.last_event_at %}
+      <p class="muted">Last event: {{ health.audit_log.last_event_at }}</p>
+      {% endif %}
+      {% else %}
+      <p class="badge warning">not found</p>
+      {% endif %}
+    </article>
+
+    <!-- Artifacts dir -->
+    <article class="card">
+      <h2>Artifacts Dir</h2>
+      {% if health.artifacts_dir.writable %}
+      <p class="badge success">writable</p>
+      <p class="muted">{{ health.artifacts_dir.path }}</p>
+      {% else %}
+      <p class="badge danger">not writable</p>
+      <p class="muted">{{ health.artifacts_dir.error }}</p>
+      {% endif %}
+    </article>
+
+    <!-- Config -->
+    <article class="card">
+      <h2>Config</h2>
+      <p>Notion token: <span class="badge {% if health.config.notion_token_set %}success{% else %}warning{% endif %}">
+        {% if health.config.notion_token_set %}set{% else %}not set{% endif %}
+      </span></p>
+      {% if health.config.issues %}
+      <ul class="issue-list">
+        {% for issue in health.config.issues %}
+        <li class="badge danger">{{ issue }}</li>
+        {% endfor %}
+      </ul>
+      {% endif %}
+    </article>
+
+  </div>
+
+  <!-- Cron jobs -->
+  <article class="card" style="margin-top:1rem">
+    <h2>Cron Jobs</h2>
+    {% if health.cron.jobs %}
+    <table class="table">
+      <thead>
+        <tr><th>ID</th><th>Enabled</th><th>Last Run</th><th>Consecutive Errors</th><th>Status</th></tr>
+      </thead>
+      <tbody>
+        {% for job in health.cron.jobs %}
+        <tr>
+          <td>{{ job.id }}</td>
+          <td>{{ "yes" if job.enabled else "no" }}</td>
+          <td>{{ job.last_run_at or "—" }}</td>
+          <td>{{ job.consecutive_errors }}</td>
+          <td><span class="badge {% if job.status == 'ok' %}success{% elif job.status == 'warning' %}warning{% else %}danger{% endif %}">{{ job.status }}</span></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% elif health.cron.note %}
+    <p class="muted">{{ health.cron.note }}</p>
+    {% else %}
+    <p class="muted">No cron jobs found.</p>
+    {% endif %}
+  </article>
+
+</section>
+{% endblock %}

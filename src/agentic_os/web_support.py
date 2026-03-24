@@ -81,9 +81,9 @@ def build_overview(service: AgenticOSService) -> dict[str, Any]:
         "recent_failures_count": failures["count"],
         "recent_external_actions_count": external_actions["count"],
         "recent_tasks": [serialize_task(task) for task in tasks[:10]],
-        "pending_approvals": pending_approvals["items"][:5],
-        "recent_failures": failures["items"],
-        "recent_external_actions": external_actions["items"],
+        "pending_approvals": pending_approvals.get("records", [])[:5],
+        "recent_failures": failures.get("records", []),
+        "recent_external_actions": external_actions.get("records", []),
     }
 
 

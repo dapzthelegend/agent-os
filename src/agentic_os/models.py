@@ -5,7 +5,7 @@ from typing import Any, Optional
 
 
 DOMAINS = ("personal", "technical", "finance", "system")
-INTENT_TYPES = ("read", "draft", "execute", "capture", "recap")
+INTENT_TYPES = ("read", "draft", "execute", "capture", "recap", "content")
 RISK_LEVELS = ("low", "medium", "high")
 ACTION_SOURCES = ("openclaw_tool", "openclaw_skill", "custom_adapter", "manual")
 STATUSES = (
@@ -18,6 +18,7 @@ STATUSES = (
     "completed",
     "failed",
     "cancelled",
+    "stalled",
 )
 APPROVAL_STATES = ("not_needed", "pending", "approved", "denied", "cancelled")
 POLICY_DECISIONS = ("read_ok", "draft_required", "approval_required")
@@ -70,6 +71,12 @@ class TaskRecord:
     external_write: bool
     policy_decision: Optional[str]
     action_source: str
+    retry_count: int = 0
+    # Phase 2 — dispatch tracking (added via TASK_COLUMNS migration)
+    claimed_at: Optional[str] = None
+    claimed_by: Optional[str] = None
+    dispatch_session_key: Optional[str] = None
+    dispatch_attempts: int = 0
 
 
 @dataclass(frozen=True)
@@ -102,6 +109,7 @@ class ExecutionRecord:
     result_summary: Optional[str]
     created_at: str
     updated_at: str
+    session_key: Optional[str] = None
 
     def validate(self) -> "ExecutionRecord":
         validate_choice(self.status, EXECUTION_STATES, "status")

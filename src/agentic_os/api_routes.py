@@ -6,6 +6,9 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from .config import default_paths, load_app_config
+from .health import get_system_health
+from .execution_receiver import ExecutionParseError, receive_execution_result
 from .models import OperatorError
 from .web_support import (
     annotate_audit_events,
@@ -23,6 +26,10 @@ from .web_support import (
 router = APIRouter(prefix="/api", tags=["api"])
 
 
+class RetryTaskPayload(BaseModel):
+    feedback: str = "operator retry"
+
+
 class ApprovalDecisionPayload(BaseModel):
     note: Optional[str] = None
 
@@ -31,6 +38,17 @@ class ArtifactRevisionPayload(BaseModel):
     artifact_type: Optional[str] = None
     artifact_text: str = ""
     artifact_json: str = ""
+
+
+class ExecutionCallbackPayload(BaseModel):
+    task_id: str
+    session_key: str = "unknown"
+    output: str
+
+
+@router.get("/health")
+def api_health() -> dict:
+    return get_system_health(get_service())
 
 
 @router.get("/overview")
@@ -139,6 +157,24 @@ def api_recap_external_actions(domain: Optional[str] = None, limit: int = 20) ->
     return get_service().recap_external_actions(domain=domain, limit=limit)
 
 
+@router.post("/tasks/{task_id}/retry")
+def api_retry_task(task_id: str, payload: RetryTaskPayload) -> dict:
+    try:
+        return get_service().retry_task(task_id, feedback=payload.feedback)
+    except Exception as exc:
+        raise _handle_operator_error(exc) from exc
+
+
+@router.get("/recap/overdue")
+def api_recap_overdue(domain: Optional[str] = None, threshold_hours: float = 48.0) -> dict:
+    return get_service().recap_overdue(domain=domain, threshold_hours=threshold_hours)
+
+
+@router.get("/recap/in-progress")
+def api_recap_in_progress(domain: Optional[str] = None) -> dict:
+    return get_service().recap_in_progress(domain=domain)
+
+
 def _handle_operator_error(exc: Exception) -> HTTPException:
     if isinstance(exc, KeyError):
         return HTTPException(status_code=404, detail=str(exc))
@@ -171,6 +207,38 @@ def api_cancel(approval_id: str, payload: ApprovalDecisionPayload) -> dict:
         return get_service().cancel(approval_id, decision_note=payload.note)
     except Exception as exc:
         raise _handle_operator_error(exc) from exc
+
+
+@router.post("/executions/callback")
+def api_execution_callback(payload: ExecutionCallbackPayload) -> dict:
+    """
+    Receive ACP agent output and complete the execution pipeline.
+
+    The agent output must contain RESULT_START...RESULT_END markers and
+    TASK_DONE: <task_id>. On duplicate submission (same operation_key),
+    returns the existing record with idempotent=true.
+    """
+    paths = default_paths()
+    try:
+        result = receive_execution_result(
+            payload.output,
+            task_id=payload.task_id,
+            session_key=payload.session_key,
+            paths=paths,
+        )
+        return {
+            "status": "success" if result.success else "error",
+            "task_id": result.task_id,
+            "artifact_id": result.artifact_id,
+            "idempotent": result.idempotent,
+            "error": result.error,
+        }
+    except ExecutionParseError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @router.post("/artifacts/{task_id}/revise")

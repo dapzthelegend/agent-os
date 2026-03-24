@@ -18,6 +18,7 @@ from .daily_routine import (
     extract_follow_up_actions,
     infer_domain,
     prepare_email_payload,
+    render_html_email,
     render_plaintext_email,
     summarize_task_for_yesterday,
 )
@@ -39,6 +40,19 @@ class AgenticOSService:
         self.db.initialize()
         self.audit.ensure()
         self.artifacts.ensure()
+        # 7.5 — Config validation: log issues to stderr; send Discord DM on failure
+        from .health import validate_startup_config
+        issues = validate_startup_config(self.paths, self.config)
+        if issues:
+            import sys
+            for issue in issues:
+                print(f"[agentic-os] CONFIG WARNING: {issue}", file=sys.stderr)
+            try:
+                from .notification_router import _send_with_fallback
+                msg = "agentic-os startup config issues:\n" + "\n".join(f"• {i}" for i in issues)
+                _send_with_fallback(msg, channel_hint="startup_config")
+            except Exception:
+                pass
 
     def create_request(
         self,
@@ -67,6 +81,7 @@ class AgenticOSService:
             classification=classification,
             target=target,
             external_write=external_write,
+            action_source=action_source,
         )
         if policy_decision == "approval_required" and not operation_key:
             raise ValueError("approval_required requests must include an operation_key")
@@ -303,6 +318,62 @@ class AgenticOSService:
             action_source=action_source,
         )
 
+    # ── Execution loop helpers ────────────────────────────────────────────────
+
+    def list_ready_tasks(self, *, limit: int = 20) -> list[TaskRecord]:
+        """Tasks eligible for execution: approved, or new with read_ok policy."""
+        return self.db.query_ready_tasks(limit=limit)
+
+    def pickup_task(self, task_id: str, *, claimed_by: str = "task_executor_cron") -> dict:
+        """Atomically claim a task for execution. Emits task_picked_up audit event."""
+        result = self.db.pickup_task(task_id, claimed_by=claimed_by)
+        if result["success"]:
+            self._append_event(
+                task_id=task_id,
+                event_type="task_picked_up",
+                payload={"task_id": task_id, "claimed_by": claimed_by},
+            )
+        return result
+
+    def mark_dispatched(self, task_id: str, *, session_key: str, agent: str) -> None:
+        """Record that a child session was spawned. Emits task_dispatched audit event."""
+        self.db.update_dispatch_session_key(task_id, session_key)
+        self._append_event(
+            task_id=task_id,
+            event_type="task_dispatched",
+            payload={"task_id": task_id, "session_key": session_key, "agent": agent},
+        )
+
+    def record_spawn_failure(self, task_id: str, *, reason: str) -> TaskRecord:
+        """Mark a task failed after a spawn error. Emits spawn_failed audit event."""
+        task = self.fail_task(task_id, reason=f"spawn_failed: {reason}")
+        self._append_event(
+            task_id=task_id,
+            event_type="spawn_failed",
+            payload={"task_id": task_id, "reason": reason},
+        )
+        return task
+
+    def requeue_task(self, task_id: str) -> TaskRecord:
+        """
+        Reset a stalled task back to its pre-execution ready state.
+        Returns to 'approved' if it was explicitly approved, else 'new'.
+        Emits task_requeued audit event.
+        """
+        task = self.db.get_task(task_id)
+        if task.status not in ("stalled", "failed", "in_progress"):
+            raise ValueError(f"task {task_id} is not requeue-eligible (status={task.status})")
+        target_status = "approved" if task.approval_state == "approved" else "new"
+        self.db.update_task(task_id, status=target_status)
+        self._append_event(
+            task_id=task_id,
+            event_type="task_requeued",
+            payload={"task_id": task_id, "from_status": task.status, "to_status": target_status},
+        )
+        return self.db.get_task(task_id)
+
+    # ─────────────────────────────────────────────────────────────────────────
+
     def list_approvals(self, task_id: Optional[str] = None) -> list[ApprovalRecord]:
         return self.db.list_approvals(task_id=task_id)
 
@@ -416,21 +487,45 @@ class AgenticOSService:
         tasks = self.list_tasks(limit=500, domain=domain)
         today = self._today_utc_date()
         todays_tasks = [task for task in tasks if task.created_at[:10] == today]
+
+        # Pending approvals count (all time, not just today)
+        pending_approvals = self.db.list_approvals_by_status("pending")
+        pending_approval_count = sum(
+            1 for a in pending_approvals
+            if domain is None or self.db.get_task(a.task_id).domain == domain
+        )
+
+        # In-progress tasks (all time)
+        in_progress_tasks = [
+            task for task in self.list_tasks(limit=500, domain=domain)
+            if task.status in {"in_progress", "awaiting_input", "awaiting_approval"}
+        ]
+
+        # Overdue tasks (>48h no update, not terminal)
+        overdue = self._find_overdue_tasks(domain=domain)
+
         return {
             "scope": "today",
             "date": today,
             "domain": domain,
             "counts": self._task_counts(todays_tasks),
             "by_domain": self._group_task_counts(todays_tasks, key_name="domain"),
-            "items": [self._task_snapshot(task) for task in todays_tasks],
+            "pending_approvals_count": pending_approval_count,
+            "in_progress_count": len(in_progress_tasks),
+            "overdue_count": len(overdue),
+            "records": [self._task_snapshot(task) for task in todays_tasks],
+            "in_progress": [self._task_snapshot(task) for task in in_progress_tasks[:10]],
+            "overdue": overdue[:10],
         }
 
     def recap_approvals(self, *, domain: Optional[str] = None) -> dict[str, Any]:
         approvals = []
+        now_utc = datetime.now(timezone.utc)
         for approval in self.db.list_approvals_by_status("pending"):
             task = self.db.get_task(approval.task_id)
             if domain is not None and task.domain != domain:
                 continue
+            hours_pending = self._hours_since(approval.created_at, now_utc)
             approvals.append(
                 {
                     "approval_id": approval.id,
@@ -442,13 +537,42 @@ class AgenticOSService:
                     "operation_key": approval.operation_key,
                     "created_at": approval.created_at,
                     "user_request": task.user_request,
+                    "hours_pending": round(hours_pending, 1),
+                    "escalation_flag": hours_pending >= 2.0,
                 }
             )
+        # Sort by longest-pending first
+        approvals.sort(key=lambda r: r["hours_pending"], reverse=True)
         return {
             "scope": "awaiting_approval",
             "domain": domain,
             "count": len(approvals),
-            "items": approvals,
+            "escalated_count": sum(1 for r in approvals if r["escalation_flag"]),
+            "records": approvals,
+        }
+
+    def recap_overdue(self, *, domain: Optional[str] = None, threshold_hours: float = 48.0) -> dict[str, Any]:
+        """Return tasks that have had no update for more than threshold_hours and are not in a terminal state."""
+        overdue = self._find_overdue_tasks(domain=domain, threshold_hours=threshold_hours)
+        return {
+            "scope": "overdue",
+            "domain": domain,
+            "threshold_hours": threshold_hours,
+            "count": len(overdue),
+            "records": overdue,
+        }
+
+    def recap_in_progress(self, *, domain: Optional[str] = None) -> dict[str, Any]:
+        """Return all tasks currently in a non-terminal, non-completed state."""
+        tasks = [
+            task for task in self.list_tasks(limit=500, domain=domain)
+            if task.status in {"in_progress", "awaiting_input", "awaiting_approval", "approved"}
+        ]
+        return {
+            "scope": "in_progress",
+            "domain": domain,
+            "count": len(tasks),
+            "records": [self._task_snapshot(task) for task in tasks],
         }
 
     def recap_drafts(self, *, domain: Optional[str] = None) -> dict[str, Any]:
@@ -457,7 +581,7 @@ class AgenticOSService:
             "scope": "open_drafts",
             "domain": domain,
             "count": len(tasks),
-            "items": [self._task_snapshot(task) for task in tasks],
+            "records": [self._task_snapshot(task) for task in tasks],
         }
 
     def recap_failures(self, *, domain: Optional[str] = None, limit: int = 20) -> dict[str, Any]:
@@ -467,12 +591,12 @@ class AgenticOSService:
             "scope": "recent_failures",
             "domain": domain,
             "count": len(recent_failures),
-            "items": [self._task_snapshot(task) for task in recent_failures],
+            "records": [self._task_snapshot(task) for task in recent_failures],
         }
 
     def recap_external_actions(self, *, domain: Optional[str] = None, limit: int = 20) -> dict[str, Any]:
         tasks = self.list_tasks(limit=500, domain=domain)
-        items = [
+        records = [
             {
                 "task_id": task.id,
                 "domain": task.domain,
@@ -490,8 +614,8 @@ class AgenticOSService:
         return {
             "scope": "external_actions",
             "domain": domain,
-            "count": len(items[:limit]),
-            "items": items[:limit],
+            "count": len(records[:limit]),
+            "records": records[:limit],
         }
 
     def run_daily_routine(
@@ -499,6 +623,7 @@ class AgenticOSService:
         *,
         payload: dict[str, Any],
         create_notion_tasks: bool = True,
+        send_email: bool = False,
     ) -> dict[str, Any]:
         routine_input = DailyRoutineInput.from_dict(payload)
         classification = RequestClassification(
@@ -521,7 +646,19 @@ class AgenticOSService:
         task = request_payload["task"]
 
         yesterday = self._build_yesterday_recap(routine_input.date)
-        recap = build_daily_recap(routine_input, yesterday)
+        # Enrich recap with live pending approvals and overdue tasks (Phase 6 gap closed)
+        pending_approvals_raw = [
+            {"approval_id": a.id, "task_id": a.task_id, "subject_type": a.subject_type,
+             "hours_pending": self._hours_since(a.created_at)}
+            for a in self.db.list_approvals(status="pending")
+        ]
+        overdue_tasks_raw = self._find_overdue_tasks(domain=None, threshold_hours=48.0)
+        recap = build_daily_recap(
+            routine_input,
+            yesterday,
+            pending_approvals=pending_approvals_raw,
+            overdue_tasks=overdue_tasks_raw,
+        )
         email_body = render_plaintext_email(recap)
         email_payload = prepare_email_payload(recap, email_body)
         artifact = self._create_artifact(
@@ -589,11 +726,37 @@ class AgenticOSService:
             event_type="task_completed",
             payload={"result_summary": summary},
         )
+        email_sent = False
+        email_send_error: Optional[str] = None
+        if send_email:
+            from .gmail_sender import send_email as _send_gmail
+            html_body = render_html_email(recap)
+            ok = _send_gmail(
+                to=routine_input.recipient,
+                subject=email_payload["subject"],
+                body=email_body,
+                html_body=html_body,
+            )
+            email_sent = ok
+            if not ok:
+                email_send_error = "gmail_send_failed"
+            self._append_event(
+                task_id=task.id,
+                event_type="daily_routine_email_sent" if ok else "daily_routine_email_send_failed",
+                payload={
+                    "to": routine_input.recipient,
+                    "subject": email_payload["subject"],
+                    "html": html_body is not None,
+                },
+            )
+
         return {
             "task": task,
             "recap": recap.to_dict(),
             "email_payload": email_payload,
             "email_body": email_body,
+            "email_sent": email_sent,
+            "email_send_error": email_send_error,
             "created_followups": created_followups,
             "created_notion_tasks": created_notion_tasks,
             "skipped_followups": skipped_followups,
@@ -656,6 +819,29 @@ class AgenticOSService:
             "approval": approval,
         }
 
+    def send_approval_reminders(self, threshold_hours: float = 1.0) -> dict[str, Any]:
+        """Send reminders for all pending approvals older than threshold_hours."""
+        from .notification_router import route_approval_reminder
+        now_utc = datetime.now(timezone.utc)
+        results = []
+        for approval in self.db.list_approvals_by_status("pending"):
+            task = self.db.get_task(approval.task_id)
+            hours = self._hours_since(approval.created_at, now_utc)
+            if hours >= threshold_hours:
+                result = route_approval_reminder(task, approval, hours)
+                results.append({
+                    "approval_id": approval.id,
+                    "task_id": task.id,
+                    "hours_pending": round(hours, 1),
+                    "channel": result.channel,
+                    "sent": result.success,
+                })
+        return {
+            "reminded": len(results),
+            "threshold_hours": threshold_hours,
+            "records": results,
+        }
+
     def approve(self, approval_id: str, decision_note: Optional[str] = None) -> dict[str, Any]:
         approval = self.db.get_approval(approval_id)
         if approval.status != "pending":
@@ -670,7 +856,63 @@ class AgenticOSService:
         approval = self.db.update_approval(approval_id, status="approved", decision_note=decision_note)
         task = self.db.update_task(approval.task_id, status="approved", approval_state="approved")
         self._append_event(task_id=task.id, event_type="approval_granted", payload={"approval": asdict(approval)})
+        self._try_send_approved_draft(task, approval)
         return {"task": task, "approval": approval}
+
+    def _try_send_approved_draft(self, task: TaskRecord, approval: ApprovalRecord) -> None:
+        """If the approved task is a gmail_reply_draft, send the draft email to the original sender."""
+        if task.target != "gmail_reply_draft":
+            return
+        try:
+            artifacts = self.db.list_artifacts(task.id)
+            draft_artifact = next(
+                (a for a in artifacts if a["artifact_type"] == "email_draft"), None
+            )
+            if draft_artifact is None:
+                self._append_event(
+                    task_id=task.id,
+                    event_type="draft_send_skipped",
+                    payload={"reason": "no email_draft artifact found"},
+                )
+                return
+            content_raw = self.artifacts.read_text(draft_artifact["path"])
+            # Handle both plain text and JSON {"body": "..."} format
+            try:
+                parsed = json.loads(content_raw)
+                body = parsed.get("body") or parsed.get("text") or content_raw
+            except (json.JSONDecodeError, AttributeError):
+                body = content_raw
+
+            metadata: dict[str, Any] = {}
+            if task.request_metadata_json:
+                try:
+                    metadata = json.loads(task.request_metadata_json) or {}
+                except json.JSONDecodeError:
+                    pass
+            sender = str(metadata.get("sender") or "")
+            subject = str(metadata.get("subject") or task.user_request.splitlines()[0])
+            if not sender:
+                self._append_event(
+                    task_id=task.id,
+                    event_type="draft_send_skipped",
+                    payload={"reason": "no sender in request_metadata_json"},
+                )
+                return
+            from .gmail_sender import send_email
+            ok = send_email(to=sender, subject=f"Re: {subject}", body=str(body))
+            self._append_event(
+                task_id=task.id,
+                event_type="draft_sent" if ok else "draft_send_failed",
+                payload={"to": sender, "subject": subject, "success": ok},
+            )
+        except Exception as exc:  # noqa: BLE001
+            import sys
+            print(f"[service] _try_send_approved_draft failed: {exc}", file=sys.stderr)
+            self._append_event(
+                task_id=task.id,
+                event_type="draft_send_failed",
+                payload={"error": str(exc)},
+            )
 
     def deny(self, approval_id: str, decision_note: Optional[str] = None) -> dict[str, Any]:
         approval = self.db.get_approval(approval_id)
@@ -800,10 +1042,11 @@ class AgenticOSService:
         approvals = self.db.list_approvals(task_id)
         if approvals:
             latest_approval = approvals[0]
+        approval_id_for_exec = latest_approval.id if latest_approval and latest_approval.status == "approved" else None
         execution = self.db.create_execution(
             operation_key=task.operation_key,
             task_id=task.id,
-            approval_id=latest_approval.id if latest_approval and latest_approval.status == "approved" else None,
+            approval_id=approval_id_for_exec,
             status="executed",
             result_summary=result_summary,
         )
@@ -814,11 +1057,17 @@ class AgenticOSService:
             tool_name=tool_name,
             operation_key=task.operation_key,
         )
+        correlation = {
+            "task_id": task.id,
+            "execution_id": execution.operation_key,
+            "approval_id": approval_id_for_exec,
+        }
         self._append_event(
             task_id=task.id,
             event_type="action_execution_recorded",
             payload={
                 **operator,
+                **correlation,
                 "status": execution.status,
                 "result_summary": result_summary,
                 "tool_result": tool_result or {},
@@ -829,6 +1078,7 @@ class AgenticOSService:
             event_type="action_executed",
             payload={
                 **operator,
+                **correlation,
                 "status": execution.status,
                 "result_summary": result_summary,
             },
@@ -837,7 +1087,7 @@ class AgenticOSService:
         self._append_event(
             task_id=task.id,
             event_type="task_completed",
-            payload={"result_summary": result_summary},
+            payload={**correlation, "result_summary": result_summary},
         )
         return {
             "task": task,
@@ -1200,7 +1450,8 @@ class AgenticOSService:
             "notion_task": self._serialize_notion_task(notion_task),
         }
 
-    def complete_task(self, task_id: str, result_summary: str) -> TaskRecord:
+    def complete_task(self, task_id: str, result_summary: str = "", *, artifact_ref: Optional[str] = None) -> TaskRecord:
+        """Mark task as executed with result summary and optional artifact reference."""
         task = self.db.get_task(task_id)
         if task.status in {"completed", "cancelled"}:
             self._record_task_operation_rejection(
@@ -1210,12 +1461,46 @@ class AgenticOSService:
                 operation="task.complete",
                 current_status=task.status,
             )
-        task = self.db.update_task(task_id, status="completed", result_summary=result_summary)
+        # Use "executed" for artifact-based completion, "completed" for direct completion
+        status = "executed" if artifact_ref else "completed"
+        task = self.db.update_task(
+            task_id,
+            status=status,
+            result_summary=result_summary,
+            artifact_ref=artifact_ref,
+        )
         self._append_event(
             task_id=task_id,
             event_type="task_completed",
-            payload={"result_summary": result_summary},
+            payload={"result_summary": result_summary, "artifact_ref": artifact_ref},
         )
+
+        # Full Notion writeback when task has an external Notion page
+        if task.external_ref:
+            try:
+                from .notion_result_writer import write_success
+                write_success(
+                    page_id=task.external_ref,
+                    task=task,
+                    result_summary=result_summary,
+                    config=self.config,
+                    artifact_id=artifact_ref,
+                )
+            except Exception as exc:
+                self._append_event(
+                    task_id=task_id,
+                    event_type="notion_update_failed",
+                    payload={"error": str(exc)},
+                )
+
+        # Send completion notification
+        try:
+            from .notifier import notify_task_completed
+            word_count = len(result_summary.split()) if task.intent_type == "content" else None
+            notify_task_completed(task, word_count=word_count)
+        except Exception:
+            pass
+
         return task
 
     def fail_task(self, task_id: str, reason: str) -> TaskRecord:
@@ -1230,7 +1515,85 @@ class AgenticOSService:
             )
         task = self.db.update_task(task_id, status="failed", result_summary=reason)
         self._append_event(task_id=task.id, event_type="task_failed", payload={"reason": reason})
+
+        # Update Notion status → Blocked (if task has an external Notion page)
+        if task.external_ref:
+            try:
+                from .notion_result_writer import write_failure
+                write_failure(task.external_ref, reason, config=self.config)
+            except Exception as exc:
+                self._append_event(
+                    task_id=task_id,
+                    event_type="notion_update_failed",
+                    payload={"error": str(exc)},
+                )
+
+        # Send Discord notification
+        try:
+            from .notifier import notify_task_failed
+            notify_task_failed(task)
+        except Exception:
+            pass
+
         return task
+
+    def reset_task_for_retry(self, task_id: str, *, feedback: str) -> TaskRecord:
+        """Reset task to in_progress for retry (max 2 retries)."""
+        task = self.db.get_task(task_id)
+        retry_count = (task.retry_count or 0) + 1
+        
+        if retry_count > 2:
+            # Max retries exceeded, fail the task
+            task = self.db.update_task(
+                task_id,
+                status="failed",
+                result_summary=f"Max retries exceeded. Last feedback: {feedback}",
+                retry_count=retry_count,
+            )
+            self._append_event(
+                task_id=task_id,
+                event_type="task_failed",
+                payload={"reason": "max_retries_exceeded", "feedback": feedback},
+            )
+        else:
+            # Reset to in_progress for retry
+            task = self.db.update_task(
+                task_id,
+                status="in_progress",
+                result_summary=f"Retry {retry_count}: {feedback}",
+                retry_count=retry_count,
+            )
+            self._append_event(
+                task_id=task_id,
+                event_type="task_retry_reset",
+                payload={"retry_count": retry_count, "feedback": feedback},
+            )
+        
+        return task
+
+    # ------------------------------------------------------------------
+    # 7.1 — Task timeout & recovery
+    # ------------------------------------------------------------------
+
+    def flag_stalled_tasks(self, threshold_hours: float = 2.0) -> dict:
+        """
+        Scan for in_progress/awaiting_input tasks silent for >threshold_hours,
+        flag them as stalled, and fire Discord DM alerts.
+
+        Called by the stall-check cron job.
+        """
+        from .recovery import scan_and_flag_stalled_tasks
+        return scan_and_flag_stalled_tasks(self, threshold_hours=threshold_hours)
+
+    def retry_task(self, task_id: str, *, feedback: str = "operator retry") -> dict:
+        """
+        Operator-initiated retry for a stalled or failed task.
+
+        Delegates to recovery.retry_stalled_task() which calls
+        reset_task_for_retry() (max 2 retries enforced there).
+        """
+        from .recovery import retry_stalled_task
+        return retry_stalled_task(self, task_id, feedback=feedback)
 
     def evaluate_policy(
         self,
@@ -1238,6 +1601,7 @@ class AgenticOSService:
         classification: RequestClassification,
         target: Optional[str],
         external_write: bool,
+        action_source: Optional[str] = None,
     ) -> str:
         rules = load_policy_rules(self.paths.policy_rules_path)
         context = {
@@ -1246,6 +1610,7 @@ class AgenticOSService:
             "risk_level": classification.risk_level,
             "target": target,
             "external_write": external_write,
+            "action_source": action_source,
         }
         for rule in rules:
             match = rule.get("match", {})
@@ -1319,6 +1684,14 @@ class AgenticOSService:
             payload_json=json.dumps(approval_payload, sort_keys=True),
         )
         self._append_event(task_id=task.id, event_type="approval_requested", payload={"approval": asdict(approval)})
+
+        # Send smart notification for new approval request
+        try:
+            from .notifier import notify_approval_requested
+            notify_approval_requested(task, approval)
+        except Exception:
+            pass
+
         return approval
 
     @staticmethod
@@ -1679,6 +2052,13 @@ class AgenticOSService:
             raise ValueError(f"no Notion status mapping configured for backend status {backend_status}")
         return self.config.notion.status_map[backend_status]
 
+    def record_session_key(self, task_id: str, session_key: str) -> None:
+        """Record the OpenClaw session key for a task's execution."""
+        task = self.db.get_task(task_id)
+        if not task.operation_key:
+            raise ValueError(f"Task {task_id} has no operation_key")
+        self.db.update_execution_session_key(operation_key=task.operation_key, session_key=session_key)
+
     @staticmethod
     def _serialize_notion_task(task: NotionTask) -> dict[str, Any]:
         return {
@@ -1698,3 +2078,37 @@ class AgenticOSService:
     @staticmethod
     def _today_utc_date() -> str:
         return datetime.now(timezone.utc).date().isoformat()
+
+    @staticmethod
+    def _hours_since(iso_timestamp: str, now: datetime) -> float:
+        """Return hours elapsed since an ISO timestamp string."""
+        try:
+            ts = datetime.fromisoformat(iso_timestamp.replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            delta = now - ts
+            return delta.total_seconds() / 3600.0
+        except (ValueError, TypeError):
+            return 0.0
+
+    def _find_overdue_tasks(
+        self,
+        *,
+        domain: Optional[str] = None,
+        threshold_hours: float = 48.0,
+    ) -> list[dict[str, Any]]:
+        """Return snapshots of tasks with no update for >threshold_hours and not in a terminal state."""
+        terminal = {"completed", "failed", "cancelled", "executed"}
+        all_tasks = self.list_tasks(limit=500, domain=domain)
+        now_utc = datetime.now(timezone.utc)
+        overdue = []
+        for task in all_tasks:
+            if task.status in terminal:
+                continue
+            hours_since_update = self._hours_since(task.updated_at, now_utc)
+            if hours_since_update >= threshold_hours:
+                snapshot = self._task_snapshot(task)
+                snapshot["hours_since_update"] = round(hours_since_update, 1)
+                overdue.append(snapshot)
+        overdue.sort(key=lambda r: r["hours_since_update"], reverse=True)
+        return overdue

@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import json
 import re
+import ssl
+import time
 from dataclasses import dataclass
 from datetime import datetime
+from functools import lru_cache
 from typing import Any, Optional
 from urllib import error, parse, request
 
-from .config import NotionConfig
+from .config import AppConfig, NotionConfig
 
 DATA_SOURCE_NOTION_VERSION = "2025-09-03"
 
@@ -32,14 +35,80 @@ class NotionError(RuntimeError):
     pass
 
 
+@lru_cache(maxsize=1)
+def _ssl_context() -> ssl.SSLContext:
+    """Return an SSL context using certifi's CA bundle (fixes macOS Python 3.9 cert issues)."""
+    try:
+        import certifi
+        ctx = ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        ctx = ssl.create_default_context()
+    return ctx
+
+
+def _request_with_retry(
+    req: request.Request,
+    *,
+    max_retries: int = 3,
+    base_delay: float = 1.0,
+) -> dict[str, Any]:
+    """
+    Make an HTTP request with exponential backoff retry on 429 (rate limit) and 5xx errors.
+    
+    Args:
+        req: urllib.request.Request to execute
+        max_retries: maximum number of retries (default 3)
+        base_delay: initial delay in seconds; doubles with each retry
+    
+    Returns:
+        parsed JSON response
+    
+    Raises:
+        NotionError: if request fails after retries or on non-retryable error
+    """
+    for attempt in range(max_retries + 1):
+        try:
+            with request.urlopen(req, timeout=30, context=_ssl_context()) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except error.HTTPError as exc:
+            # Retry on rate limit (429) or server errors (5xx)
+            should_retry = exc.code == 429 or exc.code >= 500
+            
+            if should_retry and attempt < max_retries:
+                delay = base_delay * (2 ** attempt)
+                time.sleep(delay)
+                continue
+            
+            # No more retries, or non-retryable error
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise NotionError(f"Notion API {exc.code} for {req.get_method()} {req.get_full_url()}: {detail}") from exc
+        except error.URLError as exc:
+            raise NotionError(f"Notion API request failed: {exc.reason}") from exc
+
+
 def _isoformat_timestamp(value: str) -> str:
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     return parsed.isoformat().replace("+00:00", "Z")
 
 
 class NotionAdapter:
-    def __init__(self, config: NotionConfig) -> None:
+    def __init__(self, config: NotionConfig, *, db_key: str = "tasks") -> None:
         self.config = config
+        self.db_key = db_key
+    
+    @classmethod
+    def for_db(cls, app_config: AppConfig, db_key: str = "tasks") -> "NotionAdapter":
+        """
+        Preferred construction path. Gets the right config for db_key.
+        
+        Args:
+            app_config: AppConfig instance
+            db_key: database key, e.g. "tasks", "projects"
+        
+        Returns:
+            NotionAdapter configured for the specified database
+        """
+        return cls(app_config.get_notion_db(db_key), db_key=db_key)
 
     def create_task(
         self,
@@ -182,7 +251,8 @@ class NotionAdapter:
                 "title": [{"type": "text", "text": {"content": title}}]
             }
         if status is not None:
-            properties[self.config.properties.status] = {"status": {"name": status}}
+            notion_status = self.config.status_map.get(status, status)
+            properties[self.config.properties.status] = {"status": {"name": notion_status}}
         if task_type is not None:
             properties[self.config.properties.type] = self._build_named_option_property(
                 task_type,
@@ -228,14 +298,7 @@ class NotionAdapter:
                 "Notion-Version": self._request_notion_version(path, payload),
             },
         )
-        try:
-            with request.urlopen(req, timeout=30) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise NotionError(f"Notion API {exc.code} for {method} {path}: {detail}") from exc
-        except error.URLError as exc:
-            raise NotionError(f"Notion API request failed for {method} {path}: {exc.reason}") from exc
+        return _request_with_retry(req)
 
     def _normalize_page(self, page: dict[str, Any]) -> NotionTask:
         properties = page.get("properties", {})

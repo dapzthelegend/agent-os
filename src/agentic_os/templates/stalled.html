@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}Stalled Tasks · agentic-os{% endblock %}
+{% block content %}
+<section class="section">
+  <div class="section-header">
+    <h1>Stalled Tasks</h1>
+    <p>Tasks in <code>in_progress</code> or <code>awaiting_input</code> with no update for &gt;{{ threshold_hours | int }}h.</p>
+  </div>
+
+  {% if stalled_tasks %}
+  <table class="table">
+    <thead>
+      <tr>
+        <th>Task ID</th>
+        <th>Domain</th>
+        <th>Status</th>
+        <th>Hours stalled</th>
+        <th>Request</th>
+        <th>Action</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for task in stalled_tasks %}
+      <tr>
+        <td><a href="/tasks/{{ task.task_id }}">{{ task.task_id }}</a></td>
+        <td>{{ task.domain }}</td>
+        <td><span class="badge warning">{{ task.status }}</span></td>
+        <td>{{ task.hours_since_update }}</td>
+        <td class="muted truncate">{{ task.user_request }}</td>
+        <td>
+          <form method="POST" action="/stalled/{{ task.task_id }}/retry" style="display:inline">
+            <button class="btn btn-sm" type="submit">Retry</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <article class="card">
+    <p class="muted">No stalled tasks — all active tasks have recent updates.</p>
+  </article>
+  {% endif %}
+
+</section>
+{% endblock %}
