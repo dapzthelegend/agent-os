@@ -29,7 +29,7 @@
         {% endfor %}
       </div>
       <ul class="list">
-        {% for item in recap_today.items[:8] %}
+        {% for item in recap_today.records[:8] %}
         <li><a href="/tasks/{{ item.task_id }}">{{ item.task_id }}</a> <span>{{ item.status }}</span></li>
         {% else %}
         <li class="muted">No tasks for the current day.</li>
@@ -41,7 +41,7 @@
       <h2>Approvals</h2>
       <p>{{ recap_approvals.count }} pending</p>
       <ul class="list">
-        {% for item in recap_approvals.items[:8] %}
+        {% for item in recap_approvals.records[:8] %}
         <li><a href="/approvals/{{ item.approval_id }}">{{ item.approval_id }}</a> <span>{{ item.user_request }}</span></li>
         {% else %}
         <li class="muted">No pending approvals.</li>
@@ -55,7 +55,7 @@
       <h2>Drafts</h2>
       <p>{{ recap_drafts.count }} open drafts</p>
       <ul class="list">
-        {% for item in recap_drafts.items[:8] %}
+        {% for item in recap_drafts.records[:8] %}
         <li><a href="/tasks/{{ item.task_id }}">{{ item.task_id }}</a> <span>{{ item.user_request }}</span></li>
         {% else %}
         <li class="muted">No open drafts.</li>
@@ -67,7 +67,7 @@
       <h2>Failures</h2>
       <p>{{ recap_failures.count }} recent failures</p>
       <ul class="list">
-        {% for item in recap_failures.items[:8] %}
+        {% for item in recap_failures.records[:8] %}
         <li><a href="/tasks/{{ item.task_id }}">{{ item.task_id }}</a> <span>{{ item.result_summary or "No summary" }}</span></li>
         {% else %}
         <li class="muted">No recent failures.</li>
@@ -80,7 +80,7 @@
     <h2>External actions</h2>
     <p>{{ recap_external_actions.count }} recorded action tasks</p>
     <ul class="list">
-      {% for item in recap_external_actions.items %}
+      {% for item in recap_external_actions.records %}
       <li>
         <a href="/tasks/{{ item.task_id }}">{{ item.task_id }}</a>
         <span>{{ item.operation_key or "no operation key" }}</span>

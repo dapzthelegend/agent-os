@@ -115,6 +115,7 @@ def normalize_inbox_item(item: dict[str, Any]) -> dict[str, Any]:
     )
     due = _optional_text(item.get("due") or item.get("deadline") or item.get("due_at") or item.get("dueAt"))
     actionable = _coerce_bool(item.get("actionable"), default=bool(requested_action or due))
+    message_id = _optional_text(item.get("message_id") or item.get("messageId") or item.get("id"))
     return {
         "subject": _first_non_empty(item, "subject", "title", "name", fallback="Untitled message"),
         "sender": _optional_text(item.get("sender") or item.get("from") or item.get("author")),
@@ -122,6 +123,7 @@ def normalize_inbox_item(item: dict[str, Any]) -> dict[str, Any]:
         "requested_action": requested_action,
         "due": due,
         "actionable": actionable,
+        "message_id": message_id,
     }
 
 

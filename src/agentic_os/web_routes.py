@@ -9,6 +9,7 @@ from fastapi.responses import RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from .models import OperatorError
+from .health import get_system_health
 from .web_support import (
     annotate_audit_events,
     approval_groups,
@@ -208,6 +209,30 @@ def audit_page(request: Request, limit: int = 50, domain: Optional[str] = None, 
             "filter_options": task_filter_options(service),
         },
     )
+
+
+@router.get("/health")
+def health_page(request: Request):
+    service = get_service()
+    health = get_system_health(service)
+    return _render(request, "health.html", {"health": health})
+
+
+@router.get("/stalled")
+def stalled_page(request: Request):
+    service = get_service()
+    from .recovery import find_stalled_tasks
+    tasks = find_stalled_tasks(service, threshold_hours=2.0)
+    return _render(request, "stalled.html", {"stalled_tasks": tasks, "threshold_hours": 2.0})
+
+
+@router.post("/stalled/{task_id}/retry")
+def retry_stalled(task_id: str, feedback: str = Form(default="operator retry")):
+    try:
+        get_service().retry_task(task_id, feedback=feedback)
+    except Exception as exc:
+        return _redirect("/stalled", error=str(exc))
+    return _redirect("/stalled", message=f"Task {task_id} reset for retry.")
 
 
 @router.get("/recaps")

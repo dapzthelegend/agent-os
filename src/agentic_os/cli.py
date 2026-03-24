@@ -33,6 +33,11 @@ def build_parser() -> argparse.ArgumentParser:
     create_task_complete_parser(task_subparsers)
     create_task_fail_parser(task_subparsers)
     create_task_execute_parser(task_subparsers)
+    create_task_list_ready_parser(task_subparsers)
+    create_task_pickup_parser(task_subparsers)
+    create_task_mark_dispatched_parser(task_subparsers)
+    create_task_record_result_parser(task_subparsers)
+    create_task_requeue_parser(task_subparsers)
 
     approval_parser = subparsers.add_parser("approval", help="Approval operations")
     approval_subparsers = approval_parser.add_subparsers(dest="approval_command", required=True)
@@ -41,6 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
     create_approval_approve_parser(approval_subparsers)
     create_approval_deny_parser(approval_subparsers)
     create_approval_cancel_parser(approval_subparsers)
+    create_approval_remind_pending_parser(approval_subparsers)
 
     execution_parser = subparsers.add_parser("execution", help="Execution inspection")
     execution_subparsers = execution_parser.add_subparsers(dest="execution_command", required=True)
@@ -57,6 +63,8 @@ def build_parser() -> argparse.ArgumentParser:
     create_recap_drafts_parser(recap_subparsers)
     create_recap_failures_parser(recap_subparsers)
     create_recap_external_actions_parser(recap_subparsers)
+    create_recap_overdue_parser(recap_subparsers)
+    create_recap_in_progress_parser(recap_subparsers)
 
     artifact_parser = subparsers.add_parser("artifact", help="Artifact operations")
     artifact_subparsers = artifact_parser.add_subparsers(dest="artifact_command", required=True)
@@ -85,6 +93,24 @@ def build_parser() -> argparse.ArgumentParser:
     daily_routine_parser = subparsers.add_parser("daily-routine", help="Phase 1 daily routine support flow")
     daily_routine_subparsers = daily_routine_parser.add_subparsers(dest="daily_routine_command", required=True)
     create_daily_routine_run_parser(daily_routine_subparsers)
+
+    calendar_parser = subparsers.add_parser("calendar", help="Google Calendar operations (agent inbox)")
+    calendar_subparsers = calendar_parser.add_subparsers(dest="calendar_command", required=True)
+    create_calendar_list_parser(calendar_subparsers)
+    create_calendar_create_parser(calendar_subparsers)
+    create_calendar_block_parser(calendar_subparsers)
+    create_calendar_update_parser(calendar_subparsers)
+    create_calendar_delete_parser(calendar_subparsers)
+    create_calendar_remind_parser(calendar_subparsers)
+
+    retry_parser = subparsers.add_parser("retry", help="Retry a stalled or failed task")
+    retry_parser.add_argument("task_id")
+    retry_parser.add_argument("--feedback", default="operator retry")
+
+    subparsers.add_parser("health", help="Print system health snapshot")
+
+    stall_parser = subparsers.add_parser("stall-check", help="Scan and flag stalled tasks, send Discord alerts")
+    stall_parser.add_argument("--threshold-hours", type=float, default=2.0)
 
     return parser
 
@@ -145,6 +171,51 @@ def create_task_execute_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument("--tool-result-json")
 
 
+# ── Execution loop commands ───────────────────────────────────────────────────
+
+def create_task_list_ready_parser(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser(
+        "list-ready", help="List tasks eligible for execution (approved or new+read_ok)"
+    )
+    parser.add_argument("--limit", type=int, default=20)
+
+
+def create_task_pickup_parser(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser(
+        "pickup", help="Atomically claim a task for execution (→ in_progress)"
+    )
+    parser.add_argument("--task-id", required=True)
+    parser.add_argument("--claimed-by", default="task_executor_cron")
+
+
+def create_task_mark_dispatched_parser(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser(
+        "mark-dispatched", help="Record that a child session was spawned for a task"
+    )
+    parser.add_argument("--task-id", required=True)
+    parser.add_argument("--session-key", required=True)
+    parser.add_argument("--agent", required=True)
+
+
+def create_task_record_result_parser(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser(
+        "record-result",
+        help="Record a child session's execution result from an output file",
+    )
+    parser.add_argument("--task-id", required=True)
+    parser.add_argument("--output-file", required=True, help="Path to file containing full agent output")
+    parser.add_argument("--session-key", default="unknown")
+
+
+def create_task_requeue_parser(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser(
+        "requeue", help="Requeue a stalled/failed task back to a ready state"
+    )
+    parser.add_argument("--task-id", required=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 def create_approval_list_parser(subparsers: argparse._SubParsersAction) -> None:
     parser = subparsers.add_parser("list", help="List approvals")
     parser.add_argument("--task-id")
@@ -171,6 +242,14 @@ def create_approval_cancel_parser(subparsers: argparse._SubParsersAction) -> Non
     parser = subparsers.add_parser("cancel", help="Cancel a pending approval record")
     parser.add_argument("approval_id")
     parser.add_argument("--note")
+
+
+def create_approval_remind_pending_parser(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser(
+        "remind-pending",
+        help="Send reminders for approvals pending longer than --threshold-hours (default 1h)",
+    )
+    parser.add_argument("--threshold-hours", type=float, default=1.0)
 
 
 def create_artifact_revise_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -326,6 +405,67 @@ def create_notion_append_note_parser(subparsers: argparse._SubParsersAction) -> 
     parser.add_argument("--note", required=True)
 
 
+def create_calendar_list_parser(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser("list", help="List today's events from all calendars")
+    parser.add_argument("--date", help="ISO date to poll (default: today)")
+    parser.add_argument("--account", choices=["agent", "dapz", "sola", "all"], default="all")
+
+
+def create_calendar_create_parser(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser("create", help="Create a calendar event (agent inbox only)")
+    parser.add_argument("--title", required=True)
+    parser.add_argument("--start", required=True, help="ISO 8601 datetime, e.g. 2026-03-24T10:00:00")
+    parser.add_argument("--end", required=True, help="ISO 8601 datetime, e.g. 2026-03-24T11:00:00")
+    parser.add_argument("--description")
+    parser.add_argument("--location")
+    parser.add_argument("--attendees", nargs="*", help="Space-separated attendee emails")
+    parser.add_argument(
+        "--reminders",
+        nargs="*",
+        type=int,
+        metavar="MINUTES",
+        help="Popup reminder times in minutes before event, e.g. --reminders 10 30",
+    )
+    parser.add_argument("--timezone", default="Europe/London")
+
+
+def create_calendar_block_parser(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser("block", help="Block time on the agent calendar")
+    parser.add_argument("--title", required=True)
+    parser.add_argument("--start", required=True, help="ISO 8601 datetime")
+    parser.add_argument("--end", required=True, help="ISO 8601 datetime")
+    parser.add_argument("--description")
+    parser.add_argument("--timezone", default="Europe/London")
+
+
+def create_calendar_update_parser(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser("update", help="Update an existing calendar event")
+    parser.add_argument("event_id")
+    parser.add_argument("--title")
+    parser.add_argument("--start")
+    parser.add_argument("--end")
+    parser.add_argument("--description")
+    parser.add_argument("--location")
+    parser.add_argument(
+        "--reminders",
+        nargs="*",
+        type=int,
+        metavar="MINUTES",
+    )
+    parser.add_argument("--timezone", default="Europe/London")
+
+
+def create_calendar_delete_parser(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser("delete", help="Delete a calendar event")
+    parser.add_argument("event_id")
+
+
+def create_calendar_remind_parser(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser("remind", help="Add a popup reminder to an existing event")
+    parser.add_argument("event_id")
+    parser.add_argument("--minutes", type=int, required=True, help="Minutes before event")
+
+
 def create_daily_routine_run_parser(subparsers: argparse._SubParsersAction) -> None:
     parser = subparsers.add_parser("run", help="Build and persist a daily recap from structured inputs")
     parser.add_argument("--input-file")
@@ -343,6 +483,21 @@ def create_daily_routine_run_parser(subparsers: argparse._SubParsersAction) -> N
     parser.add_argument("--notion-file")
     parser.add_argument("--notion-json")
     parser.add_argument("--no-notion", action="store_true")
+    parser.add_argument(
+        "--poll-inbox",
+        action="store_true",
+        help="Fetch agent and personal inboxes from Gmail API (overrides --*-inbox-* flags)",
+    )
+    parser.add_argument(
+        "--poll-calendar",
+        action="store_true",
+        help="Fetch today's events from Google Calendar API (overrides --calendar-* flags)",
+    )
+    parser.add_argument(
+        "--send-email",
+        action="store_true",
+        help="Send the recap email via Gmail API after building it",
+    )
 
 
 def create_execution_show_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -382,6 +537,17 @@ def create_recap_external_actions_parser(subparsers: argparse._SubParsersAction)
     parser = subparsers.add_parser("external-actions", help="Summarize recorded external actions")
     parser.add_argument("--domain", choices=DOMAINS)
     parser.add_argument("--limit", type=int, default=20)
+
+
+def create_recap_overdue_parser(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser("overdue", help="List tasks with no update for >N hours (default 48)")
+    parser.add_argument("--domain", choices=DOMAINS)
+    parser.add_argument("--threshold-hours", type=float, default=48.0)
+
+
+def create_recap_in_progress_parser(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser("in-progress", help="List all in-progress and awaiting tasks")
+    parser.add_argument("--domain", choices=DOMAINS)
 
 
 def parse_artifact(args: argparse.Namespace) -> Optional[Any]:
@@ -447,6 +613,19 @@ def build_daily_routine_payload(args: argparse.Namespace) -> dict[str, Any]:
     ):
         if value is not None:
             base_payload[key] = value
+
+    # Gmail API polling (overrides manual --*-inbox-* flags when set)
+    if getattr(args, "poll_inbox", False):
+        from .gmail_poller import poll_all_inboxes
+        polled = poll_all_inboxes()
+        base_payload.setdefault("agent_inbox", polled["agent_inbox"])
+        base_payload.setdefault("personal_inbox", polled["personal_inbox"])
+
+    # Google Calendar API polling (overrides --calendar-* flags when set)
+    if getattr(args, "poll_calendar", False):
+        from .calendar_poller import poll_calendar
+        base_payload.setdefault("calendar", poll_calendar())
+
     section_inputs = {
         "calendar": load_json_object(
             raw_value=args.calendar_json,
@@ -507,6 +686,91 @@ def to_jsonable(value: Any) -> Any:
 
 def print_json(payload: Any) -> None:
     print(json.dumps(to_jsonable(payload), indent=2, sort_keys=True))
+
+
+def print_correlation_trace(service: AgenticOSService, task_id: str) -> None:
+    """Print a structured correlation chain: task → approval → execution → result."""
+    detail = service.get_task_detail(task_id)
+    task = detail["task"]
+    approvals = detail["approvals"]
+    execution = detail["execution"]
+    audit_events = detail["audit_events"]
+
+    lines = []
+    lines.append(f"=== Correlation Trace: {task_id} ===")
+    lines.append("")
+
+    # Task node
+    lines.append(f"TASK  {task['id']}")
+    lines.append(f"      status       : {task['status']}")
+    lines.append(f"      domain       : {task['domain']}")
+    lines.append(f"      intent       : {task['intent_type']}")
+    lines.append(f"      risk         : {task['risk_level']}")
+    lines.append(f"      policy       : {task['policy_decision']}")
+    lines.append(f"      operation_key: {task['operation_key'] or '—'}")
+    lines.append(f"      created_at   : {task['created_at']}")
+    lines.append(f"      updated_at   : {task['updated_at']}")
+    lines.append("")
+
+    # Approval node(s)
+    if approvals:
+        for i, approval in enumerate(approvals):
+            prefix = "APPROVAL" if i == 0 else "        "
+            lines.append(f"{prefix}  {approval['id']}")
+            lines.append(f"          status      : {approval['status']}")
+            lines.append(f"          subject_type: {approval['subject_type']}")
+            lines.append(f"          operation_key: {approval.get('operation_key') or '—'}")
+            if approval.get("decision_note"):
+                lines.append(f"          note        : {approval['decision_note']}")
+            lines.append(f"          created_at  : {approval['created_at']}")
+            if approval.get("decided_at"):
+                lines.append(f"          decided_at  : {approval['decided_at']}")
+    else:
+        lines.append("APPROVAL  — (none)")
+    lines.append("")
+
+    # Execution node
+    if execution:
+        lines.append(f"EXECUTION  {execution['operation_key']}")
+        lines.append(f"           task_id    : {execution['task_id']}")
+        lines.append(f"           approval_id: {execution.get('approval_id') or '—'}")
+        lines.append(f"           status     : {execution['status']}")
+        if execution.get("result_summary"):
+            summary = execution["result_summary"][:120].replace("\n", " ")
+            lines.append(f"           result     : {summary}")
+        lines.append(f"           created_at : {execution['created_at']}")
+    else:
+        lines.append("EXECUTION  — (not yet executed)")
+    lines.append("")
+
+    # Result
+    if task.get("result_summary"):
+        summary = task["result_summary"][:200].replace("\n", " ")
+        lines.append(f"RESULT     {summary}")
+    elif task.get("artifact_ref"):
+        lines.append(f"ARTIFACT   {task['artifact_ref']}")
+    else:
+        lines.append("RESULT     — (none)")
+    lines.append("")
+
+    # Audit chain
+    lines.append(f"AUDIT TRAIL  ({len(audit_events)} events)")
+    for event in audit_events:
+        import json as _json
+        payload_str = ""
+        try:
+            p = _json.loads(event["payload_json"]) if isinstance(event.get("payload_json"), str) else event.get("payload", {})
+            # Surface correlation IDs in audit output
+            corr_parts = []
+            for key in ("task_id", "execution_id", "approval_id"):
+                if p.get(key):
+                    corr_parts.append(f"{key}={p[key]}")
+            payload_str = "  [" + ", ".join(corr_parts) + "]" if corr_parts else ""
+        except Exception:
+            pass
+        lines.append(f"  [{event['created_at']}] {event['event_type']}{payload_str}")
+
+    print("\n".join(lines))
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -667,7 +931,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 0
 
         if args.command == "task" and args.task_command == "trace":
-            print_json(service.get_task_detail(args.task_id))
+            print_correlation_trace(service, args.task_id)
             return 0
 
         if args.command == "task" and args.task_command == "complete":
@@ -694,6 +958,72 @@ def main(argv: Optional[list[str]] = None) -> int:
             )
             return 0
 
+        # ── Execution loop commands ───────────────────────────────────────────
+
+        if args.command == "task" and args.task_command == "list-ready":
+            tasks = service.list_ready_tasks(limit=args.limit)
+            print_json({"count": len(tasks), "tasks": [asdict(t) for t in tasks]})
+            return 0
+
+        if args.command == "task" and args.task_command == "pickup":
+            result = service.pickup_task(args.task_id, claimed_by=args.claimed_by)
+            print_json(result)
+            return 0 if result["success"] else 1
+
+        if args.command == "task" and args.task_command == "mark-dispatched":
+            service.mark_dispatched(args.task_id, session_key=args.session_key, agent=args.agent)
+            print_json({"status": "ok", "task_id": args.task_id, "session_key": args.session_key})
+            return 0
+
+        if args.command == "task" and args.task_command == "record-result":
+            from pathlib import Path as _Path
+            from .execution_receiver import receive_execution_result, ExecutionParseError
+            from .config import default_paths as _default_paths
+            output_path = _Path(args.output_file)
+            if not output_path.exists():
+                import sys as _sys
+                print(
+                    json.dumps({"status": "error", "error": f"output_file not found: {args.output_file}"}),
+                    file=_sys.stderr,
+                )
+                return 1
+            raw_output = output_path.read_text(encoding="utf-8")
+            paths = _default_paths()
+            try:
+                result = receive_execution_result(
+                    raw_output,
+                    task_id=args.task_id,
+                    session_key=args.session_key,
+                    paths=paths,
+                )
+            except ExecutionParseError as exc:
+                import sys as _sys
+                print(
+                    json.dumps({"status": "error", "task_id": args.task_id, "error": str(exc)}),
+                    file=_sys.stderr,
+                )
+                return 1
+            if result.success:
+                print_json({
+                    "status": "already_done" if result.idempotent else "success",
+                    "task_id": result.task_id,
+                    "artifact_id": result.artifact_id,
+                })
+                return 0
+            import sys as _sys
+            print(
+                json.dumps({"status": "error", "task_id": result.task_id, "error": result.error}),
+                file=_sys.stderr,
+            )
+            return 1
+
+        if args.command == "task" and args.task_command == "requeue":
+            task = service.requeue_task(args.task_id)
+            print_json({"task": asdict(task)})
+            return 0
+
+        # ─────────────────────────────────────────────────────────────────────
+
         if args.command == "approval" and args.approval_command == "list":
             payload = {"approvals": [asdict(item) for item in service.list_approvals(task_id=args.task_id)]}
             print_json(payload)
@@ -713,6 +1043,10 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         if args.command == "approval" and args.approval_command == "cancel":
             print_json(service.cancel(args.approval_id, decision_note=args.note))
+            return 0
+
+        if args.command == "approval" and args.approval_command == "remind-pending":
+            print_json(service.send_approval_reminders(threshold_hours=args.threshold_hours))
             return 0
 
         if args.command == "artifact" and args.artifact_command == "revise":
@@ -760,6 +1094,14 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         if args.command == "recap" and args.recap_command == "external-actions":
             print_json(service.recap_external_actions(domain=args.domain, limit=args.limit))
+            return 0
+
+        if args.command == "recap" and args.recap_command == "overdue":
+            print_json(service.recap_overdue(domain=args.domain, threshold_hours=args.threshold_hours))
+            return 0
+
+        if args.command == "recap" and args.recap_command == "in-progress":
+            print_json(service.recap_in_progress(domain=args.domain))
             return 0
 
         if args.command == "adapter" and args.adapter_command == "execute":
@@ -866,12 +1208,96 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 0
 
         if args.command == "daily-routine" and args.daily_routine_command == "run":
-            print_json(
-                service.run_daily_routine(
-                    payload=build_daily_routine_payload(args),
-                    create_notion_tasks=not args.no_notion,
-                )
+            result = service.run_daily_routine(
+                payload=build_daily_routine_payload(args),
+                create_notion_tasks=not args.no_notion,
+                send_email=getattr(args, "send_email", False),
             )
+            print_json(result)
+            if result.get("email_sent"):
+                print(
+                    f"DAILY_ROUTINE_COMPLETE\n"
+                    f"email_sent_to: {result['recap']['recipient']}\n"
+                    f"follow_up_tasks_created: {len(result['created_followups'])}\n"
+                    f"recap_date: {result['recap']['run_date']}",
+                    file=sys.stderr,
+                )
+            return 0
+
+        if args.command == "calendar":
+            from .calendar_poller import poll_calendar
+            from .calendar_writer import (
+                add_reminder,
+                block_time,
+                create_event,
+                delete_event,
+                update_event,
+            )
+
+            if args.calendar_command == "list":
+                print_json(poll_calendar())
+                return 0
+
+            if args.calendar_command == "create":
+                result = create_event(
+                    title=args.title,
+                    start=args.start,
+                    end=args.end,
+                    description=args.description,
+                    location=args.location,
+                    attendees=args.attendees,
+                    reminders_minutes=args.reminders,
+                    timezone=args.timezone,
+                )
+                print_json(result)
+                return 0
+
+            if args.calendar_command == "block":
+                result = block_time(
+                    title=args.title,
+                    start=args.start,
+                    end=args.end,
+                    description=args.description,
+                    timezone=args.timezone,
+                )
+                print_json(result)
+                return 0
+
+            if args.calendar_command == "update":
+                result = update_event(
+                    args.event_id,
+                    title=args.title,
+                    start=args.start,
+                    end=args.end,
+                    description=args.description,
+                    location=args.location,
+                    reminders_minutes=args.reminders,
+                    timezone=args.timezone,
+                )
+                print_json(result)
+                return 0
+
+            if args.calendar_command == "delete":
+                ok = delete_event(args.event_id)
+                print_json({"deleted": ok, "event_id": args.event_id})
+                return 0 if ok else 2
+
+            if args.calendar_command == "remind":
+                result = add_reminder(args.event_id, args.minutes)
+                print_json(result)
+                return 0
+
+        if args.command == "retry":
+            print_json(service.retry_task(args.task_id, feedback=args.feedback))
+            return 0
+
+        if args.command == "health":
+            from .health import get_system_health
+            print_json(get_system_health(service))
+            return 0
+
+        if args.command == "stall-check":
+            print_json(service.flag_stalled_tasks(threshold_hours=args.threshold_hours))
             return 0
     except (
         KeyError,
