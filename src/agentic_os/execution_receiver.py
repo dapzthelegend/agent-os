@@ -1,4 +1,4 @@
-"""Execution receiver — parses ACP output, stores artifact, updates backend + Notion."""
+"""Execution receiver — parses ACP output, stores artifact, updates backend + Paperclip."""
 
 from __future__ import annotations
 
@@ -11,8 +11,6 @@ from .artifacts import ArtifactStore
 from .config import Paths, default_paths, load_app_config
 from .email_draft_handler import EMAIL_DRAFT_ARTIFACT_TYPE
 from .models import TaskRecord
-from .notion import NotionAdapter
-from .notion_result_writer import write_success, write_failure, write_content_page
 from .service import AgenticOSService
 
 
@@ -132,9 +130,15 @@ def receive_execution_result(
             created_at=artifact_record.created_at,
         )
 
-        # Step 5: Update backend task
+        # Step 5: Update backend task + Paperclip writeback
         result_summary = content[:200] if content else "Execution completed"
-        service.complete_task(task_id, result_summary=result_summary, artifact_ref=artifact_id)
+        service.complete_task(
+            task_id,
+            result_summary=result_summary,
+            artifact_ref=artifact_id,
+            paperclip_content=content,
+            artifact_path=artifact_record.path,
+        )
 
         # Step 5b: Emit callback audit event with full correlation IDs
         reloaded_task = service.db.get_task(task_id)
@@ -153,34 +157,7 @@ def receive_execution_result(
             },
         )
 
-        # Step 6: Full Notion writeback if task has external_ref (Notion page ID)
-        if task.external_ref:
-            try:
-                is_content_task = task.intent_type == "content" or (task.domain == "personal" and task.intent_type == "draft")
-                if is_content_task:
-                    write_content_page(
-                        page_id=task.external_ref,
-                        task=task,
-                        content=content,
-                        config=config,
-                    )
-                else:
-                    write_success(
-                        page_id=task.external_ref,
-                        task=task,
-                        result_summary=result_summary,
-                        config=config,
-                        artifact_id=artifact_id,
-                    )
-            except Exception as e:
-                # Log but don't fail the whole operation
-                service._append_event(
-                    task_id=task_id,
-                    event_type="notion_update_failed",
-                    payload={"error": str(e)},
-                )
-
-        # Step 7: Return success
+        # Step 6: Return success
         return ExecutionResult(task_id=task_id, artifact_id=artifact_id, success=True)
     
     except ExecutionParseError:
@@ -213,23 +190,8 @@ def receive_execution_failure(
         service = AgenticOSService(paths, config)
         task = service.db.get_task(task_id)
 
-        # Update backend
+        # Update backend (Paperclip writeback handled inside fail_task)
         service.fail_task(task_id, reason=error)
-
-        # Full Notion writeback if task has external_ref
-        if task.external_ref:
-            try:
-                write_failure(
-                    page_id=task.external_ref,
-                    reason=error,
-                    config=config,
-                )
-            except Exception as e:
-                service._append_event(
-                    task_id=task_id,
-                    event_type="notion_update_failed",
-                    payload={"error": str(e)},
-                )
     
     except Exception as e:
         print(f"Error in receive_execution_failure: {e}", file=sys.stderr)

@@ -48,6 +48,20 @@ EVENT_TYPES = (
     "task_dispatched",
     "task_requeued",
     "spawn_failed",
+    # Paperclip projection (Phase 1)
+    "paperclip_issue_created",
+    "paperclip_projection_failed",
+    "paperclip_sync_failed",
+    # Plan gate (Phase 2)
+    "task_mode_set",
+    "plan_submitted",
+    "plan_awaiting_review",
+    "plan_approved",
+    "plan_rejected",
+    # Paperclip reconciler (Phase 4)
+    "reconciler_ran",
+    "reconciler_action_taken",
+    "reconciler_comment_ignored",
 )
 
 

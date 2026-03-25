@@ -1,0 +1,12 @@
+{
+  "jobs": [
+    {
+      "name": "paperclip-reconcile",
+      "description": "Poll Paperclip activity and reflect operator actions into backend state",
+      "command": "PYTHONPATH=src python3 -m agentic_os.paperclip_reconciler",
+      "schedule": "every 2 minutes",
+      "enabled": true,
+      "timeout_seconds": 60
+    }
+  ]
+}

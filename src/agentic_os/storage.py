@@ -11,26 +11,48 @@ def utc_now_sql() -> str:
     return "strftime('%Y-%m-%dT%H:%M:%SZ', 'now')"
 
 
+# Canonical schema — no incremental migrations.
+# If the DB has an old schema (missing paperclip_issue_id), run scripts/reset_db.py.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
     id TEXT PRIMARY KEY,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    -- core
+    title TEXT,
+    description TEXT,
     domain TEXT NOT NULL,
+    status TEXT NOT NULL,
+    task_mode TEXT NOT NULL DEFAULT 'direct',
+    -- legacy fields retained for live-path compat
     intent_type TEXT NOT NULL,
     risk_level TEXT NOT NULL,
-    status TEXT NOT NULL,
     approval_state TEXT NOT NULL,
     user_request TEXT NOT NULL,
     result_summary TEXT,
     artifact_ref TEXT,
+    artifact_path TEXT,
     external_ref TEXT,
     target TEXT,
+    delivery_target TEXT,
+    delivery_thread_id TEXT,
     request_metadata_json TEXT,
     operation_key TEXT,
     external_write INTEGER NOT NULL DEFAULT 0,
     policy_decision TEXT,
-    action_source TEXT NOT NULL DEFAULT 'manual'
+    action_source TEXT NOT NULL DEFAULT 'manual',
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    claimed_at TEXT,
+    claimed_by TEXT,
+    dispatch_session_key TEXT,
+    dispatch_attempts INTEGER NOT NULL DEFAULT 0,
+    -- paperclip
+    paperclip_issue_id TEXT,
+    paperclip_assignee_agent_id TEXT,
+    paperclip_project_id TEXT,
+    paperclip_goal_id TEXT,
+    plan_version INTEGER NOT NULL DEFAULT 0,
+    approved_plan_revision_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS artifacts (
@@ -87,6 +109,7 @@ CREATE INDEX IF NOT EXISTS idx_tasks_domain ON tasks(domain, created_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_target ON tasks(target, created_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_action_source ON tasks(action_source, created_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_ready ON tasks(status, policy_decision, created_at);
+CREATE INDEX IF NOT EXISTS idx_tasks_paperclip_issue ON tasks(paperclip_issue_id);
 CREATE INDEX IF NOT EXISTS idx_audit_events_task_id ON audit_events(task_id, id);
 CREATE INDEX IF NOT EXISTS idx_audit_events_created_at ON audit_events(created_at, id);
 CREATE INDEX IF NOT EXISTS idx_artifacts_task_id ON artifacts(task_id, created_at);
@@ -94,24 +117,8 @@ CREATE INDEX IF NOT EXISTS idx_approvals_task_id ON approvals(task_id, created_a
 CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status, created_at);
 """
 
-TASK_COLUMNS = {
-    "target": "ALTER TABLE tasks ADD COLUMN target TEXT",
-    "request_metadata_json": "ALTER TABLE tasks ADD COLUMN request_metadata_json TEXT",
-    "operation_key": "ALTER TABLE tasks ADD COLUMN operation_key TEXT",
-    "external_write": "ALTER TABLE tasks ADD COLUMN external_write INTEGER NOT NULL DEFAULT 0",
-    "policy_decision": "ALTER TABLE tasks ADD COLUMN policy_decision TEXT",
-    "action_source": "ALTER TABLE tasks ADD COLUMN action_source TEXT NOT NULL DEFAULT 'manual'",
-    "retry_count": "ALTER TABLE tasks ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
-    # Phase 2 — dispatch tracking
-    "claimed_at":           "ALTER TABLE tasks ADD COLUMN claimed_at TEXT",
-    "claimed_by":           "ALTER TABLE tasks ADD COLUMN claimed_by TEXT",
-    "dispatch_session_key": "ALTER TABLE tasks ADD COLUMN dispatch_session_key TEXT",
-    "dispatch_attempts":    "ALTER TABLE tasks ADD COLUMN dispatch_attempts INTEGER NOT NULL DEFAULT 0",
-}
-
-EXECUTION_COLUMNS = {
-    "session_key": "ALTER TABLE executions ADD COLUMN session_key TEXT",
-}
+# Sentinel column used to detect an incompatible (pre-phase-0) schema.
+_REQUIRED_COLUMN = "paperclip_issue_id"
 
 
 class Database:
@@ -127,37 +134,21 @@ class Database:
 
     def initialize(self) -> None:
         with self.connect() as connection:
+            self._check_schema_compatibility(connection)
             connection.executescript(SCHEMA)
-            self._ensure_task_columns(connection)
-            self._ensure_execution_columns(connection)
 
     @staticmethod
-    def _ensure_task_columns(connection: sqlite3.Connection) -> None:
-        existing = {
-            row["name"]
-            for row in connection.execute("PRAGMA table_info(tasks)").fetchall()
-        }
-        for name, ddl in TASK_COLUMNS.items():
-            if name not in existing:
-                try:
-                    connection.execute(ddl)
-                except sqlite3.OperationalError as exc:
-                    if "duplicate column name" not in str(exc):
-                        raise
-
-    @staticmethod
-    def _ensure_execution_columns(connection: sqlite3.Connection) -> None:
-        existing = {
-            row["name"]
-            for row in connection.execute("PRAGMA table_info(executions)").fetchall()
-        }
-        for name, ddl in EXECUTION_COLUMNS.items():
-            if name not in existing:
-                try:
-                    connection.execute(ddl)
-                except sqlite3.OperationalError as exc:
-                    if "duplicate column name" not in str(exc):
-                        raise
+    def _check_schema_compatibility(connection: sqlite3.Connection) -> None:
+        """Fail fast if an incompatible old schema is detected."""
+        rows = connection.execute("PRAGMA table_info(tasks)").fetchall()
+        if not rows:
+            return  # table doesn't exist yet — fresh DB, OK
+        existing = {row["name"] for row in rows}
+        if _REQUIRED_COLUMN not in existing:
+            raise RuntimeError(
+                "Incompatible task schema detected (pre-phase-0). "
+                "Run scripts/reset_db.py to recreate the database."
+            )
 
     @staticmethod
     def _next_task_id(connection: sqlite3.Connection) -> str:
@@ -235,6 +226,20 @@ class Database:
         policy_decision: Optional[str] = None,
         action_source: Optional[str] = None,
         retry_count: Optional[int] = None,
+        # Paperclip fields
+        paperclip_issue_id: Optional[str] = None,
+        paperclip_assignee_agent_id: Optional[str] = None,
+        paperclip_project_id: Optional[str] = None,
+        paperclip_goal_id: Optional[str] = None,
+        plan_version: Optional[int] = None,
+        approved_plan_revision_id: Optional[str] = None,
+        # New schema fields
+        title: Optional[str] = None,
+        description: Optional[str] = None,
+        task_mode: Optional[str] = None,
+        delivery_target: Optional[str] = None,
+        delivery_thread_id: Optional[str] = None,
+        artifact_path: Optional[str] = None,
     ) -> TaskRecord:
         updates: list[str] = []
         values: list[Any] = []
@@ -249,6 +254,17 @@ class Database:
             ("operation_key", operation_key),
             ("policy_decision", policy_decision),
             ("action_source", action_source),
+            ("paperclip_issue_id", paperclip_issue_id),
+            ("paperclip_assignee_agent_id", paperclip_assignee_agent_id),
+            ("paperclip_project_id", paperclip_project_id),
+            ("paperclip_goal_id", paperclip_goal_id),
+            ("approved_plan_revision_id", approved_plan_revision_id),
+            ("title", title),
+            ("description", description),
+            ("task_mode", task_mode),
+            ("delivery_target", delivery_target),
+            ("delivery_thread_id", delivery_thread_id),
+            ("artifact_path", artifact_path),
         ):
             if value is not None:
                 updates.append(f"{field} = ?")
@@ -259,6 +275,9 @@ class Database:
         if retry_count is not None:
             updates.append("retry_count = ?")
             values.append(retry_count)
+        if plan_version is not None:
+            updates.append("plan_version = ?")
+            values.append(plan_version)
         updates.append(f"updated_at = {utc_now_sql()}")
         values.append(task_id)
         query = f"UPDATE tasks SET {', '.join(updates)} WHERE id = ?"
@@ -348,6 +367,7 @@ class Database:
         Return tasks eligible for execution (FIFO):
           - status = 'approved'
           - status = 'new' AND policy_decision = 'read_ok'
+          - plan_first: status = 'approved_for_execution' AND approved_plan_revision_id IS NOT NULL
         """
         with self.connect() as connection:
             rows = connection.execute(
@@ -355,6 +375,11 @@ class Database:
                 SELECT * FROM tasks
                 WHERE status = 'approved'
                    OR (status = 'new' AND policy_decision = 'read_ok')
+                   OR (
+                      task_mode = 'plan_first'
+                      AND status = 'approved_for_execution'
+                      AND approved_plan_revision_id IS NOT NULL
+                   )
                 ORDER BY created_at ASC, id ASC
                 LIMIT ?
                 """,
@@ -364,8 +389,10 @@ class Database:
 
     def pickup_task(self, task_id: str, *, claimed_by: str = "task_executor_cron") -> dict:
         """
-        Atomically transition an eligible task to 'in_progress'.
+        Atomically transition an eligible task to 'in_progress' (direct) or 'executing' (plan_first).
         Uses BEGIN IMMEDIATE to prevent concurrent cron double-dispatch.
+
+        plan_first tasks must be in 'approved_for_execution' with approved_plan_revision_id set.
 
         Returns:
             {"success": True, "task_id": task_id}
@@ -377,26 +404,37 @@ class Database:
             if row is None:
                 raise KeyError(f"unknown task_id: {task_id}")
             task = self._row_to_task(row)
-            eligible = (
-                task.status == "approved"
-                or (task.status == "new" and task.policy_decision == "read_ok")
-            )
+
+            if task.task_mode == "plan_first":
+                eligible = (
+                    task.status == "approved_for_execution"
+                    and bool(task.approved_plan_revision_id)
+                )
+                new_status = "executing"
+            else:
+                eligible = (
+                    task.status == "approved"
+                    or (task.status == "new" and task.policy_decision == "read_ok")
+                )
+                new_status = "in_progress"
+
             if not eligible:
+                already_running = task.status in ("in_progress", "executing")
                 return {
                     "success": False,
                     "task_id": task_id,
-                    "reason": "already_claimed" if task.status == "in_progress" else "not_eligible",
+                    "reason": "already_claimed" if already_running else "not_eligible",
                     "current_status": task.status,
                 }
             connection.execute(
                 f"""UPDATE tasks
-                    SET status = 'in_progress',
+                    SET status = ?,
                         claimed_at = {utc_now_sql()},
                         claimed_by = ?,
                         dispatch_attempts = COALESCE(dispatch_attempts, 0) + 1,
                         updated_at = {utc_now_sql()}
                     WHERE id = ?""",
-                (claimed_by, task_id),
+                (new_status, claimed_by, task_id),
             )
         return {"success": True, "task_id": task_id}
 
@@ -426,6 +464,16 @@ class Database:
         if not tasks:
             return None
         return tasks[0]
+
+    def get_task_by_paperclip_issue_id(self, issue_id: str) -> Optional[TaskRecord]:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM tasks WHERE paperclip_issue_id = ? ORDER BY created_at DESC LIMIT 1",
+                (issue_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_task(row)
 
     def list_tasks_by_operation_key(self, operation_key: str) -> list[TaskRecord]:
         with self.connect() as connection:
@@ -683,6 +731,7 @@ class Database:
 
     @staticmethod
     def _row_to_task(row: sqlite3.Row) -> TaskRecord:
+        keys = row.keys()
         return TaskRecord(
             id=row["id"],
             created_at=row["created_at"],
@@ -702,11 +751,23 @@ class Database:
             external_write=bool(row["external_write"]),
             policy_decision=row["policy_decision"],
             action_source=row["action_source"],
-            retry_count=row["retry_count"] if "retry_count" in row.keys() else 0,
-            claimed_at=row["claimed_at"] if "claimed_at" in row.keys() else None,
-            claimed_by=row["claimed_by"] if "claimed_by" in row.keys() else None,
-            dispatch_session_key=row["dispatch_session_key"] if "dispatch_session_key" in row.keys() else None,
-            dispatch_attempts=row["dispatch_attempts"] if "dispatch_attempts" in row.keys() else 0,
+            retry_count=row["retry_count"] if "retry_count" in keys else 0,
+            claimed_at=row["claimed_at"] if "claimed_at" in keys else None,
+            claimed_by=row["claimed_by"] if "claimed_by" in keys else None,
+            dispatch_session_key=row["dispatch_session_key"] if "dispatch_session_key" in keys else None,
+            dispatch_attempts=row["dispatch_attempts"] if "dispatch_attempts" in keys else 0,
+            title=row["title"] if "title" in keys else None,
+            description=row["description"] if "description" in keys else None,
+            task_mode=row["task_mode"] if "task_mode" in keys else "direct",
+            delivery_target=row["delivery_target"] if "delivery_target" in keys else None,
+            delivery_thread_id=row["delivery_thread_id"] if "delivery_thread_id" in keys else None,
+            artifact_path=row["artifact_path"] if "artifact_path" in keys else None,
+            paperclip_issue_id=row["paperclip_issue_id"] if "paperclip_issue_id" in keys else None,
+            paperclip_assignee_agent_id=row["paperclip_assignee_agent_id"] if "paperclip_assignee_agent_id" in keys else None,
+            paperclip_project_id=row["paperclip_project_id"] if "paperclip_project_id" in keys else None,
+            paperclip_goal_id=row["paperclip_goal_id"] if "paperclip_goal_id" in keys else None,
+            plan_version=row["plan_version"] if "plan_version" in keys else 0,
+            approved_plan_revision_id=row["approved_plan_revision_id"] if "approved_plan_revision_id" in keys else None,
         )
 
     @staticmethod

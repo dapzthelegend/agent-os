@@ -46,6 +46,22 @@ class ExecutionCallbackPayload(BaseModel):
     output: str
 
 
+class ApprovePlanPayload(BaseModel):
+    revision_id: str = ""  # defaults to "plan-v{N}-operator" if blank
+
+
+class RejectPlanPayload(BaseModel):
+    feedback: str
+
+
+class CancelTaskPayload(BaseModel):
+    reason: str = "Cancelled by operator"
+
+
+class SetTaskModePayload(BaseModel):
+    mode: str  # "plan_first" or "direct"
+
+
 @router.get("/health")
 def api_health() -> dict:
     return get_system_health(get_service())
@@ -252,3 +268,47 @@ def api_revise_artifact(task_id: str, payload: ArtifactRevisionPayload) -> dict:
         )
     except Exception as exc:
         raise _handle_operator_error(exc) from exc
+
+
+@router.post("/tasks/{task_id}/approve-plan")
+def api_approve_plan(task_id: str, payload: ApprovePlanPayload) -> dict:
+    try:
+        service = get_service()
+        if not payload.revision_id:
+            task = service.db.get_task(task_id)
+            revision_id = f"plan-v{task.plan_version or 1}-operator"
+        else:
+            revision_id = payload.revision_id
+        return asdict(service.approve_plan(task_id, revision_id=revision_id))
+    except Exception as exc:
+        raise _handle_operator_error(exc) from exc
+
+
+@router.post("/tasks/{task_id}/reject-plan")
+def api_reject_plan(task_id: str, payload: RejectPlanPayload) -> dict:
+    try:
+        return asdict(get_service().reject_plan(task_id, feedback=payload.feedback))
+    except Exception as exc:
+        raise _handle_operator_error(exc) from exc
+
+
+@router.post("/tasks/{task_id}/cancel")
+def api_cancel_task(task_id: str, payload: CancelTaskPayload) -> dict:
+    try:
+        return asdict(get_service().cancel_task(task_id, reason=payload.reason))
+    except Exception as exc:
+        raise _handle_operator_error(exc) from exc
+
+
+@router.post("/tasks/{task_id}/set-mode")
+def api_set_task_mode(task_id: str, payload: SetTaskModePayload) -> dict:
+    try:
+        return asdict(get_service().set_task_mode(task_id, mode=payload.mode))
+    except Exception as exc:
+        raise _handle_operator_error(exc) from exc
+
+
+@router.get("/paperclip/health")
+def api_paperclip_health() -> dict:
+    from .health import get_paperclip_health
+    return get_paperclip_health(get_service())

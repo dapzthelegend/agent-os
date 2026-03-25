@@ -1,31 +1,26 @@
 {
-  "notion": {
-    "apiTokenEnv": "NOTION_API_KEY",
-    "dataSourceId": "3290f66f-ccd8-8086-b5ed-000be02c77ac",
-    "properties": {
-      "title": "Name",
-      "status": "Status",
-      "type": "Type",
-      "area": "Domain",
-      "risk": "Risk",
-      "backendTaskId": "OpenClaw Task ID",
-      "operationKey": "Operation Key",
-      "lastAgentUpdate": "Last Agent Update"
+  "paperclip": {
+    "base_url": "http://localhost:3100/api",
+    "auth_mode": "trusted",
+    "company_id": "717af3e0-0f92-4209-bf1b-15335285e958",
+    "goal_id": "171de4c1-7618-47cf-997a-1265c5880c33",
+    "project_map": {
+      "personal": "d72a9148-5c19-41bf-a432-30cf4ec11e9a",
+      "technical": "4e3087f9-4704-47a0-9518-09c130173ff7",
+      "finance": "1483bb10-077c-4c92-91d8-e3e5bfc99d23",
+      "system": "a83b6e70-e7d3-4c5e-b3a8-04e320b187bb"
     },
-    "propertyKinds": {
-      "type": "multi_select",
-      "area": "multi_select"
+    "agent_map": {
+      "chief_of_staff": "6d80b209-77ee-4b9f-a8ab-3ff9315067f5",
+      "project_manager": "9beb4cfc-e3d2-48d3-ad61-2b9ea4d18550",
+      "engineering_manager": "33327766-6f09-4073-8c9c-36a3080405f7",
+      "engineer": "7d9e7525-3813-49ef-9338-98a13577b1ca",
+      "executor_codex": "0883cd85-6348-4982-94eb-5e6c3a6d1bbe",
+      "content_writer": "25d6435e-b50a-4954-a5ee-376dba71fe55",
+      "accountant": "36d74444-a0fb-445e-b182-e7b641a45b01",
+      "executive_assistant": "3af65f75-a25b-4246-9e04-307a0245efac"
     },
-    "statusMap": {
-      "new": "Inbox",
-      "in_progress": "In progress",
-      "awaiting_input": "Waiting",
-      "awaiting_approval": "Review",
-      "approved": "Planned",
-      "executed": "Done",
-      "completed": "Done",
-      "failed": "Blocked",
-      "cancelled": "Cancelled"
-    }
+    "reconcile_poll_interval_seconds": 120,
+    "reconcile_activity_lookback_seconds": 300
   }
 }

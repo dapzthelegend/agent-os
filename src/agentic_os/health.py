@@ -50,6 +50,8 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
@@ -98,6 +100,46 @@ def get_system_health(service: "AgenticOSService") -> dict[str, Any]:
         "artifacts_dir": artifacts_section,
         "config": config_section,
         "cron": cron_section,
+    }
+
+
+def get_paperclip_health(service: "AgenticOSService") -> dict[str, Any]:
+    """
+    Return Paperclip connectivity and reconciler status.
+
+    Schema:
+        configured: bool
+        base_url: str | None
+        company_id: str | None
+        reachable: bool | None   (None = not configured)
+        last_reconcile_at: ISO8601 str | None
+        tasks_with_issue: int
+        tasks_without_issue: int
+    """
+    config = service.config
+    if config.paperclip is None:
+        return {
+            "configured": False,
+            "base_url": None,
+            "company_id": None,
+            "reachable": None,
+            "last_reconcile_at": None,
+            "tasks_with_issue": 0,
+            "tasks_without_issue": 0,
+        }
+
+    reachable = _check_paperclip_reachable(config.paperclip.base_url)
+    last_reconcile_at = _get_last_reconcile_at(service)
+    task_counts = _get_paperclip_task_counts(service)
+
+    return {
+        "configured": True,
+        "base_url": config.paperclip.base_url,
+        "company_id": config.paperclip.company_id,
+        "reachable": reachable,
+        "last_reconcile_at": last_reconcile_at,
+        "tasks_with_issue": task_counts["with_issue"],
+        "tasks_without_issue": task_counts["without_issue"],
     }
 
 
@@ -216,6 +258,47 @@ def _check_config(config: "AppConfig") -> dict[str, Any]:
             )
 
     return {"notion_token_set": notion_token_set, "issues": issues}
+
+
+def _check_paperclip_reachable(base_url: str) -> bool:
+    """Attempt a lightweight GET to the Paperclip base URL. Returns True if reachable."""
+    try:
+        req = urllib.request.Request(base_url, method="GET")
+        with urllib.request.urlopen(req, timeout=3):
+            return True
+    except Exception:
+        return False
+
+
+def _get_last_reconcile_at(service: "AgenticOSService") -> Optional[str]:
+    """
+    Return the created_at timestamp of the most recent reconciler_ran audit event,
+    or the mtime of the reconciler state file — whichever we can find first.
+    """
+    # Fast path: check state file mtime
+    state_path = service.paths.data_dir / "paperclip_reconciler_state.json"
+    if state_path.exists():
+        try:
+            mtime = state_path.stat().st_mtime
+            return datetime.fromtimestamp(mtime, tz=timezone.utc).replace(microsecond=0).isoformat()
+        except Exception:
+            pass
+    return None
+
+
+def _get_paperclip_task_counts(service: "AgenticOSService") -> dict[str, int]:
+    """Count tasks with and without a paperclip_issue_id."""
+    try:
+        with service.db.connect() as conn:
+            (with_issue,) = conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE paperclip_issue_id IS NOT NULL AND paperclip_issue_id != ''"
+            ).fetchone()
+            (without_issue,) = conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE paperclip_issue_id IS NULL OR paperclip_issue_id = ''"
+            ).fetchone()
+        return {"with_issue": with_issue, "without_issue": without_issue}
+    except Exception:
+        return {"with_issue": 0, "without_issue": 0}
 
 
 def _check_cron(repo_root: Path) -> dict[str, Any]:

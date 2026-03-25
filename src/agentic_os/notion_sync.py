@@ -1,4 +1,14 @@
-"""Bidirectional Notion sync — polls Notion DB and updates backend on manual status changes."""
+"""
+DEPRECATED (Phase 6 — Paperclip cutover).
+
+Bidirectional Notion sync — polls Notion DB and updates backend on manual status changes.
+
+This module is no longer part of the live execution path. Operator-driven status changes
+are now received via the Paperclip reconciler (paperclip_reconciler.py).
+The `notion-sync` CLI command and `sync_notion_tasks()` service method remain available
+for one-off use but are no longer called by any cron job.
+Retained for rollback capability only — do not import from live code.
+"""
 
 from __future__ import annotations
 

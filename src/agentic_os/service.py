@@ -35,6 +35,18 @@ class AgenticOSService:
         self.audit = AuditLog(paths.audit_log_path)
         self.artifacts = ArtifactStore(paths.artifacts_dir)
         self._notion_adapter: Optional[NotionAdapter] = None
+        self._cp_cache: Any = None
+        self._cp_initialized: bool = False
+
+    @property
+    def _cp(self) -> Any:
+        """Lazy TaskControlPlane — None when Paperclip is not configured."""
+        if not self._cp_initialized:
+            if self.config.paperclip is not None:
+                from .task_control_plane import TaskControlPlane
+                self._cp_cache = TaskControlPlane(self.config.paperclip)
+            self._cp_initialized = True
+        return self._cp_cache
 
     def initialize(self) -> None:
         self.db.initialize()
@@ -83,9 +95,24 @@ class AgenticOSService:
             external_write=external_write,
             action_source=action_source,
         )
-        if policy_decision == "approval_required" and not operation_key:
+
+        from .plan_gate import classify_task_mode
+        task_mode = classify_task_mode(
+            classification.domain, classification.intent_type, classification.risk_level
+        )
+
+        # plan_first tasks bypass the approval_required operation_key requirement —
+        # the plan gate is the gating mechanism instead
+        if policy_decision == "approval_required" and not operation_key and task_mode != "plan_first":
             raise ValueError("approval_required requests must include an operation_key")
-        task_status, approval_state = self._task_state_for_policy(policy_decision)
+
+        if task_mode == "plan_first":
+            # Plan gate supersedes the policy-based status: task starts in planning
+            task_status = "planning"
+            approval_state = "not_needed"
+        else:
+            task_status, approval_state = self._task_state_for_policy(policy_decision)
+
         task = self.db.create_task(
             classification=RequestClassification(
                 domain=classification.domain,
@@ -117,6 +144,41 @@ class AgenticOSService:
             },
         )
 
+        # Persist task_mode (plan_first or direct)
+        if task_mode != "direct":
+            task = self.db.update_task(task.id, task_mode=task_mode)
+            self._append_event(
+                task_id=task.id,
+                event_type="task_mode_set",
+                payload={"task_mode": task_mode},
+            )
+
+        # Paperclip projection (phase 1) — failure must never block task creation
+        cp = self._cp
+        if cp is not None:
+            try:
+                assignee_key = cp.resolve_assignee_for_task(task)
+                issue = cp.create_issue(task, assignee_key=assignee_key)
+                if issue and issue.id:
+                    task = self.db.update_task(
+                        task.id,
+                        paperclip_issue_id=issue.id,
+                        paperclip_project_id=issue.project_id or None,
+                        paperclip_goal_id=issue.goal_id or None,
+                        paperclip_assignee_agent_id=issue.assignee_id or None,
+                    )
+                    self._append_event(
+                        task_id=task.id,
+                        event_type="paperclip_issue_created",
+                        payload={"issue_id": issue.id, "assignee_key": assignee_key},
+                    )
+            except Exception as _pc_exc:
+                self._append_event(
+                    task_id=task.id,
+                    event_type="paperclip_projection_failed",
+                    payload={"error": str(_pc_exc)},
+                )
+
         artifact = None
         if artifact_content is not None:
             artifact = self._create_artifact(
@@ -128,13 +190,14 @@ class AgenticOSService:
             task = self.db.update_task(task.id, artifact_ref=artifact.id)
 
         approval = None
-        if policy_decision == "approval_required":
+        if policy_decision == "approval_required" and task_mode != "plan_first":
             approval = self._create_approval_for_task(task=task, artifact=artifact)
 
         return {
             "task": task,
             "policy_decision": policy_decision,
             "approval": approval,
+            "task_mode": task_mode,
         }
 
     def record_openclaw_read(
@@ -333,6 +396,20 @@ class AgenticOSService:
                 event_type="task_picked_up",
                 payload={"task_id": task_id, "claimed_by": claimed_by},
             )
+            cp = self._cp
+            if cp is not None:
+                try:
+                    task = self.db.get_task(task_id)
+                    if task.paperclip_issue_id:
+                        # plan_first tasks move to 'executing'; direct tasks to 'in_progress'
+                        backend_status = "executing" if task.task_mode == "plan_first" else "in_progress"
+                        cp.update_issue_status(task.paperclip_issue_id, backend_status)
+                except Exception as _pc_exc:
+                    self._append_event(
+                        task_id=task_id,
+                        event_type="paperclip_sync_failed",
+                        payload={"error": str(_pc_exc), "op": "pickup"},
+                    )
         return result
 
     def mark_dispatched(self, task_id: str, *, session_key: str, agent: str) -> None:
@@ -371,6 +448,211 @@ class AgenticOSService:
             payload={"task_id": task_id, "from_status": task.status, "to_status": target_status},
         )
         return self.db.get_task(task_id)
+
+    # ── Plan gate (phase 2) ───────────────────────────────────────────────────
+
+    def submit_plan(
+        self,
+        task_id: str,
+        plan_text: str,
+        *,
+        version: Optional[int] = None,
+    ) -> TaskRecord:
+        """
+        Submit a plan for an operator review.
+
+        Transitions: planning → awaiting_plan_review
+        Writes plan to local artifact store + Paperclip document.
+        Paperclip issue moves to in_review, assigned to chief_of_staff.
+        """
+        task = self.db.get_task(task_id)
+        if task.task_mode != "plan_first":
+            raise ValueError(f"task {task_id} is not in plan_first mode (mode={task.task_mode})")
+        if task.status != "planning":
+            raise ValueError(
+                f"task {task_id} must be in 'planning' status to submit a plan (status={task.status})"
+            )
+
+        plan_version = version if version is not None else (task.plan_version or 0) + 1
+
+        # Store plan as a local artifact
+        artifact = self._create_artifact(
+            task_id=task_id,
+            artifact_type="plan_document",
+            artifact_content={"plan_text": plan_text, "version": plan_version},
+            event_type="plan_submitted",
+        )
+
+        # Advance task status
+        task = self.db.update_task(
+            task_id,
+            status="awaiting_plan_review",
+            plan_version=plan_version,
+        )
+        self._append_event(
+            task_id=task_id,
+            event_type="plan_awaiting_review",
+            payload={"plan_version": plan_version, "artifact_id": artifact.id},
+        )
+
+        # Paperclip: write plan doc, move to in_review, assign to chief_of_staff
+        cp = self._cp
+        if cp is not None:
+            try:
+                if task.paperclip_issue_id:
+                    cp.write_plan_doc(task.paperclip_issue_id, plan_text, version=plan_version)
+                    cp.update_issue_status(
+                        task.paperclip_issue_id,
+                        "awaiting_plan_review",
+                        assignee_key="chief_of_staff",
+                    )
+            except Exception as _pc_exc:
+                self._append_event(
+                    task_id=task_id,
+                    event_type="paperclip_sync_failed",
+                    payload={"error": str(_pc_exc), "op": "submit_plan"},
+                )
+
+        return task
+
+    def approve_plan(
+        self,
+        task_id: str,
+        *,
+        revision_id: str,
+    ) -> TaskRecord:
+        """
+        Approve a submitted plan.
+
+        Transitions: awaiting_plan_review → approved_for_execution
+        Stores approved_plan_revision_id — execution is now unblocked.
+        Paperclip: status → todo, assignee → engineer.
+        """
+        task = self.db.get_task(task_id)
+        if task.task_mode != "plan_first":
+            raise ValueError(f"task {task_id} is not in plan_first mode")
+        if task.status != "awaiting_plan_review":
+            raise ValueError(
+                f"task {task_id} must be in 'awaiting_plan_review' to approve (status={task.status})"
+            )
+
+        task = self.db.update_task(
+            task_id,
+            status="approved_for_execution",
+            approved_plan_revision_id=revision_id,
+        )
+        self._append_event(
+            task_id=task_id,
+            event_type="plan_approved",
+            payload={"revision_id": revision_id},
+        )
+
+        cp = self._cp
+        if cp is not None:
+            try:
+                if task.paperclip_issue_id:
+                    cp.update_issue_status(
+                        task.paperclip_issue_id,
+                        "approved_for_execution",
+                        assignee_key="engineer",
+                    )
+                    cp.add_comment(
+                        task.paperclip_issue_id,
+                        f"Plan approved (revision {revision_id}). Ready for execution.",
+                    )
+            except Exception as _pc_exc:
+                self._append_event(
+                    task_id=task_id,
+                    event_type="paperclip_sync_failed",
+                    payload={"error": str(_pc_exc), "op": "approve_plan"},
+                )
+
+        return task
+
+    def reject_plan(
+        self,
+        task_id: str,
+        *,
+        feedback: str,
+    ) -> TaskRecord:
+        """
+        Reject a submitted plan and send it back for revision.
+
+        Transitions: awaiting_plan_review → planning
+        Paperclip: comment with feedback, status back to in_progress.
+        """
+        task = self.db.get_task(task_id)
+        if task.task_mode != "plan_first":
+            raise ValueError(f"task {task_id} is not in plan_first mode")
+        if task.status != "awaiting_plan_review":
+            raise ValueError(
+                f"task {task_id} must be in 'awaiting_plan_review' to reject (status={task.status})"
+            )
+
+        task = self.db.update_task(task_id, status="planning")
+        self._append_event(
+            task_id=task_id,
+            event_type="plan_rejected",
+            payload={"feedback": feedback},
+        )
+
+        cp = self._cp
+        if cp is not None:
+            try:
+                if task.paperclip_issue_id:
+                    cp.update_issue_status(task.paperclip_issue_id, "planning")
+                    cp.add_comment(
+                        task.paperclip_issue_id,
+                        f"REVISE: {feedback}",
+                    )
+            except Exception as _pc_exc:
+                self._append_event(
+                    task_id=task_id,
+                    event_type="paperclip_sync_failed",
+                    payload={"error": str(_pc_exc), "op": "reject_plan"},
+                )
+
+        return task
+
+    def cancel_task(self, task_id: str, *, reason: str = "Cancelled by operator") -> TaskRecord:
+        """
+        Cancel a task directly by task_id (no approval record required).
+
+        Used by the Paperclip reconciler when an operator sets a task to
+        'cancelled' in Paperclip.  Does NOT write back to Paperclip — the
+        signal originated there, so we only update backend state.
+
+        No-ops if task is already in a terminal state.
+        """
+        task = self.db.get_task(task_id)
+        if task.status in {"cancelled", "completed", "failed"}:
+            return task
+        task = self.db.update_task(task_id, status="cancelled", result_summary=reason)
+        self._append_event(
+            task_id=task_id,
+            event_type="task_cancelled",
+            payload={"reason": reason, "source": "paperclip_reconciler"},
+        )
+        return task
+
+    def set_task_mode(self, task_id: str, *, mode: str) -> TaskRecord:
+        """
+        Set the task_mode field for a task.
+
+        Valid modes: 'plan_first', 'direct'.
+        Intended for operator use via the dashboard or API to override
+        the mode assigned at creation time.
+        """
+        if mode not in {"plan_first", "direct"}:
+            raise ValueError(f"invalid task_mode: {mode!r} — must be 'plan_first' or 'direct'")
+        self.db.get_task(task_id)  # raises KeyError if not found
+        task = self.db.update_task(task_id, task_mode=mode)
+        self._append_event(
+            task_id=task_id,
+            event_type="task_mode_set",
+            payload={"task_mode": mode, "source": "operator"},
+        )
+        return task
 
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -938,6 +1220,18 @@ class AgenticOSService:
             event_type="task_cancelled",
             payload={"reason": task.result_summary or "Approval denied."},
         )
+        cp = self._cp
+        if cp is not None:
+            try:
+                if task.paperclip_issue_id:
+                    cp.update_issue_status(task.paperclip_issue_id, "cancelled")
+                    cp.add_comment(task.paperclip_issue_id, f"Cancelled: {task.result_summary or 'Approval denied.'}")
+            except Exception as _pc_exc:
+                self._append_event(
+                    task_id=task.id,
+                    event_type="paperclip_sync_failed",
+                    payload={"error": str(_pc_exc), "op": "deny"},
+                )
         return {"task": task, "approval": approval}
 
     def cancel(self, approval_id: str, decision_note: Optional[str] = None) -> dict[str, Any]:
@@ -964,6 +1258,18 @@ class AgenticOSService:
             event_type="task_cancelled",
             payload={"reason": task.result_summary or "Approval cancelled."},
         )
+        cp = self._cp
+        if cp is not None:
+            try:
+                if task.paperclip_issue_id:
+                    cp.update_issue_status(task.paperclip_issue_id, "cancelled")
+                    cp.add_comment(task.paperclip_issue_id, f"Cancelled: {task.result_summary or 'Approval cancelled.'}")
+            except Exception as _pc_exc:
+                self._append_event(
+                    task_id=task.id,
+                    event_type="paperclip_sync_failed",
+                    payload={"error": str(_pc_exc), "op": "cancel"},
+                )
         return {"task": task, "approval": approval}
 
     def execute_action(
@@ -1450,8 +1756,22 @@ class AgenticOSService:
             "notion_task": self._serialize_notion_task(notion_task),
         }
 
-    def complete_task(self, task_id: str, result_summary: str = "", *, artifact_ref: Optional[str] = None) -> TaskRecord:
-        """Mark task as executed with result summary and optional artifact reference."""
+    def complete_task(
+        self,
+        task_id: str,
+        result_summary: str = "",
+        *,
+        artifact_ref: Optional[str] = None,
+        paperclip_content: Optional[str] = None,
+        artifact_path: Optional[str] = None,
+    ) -> TaskRecord:
+        """
+        Mark task as executed with result summary and optional artifact reference.
+
+        paperclip_content: full result text for Paperclip writeback (uses long-doc path
+            when len > LONG_RESULT_THRESHOLD). Defaults to result_summary when not provided.
+        artifact_path: filesystem path to the result artifact for Paperclip attachment upload.
+        """
         task = self.db.get_task(task_id)
         if task.status in {"completed", "cancelled"}:
             self._record_task_operation_rejection(
@@ -1475,22 +1795,31 @@ class AgenticOSService:
             payload={"result_summary": result_summary, "artifact_ref": artifact_ref},
         )
 
-        # Full Notion writeback when task has an external Notion page
-        if task.external_ref:
+        # Paperclip writeback — status + rich result (doc/comment/artifact)
+        cp = self._cp
+        if cp is not None:
             try:
-                from .notion_result_writer import write_success
-                write_success(
-                    page_id=task.external_ref,
-                    task=task,
-                    result_summary=result_summary,
-                    config=self.config,
-                    artifact_id=artifact_ref,
-                )
-            except Exception as exc:
+                if task.paperclip_issue_id:
+                    executor_key = cp.resolve_executor_key(task)
+                    cp.update_issue_status(
+                        task.paperclip_issue_id,
+                        task.status,
+                        assignee_key=executor_key,
+                    )
+                    pc_text = paperclip_content or result_summary
+                    if pc_text:
+                        from pathlib import Path as _Path
+                        cp.write_result(
+                            task.paperclip_issue_id,
+                            pc_text,
+                            task_id=task_id,
+                            artifact_path=_Path(artifact_path) if artifact_path else None,
+                        )
+            except Exception as _pc_exc:
                 self._append_event(
                     task_id=task_id,
-                    event_type="notion_update_failed",
-                    payload={"error": str(exc)},
+                    event_type="paperclip_sync_failed",
+                    payload={"error": str(_pc_exc), "op": "complete"},
                 )
 
         # Send completion notification
@@ -1516,16 +1845,18 @@ class AgenticOSService:
         task = self.db.update_task(task_id, status="failed", result_summary=reason)
         self._append_event(task_id=task.id, event_type="task_failed", payload={"reason": reason})
 
-        # Update Notion status → Blocked (if task has an external Notion page)
-        if task.external_ref:
+        # Paperclip writeback — status + failure comment
+        cp = self._cp
+        if cp is not None:
             try:
-                from .notion_result_writer import write_failure
-                write_failure(task.external_ref, reason, config=self.config)
-            except Exception as exc:
+                if task.paperclip_issue_id:
+                    cp.update_issue_status(task.paperclip_issue_id, "failed")
+                    cp.post_failure_comment(task.paperclip_issue_id, reason[:500])
+            except Exception as _pc_exc:
                 self._append_event(
                     task_id=task_id,
-                    event_type="notion_update_failed",
-                    payload={"error": str(exc)},
+                    event_type="paperclip_sync_failed",
+                    payload={"error": str(_pc_exc), "op": "fail"},
                 )
 
         # Send Discord notification

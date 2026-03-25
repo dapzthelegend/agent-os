@@ -2,7 +2,9 @@
 
 Local-first backend for an OpenClaw-powered agentic OS. Handles durable task state, policy decisions, artifact revisions, approvals, execution records, and audit history.
 
-OpenClaw tools and skills handle reads, drafting, and execution. This repo stores what happened and what should happen next.
+OpenClaw agents think and act. agentic-os remembers what happened and enforces what should happen next.
+
+**Full system documentation:** [SYSTEM_SPEC.md](SYSTEM_SPEC.md)
 
 ## Layout
 

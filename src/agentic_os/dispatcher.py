@@ -90,6 +90,7 @@ class Dispatcher:
         routing: str,
         agent: str,
         fallback_agent: Optional[str] = None,
+        approved_plan: Optional[str] = None,
     ) -> DispatchPayload:
         """
         Build dispatch payload for a classified task.
@@ -101,6 +102,7 @@ class Dispatcher:
             classification: RequestClassification
             routing: auto_execute | needs_approval | escalate
             agent: main | manager | senior (from routing rules or decision engine)
+            approved_plan: approved plan text for plan_first tasks (included in brief)
 
         Returns:
             DispatchPayload with full brief (compressed if very long)
@@ -111,6 +113,7 @@ class Dispatcher:
             domain=classification.domain,
             intent_type=classification.intent_type,
             risk_level=classification.risk_level,
+            approved_plan=approved_plan,
         )
 
         # Phase 3: compress very long briefs before dispatch
@@ -157,17 +160,36 @@ After outputting TASK_DONE: {task_id}, you MUST record the result:
         domain: str,
         intent_type: str,
         risk_level: str,
+        approved_plan: Optional[str] = None,
     ) -> str:
         """Build the full prompt brief for an ACP session."""
 
         if intent_type == "content":
-            return self._build_content_brief(title, task_id, risk_level)
+            brief = self._build_content_brief(title, task_id, risk_level)
         elif domain == "personal" and intent_type == "draft":
-            return self._build_draft_brief(title, task_id, domain, risk_level)
+            brief = self._build_draft_brief(title, task_id, domain, risk_level)
         elif domain == "technical" and intent_type in ("execute", "read"):
-            return self._build_technical_brief(title, task_id, domain, intent_type, risk_level)
+            brief = self._build_technical_brief(title, task_id, domain, intent_type, risk_level)
         else:
-            return self._build_generic_brief(title, task_id, domain, intent_type, risk_level)
+            brief = self._build_generic_brief(title, task_id, domain, intent_type, risk_level)
+
+        if approved_plan:
+            plan_section = (
+                f"\n== APPROVED EXECUTION PLAN ==\n"
+                f"The following plan has been reviewed and approved by the operator.\n"
+                f"You MUST follow this plan. Do not deviate without explicit instruction.\n\n"
+                f"{approved_plan.strip()}\n"
+                f"== END OF PLAN ==\n"
+            )
+            # Insert the plan block right before the write-back instructions
+            writeback_marker = "== MANDATORY WRITE-BACK =="
+            if writeback_marker in brief:
+                idx = brief.index(writeback_marker)
+                brief = brief[:idx] + plan_section + "\n" + brief[idx:]
+            else:
+                brief = brief + plan_section
+
+        return brief
 
     def _build_content_brief(self, title: str, task_id: str, risk_level: str) -> str:
         """
@@ -312,6 +334,27 @@ def main() -> None:
         risk_level=task.risk_level,
     )
     routing, agent = dispatcher.resolve_routing(classification)
+
+    # Load approved plan for plan_first tasks
+    approved_plan: Optional[str] = None
+    if task.task_mode == "plan_first" and task.approved_plan_revision_id:
+        from pathlib import Path
+        from .artifacts import ArtifactStore
+        import json as _json
+        try:
+            store = ArtifactStore(paths.artifacts_dir)
+            plan_artifacts = [
+                a for a in db.list_artifacts(task.id)
+                if a.get("artifact_type") == "plan_document"
+            ]
+            if plan_artifacts:
+                latest = sorted(plan_artifacts, key=lambda a: a.get("version", 0))[-1]
+                raw = store.read_text(latest["path"])
+                parsed = _json.loads(raw)
+                approved_plan = parsed.get("plan_text") or raw
+        except Exception:
+            pass
+
     payload = dispatcher.build_payload(
         task_id=task.id,
         notion_page_id=task.external_ref or "",
@@ -319,6 +362,7 @@ def main() -> None:
         classification=classification,
         routing=routing,
         agent=agent,
+        approved_plan=approved_plan,
     )
 
     # Output as JSON
