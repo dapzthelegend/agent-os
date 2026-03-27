@@ -7,7 +7,7 @@ from typing import Any, Optional
 DOMAINS = ("personal", "technical", "finance", "system")
 INTENT_TYPES = ("read", "draft", "execute", "capture", "recap", "content")
 RISK_LEVELS = ("low", "medium", "high")
-ACTION_SOURCES = ("openclaw_tool", "openclaw_skill", "custom_adapter", "manual")
+ACTION_SOURCES = ("openclaw_tool", "openclaw_skill", "custom_adapter", "manual", "api", "paperclip_manual")
 STATUSES = (
     # legacy live-path statuses (phase 0 compat)
     "new",

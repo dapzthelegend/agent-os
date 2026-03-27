@@ -15,7 +15,7 @@ import logging
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 import json
@@ -99,8 +99,8 @@ class PaperclipClient:
             "status": status,
         }
         if assignee_id:
-            body["assigneeId"] = assignee_id
-        data = self._request("POST", "/issues", body=body)
+            body["assigneeAgentId"] = assignee_id
+        data = self._request("POST", f"/companies/{self._config.company_id}/issues", body=body)
         return _parse_issue(data)
 
     def update_issue(
@@ -116,7 +116,7 @@ class PaperclipClient:
         if status is not None:
             body["status"] = status
         if assignee_id is not None:
-            body["assigneeId"] = assignee_id
+            body["assigneeAgentId"] = assignee_id
         if title is not None:
             body["title"] = title
         if description is not None:
@@ -195,6 +195,31 @@ class PaperclipClient:
     # Activity
     # ------------------------------------------------------------------
 
+    def list_issues(
+        self,
+        *,
+        company_id: Optional[str] = None,
+        goal_id: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[IssueRef]:
+        """List issues for a company, optionally filtered by status.
+
+        Note: goal_id filtering is not supported by the server's list endpoint
+        and is ignored.
+        """
+        if not company_id:
+            raise PaperclipError("company_id is required to list issues")
+        params: dict[str, Any] = {}
+        if status:
+            params["status"] = status
+        path = f"/companies/{company_id}/issues"
+        if params:
+            path = f"{path}?{urlencode(params)}"
+        data = self._request("GET", path)
+        items = data if isinstance(data, list) else data.get("items", [])
+        return [_parse_issue(item) for item in items]
+
     def list_activity(
         self,
         issue_id: str,
@@ -217,10 +242,10 @@ class PaperclipClient:
         company_id: Optional[str] = None,
         lookback_seconds: int = 300,
     ) -> list[ActivityEvent]:
+        if not company_id:
+            raise PaperclipError("company_id is required to list recent activity")
         params: dict[str, Any] = {"lookbackSeconds": lookback_seconds}
-        if company_id:
-            params["companyId"] = company_id
-        path = f"/activity?{urlencode(params)}"
+        path = f"/companies/{company_id}/activity?{urlencode(params)}"
         data = self._request("GET", path)
         items = data if isinstance(data, list) else data.get("items", [])
         return [_parse_activity(item, str(item.get("issueId", ""))) for item in items]
@@ -254,17 +279,18 @@ class PaperclipClient:
                     if not raw:
                         return {}
                     return json.loads(raw)
+            except HTTPError as exc:
+                # Non-transient HTTP errors (4xx) are raised immediately; 5xx are retried.
+                if exc.code not in _TRANSIENT_STATUS_CODES:
+                    raise PaperclipError(str(exc), status_code=exc.code) from exc
+                last_exc = exc
+                log.warning("paperclip transient error (attempt %d/%d): %s", attempt + 1, _MAX_RETRIES, exc)
+                time.sleep(_RETRY_DELAY_SECONDS * (attempt + 1))
             except URLError as exc:
                 last_exc = exc
                 log.warning("paperclip transient error (attempt %d/%d): %s", attempt + 1, _MAX_RETRIES, exc)
                 time.sleep(_RETRY_DELAY_SECONDS * (attempt + 1))
             except Exception as exc:  # noqa: BLE001
-                # Check if it's an HTTP error with a status code
-                status_code: Optional[int] = getattr(getattr(exc, "code", None), "__int__", lambda: None)()
-                if status_code is None:
-                    status_code = getattr(exc, "code", None)
-                if status_code is not None and status_code not in _TRANSIENT_STATUS_CODES:
-                    raise PaperclipError(str(exc), status_code=status_code) from exc
                 last_exc = exc
                 log.warning("paperclip transient error (attempt %d/%d): %s", attempt + 1, _MAX_RETRIES, exc)
                 time.sleep(_RETRY_DELAY_SECONDS * (attempt + 1))
@@ -292,7 +318,7 @@ def _parse_issue(data: dict[str, Any]) -> IssueRef:
         status=str(data.get("status", "")),
         project_id=data.get("projectId") or data.get("project_id"),
         goal_id=data.get("goalId") or data.get("goal_id"),
-        assignee_id=data.get("assigneeId") or data.get("assignee_id"),
+        assignee_id=data.get("assigneeAgentId") or data.get("assigneeId") or data.get("assignee_id"),
     )
 
 

@@ -62,6 +62,22 @@ class SetTaskModePayload(BaseModel):
     mode: str  # "plan_first" or "direct"
 
 
+class SubmitPlanPayload(BaseModel):
+    plan_text: str
+    paperclip_document_id: Optional[str] = None
+
+
+class CreateTaskPayload(BaseModel):
+    user_request: str
+    domain: str
+    intent_type: str
+    risk_level: str
+    operation_key: Optional[str] = None
+    target: Optional[str] = None
+    request_metadata: Optional[dict] = None
+    action_source: str = "api"
+
+
 @router.get("/health")
 def api_health() -> dict:
     return get_system_health(get_service())
@@ -70,6 +86,60 @@ def api_health() -> dict:
 @router.get("/overview")
 def api_overview() -> dict:
     return build_overview(get_service())
+
+
+@router.post("/tasks")
+def api_create_task(payload: CreateTaskPayload) -> dict:
+    """
+    Create a new task via HTTP intake.
+
+    Validates domain / intent_type / risk_level, runs the full create_request()
+    pipeline (policy evaluation, plan gate, Paperclip projection), and returns
+    the resulting task record.
+
+    action_source defaults to "api". Use "manual" for operator-created tasks.
+    operation_key is required when policy_decision resolves to "approval_required"
+    and task_mode is "direct".
+    """
+    from .models import DOMAINS, INTENT_TYPES, RISK_LEVELS, RequestClassification
+
+    errors = []
+    if payload.domain not in DOMAINS:
+        errors.append(f"domain must be one of: {', '.join(DOMAINS)}")
+    if payload.intent_type not in INTENT_TYPES:
+        errors.append(f"intent_type must be one of: {', '.join(INTENT_TYPES)}")
+    if payload.risk_level not in RISK_LEVELS:
+        errors.append(f"risk_level must be one of: {', '.join(RISK_LEVELS)}")
+    if errors:
+        raise HTTPException(status_code=422, detail={"errors": errors})
+
+    classification = RequestClassification(
+        domain=payload.domain,
+        intent_type=payload.intent_type,
+        risk_level=payload.risk_level,
+    )
+    try:
+        result = get_service().create_request(
+            user_request=payload.user_request,
+            classification=classification,
+            operation_key=payload.operation_key,
+            target=payload.target,
+            request_metadata=payload.request_metadata,
+            action_source=payload.action_source,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise _handle_operator_error(exc) from exc
+
+    task = result["task"]
+    return {
+        "task_id": task.id,
+        "status": task.status,
+        "task_mode": task.task_mode,
+        "policy_decision": result["policy_decision"],
+        "paperclip_issue_id": task.paperclip_issue_id,
+    }
 
 
 @router.get("/tasks")
@@ -231,8 +301,11 @@ def api_execution_callback(payload: ExecutionCallbackPayload) -> dict:
     Receive ACP agent output and complete the execution pipeline.
 
     The agent output must contain RESULT_START...RESULT_END markers and
-    TASK_DONE: <task_id>. On duplicate submission (same operation_key),
-    returns the existing record with idempotent=true.
+    TASK_DONE: <task_id>. Edge cases:
+    - Unknown task_id (after session_key fallback): 400
+    - Already terminal task: 200 { status: already_terminal }
+    - Duplicate submission (operation_key dedup): 200 { status: success, idempotent: true }
+    - Any internal error: 200 { status: error, reason: ... } — never 5xx
     """
     paths = default_paths()
     try:
@@ -242,6 +315,17 @@ def api_execution_callback(payload: ExecutionCallbackPayload) -> dict:
             session_key=payload.session_key,
             paths=paths,
         )
+        if result.task_not_found:
+            raise HTTPException(
+                status_code=400,
+                detail={"status": "error", "reason": "task not found"},
+            )
+        if result.already_terminal:
+            return {
+                "status": "already_terminal",
+                "task_id": result.task_id,
+                "task_status": result.terminal_status,
+            }
         return {
             "status": "success" if result.success else "error",
             "task_id": result.task_id,
@@ -249,12 +333,12 @@ def api_execution_callback(payload: ExecutionCallbackPayload) -> dict:
             "idempotent": result.idempotent,
             "error": result.error,
         }
+    except HTTPException:
+        raise
     except ExecutionParseError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"status": "error", "reason": str(exc)}
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return {"status": "error", "reason": str(exc)}
 
 
 @router.post("/artifacts/{task_id}/revise")
@@ -296,6 +380,22 @@ def api_reject_plan(task_id: str, payload: RejectPlanPayload) -> dict:
 def api_cancel_task(task_id: str, payload: CancelTaskPayload) -> dict:
     try:
         return asdict(get_service().cancel_task(task_id, reason=payload.reason))
+    except Exception as exc:
+        raise _handle_operator_error(exc) from exc
+
+
+@router.post("/tasks/{task_id}/submit-plan")
+def api_submit_plan(task_id: str, payload: SubmitPlanPayload) -> dict:
+    try:
+        service = get_service()
+        task = service.db.get_task(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+        version = (task.plan_version or 0) + 1
+        service.submit_plan(task_id, payload.plan_text, version=version)
+        return {"status": "ok", "task_id": task_id, "plan_version": version}
+    except HTTPException:
+        raise
     except Exception as exc:
         raise _handle_operator_error(exc) from exc
 

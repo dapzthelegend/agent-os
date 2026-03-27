@@ -22,7 +22,7 @@ class TestDispatcher:
         )
         payload = self.dispatcher.build_payload(
             task_id="task_000001",
-            notion_page_id="page_001",
+            paperclip_issue_id="page_001",
             title="Write a poem about TypeScript",
             classification=classification,
             routing="auto_execute",
@@ -43,7 +43,7 @@ class TestDispatcher:
         )
         payload = self.dispatcher.build_payload(
             task_id="task_000002",
-            notion_page_id="page_002",
+            paperclip_issue_id="page_002",
             title="Fix the login form",
             classification=classification,
             routing="auto_execute",
@@ -65,7 +65,7 @@ class TestDispatcher:
         )
         payload = self.dispatcher.build_payload(
             task_id="task_000003",
-            notion_page_id="page_003",
+            paperclip_issue_id="page_003",
             title="Research API patterns",
             classification=classification,
             routing="auto_execute",
@@ -83,7 +83,7 @@ class TestDispatcher:
         )
         payload = self.dispatcher.build_payload(
             task_id="task_000004",
-            notion_page_id="page_004",
+            paperclip_issue_id="page_004",
             title="Read something",
             classification=classification,
             routing="auto_execute",
@@ -100,7 +100,7 @@ class TestDispatcher:
         )
         payload = self.dispatcher.build_payload(
             task_id="task_000005",
-            notion_page_id="page_005",
+            paperclip_issue_id="page_005",
             title="Complex task",
             classification=classification,
             routing="needs_approval",
@@ -117,7 +117,7 @@ class TestDispatcher:
         )
         payload = self.dispatcher.build_payload(
             task_id="task_000006",
-            notion_page_id="page_006",
+            paperclip_issue_id="page_006",
             title="Code task",
             classification=classification,
             routing="auto_execute",
@@ -134,14 +134,14 @@ class TestDispatcher:
         )
         payload = self.dispatcher.build_payload(
             task_id="task_000007",
-            notion_page_id="page_007",
+            paperclip_issue_id="page_007",
             title="Test task",
             classification=classification,
             routing="auto_execute",
             agent="sonnet",
         )
         assert payload.task_id == "task_000007"
-        assert payload.notion_page_id == "page_007"
+        assert payload.paperclip_issue_id == "page_007"
         assert payload.routing == "auto_execute"
         assert payload.agent == "sonnet"
         assert isinstance(payload.brief, str)
@@ -158,7 +158,7 @@ class TestDispatcher:
         title = "Write a unique poem"
         payload = self.dispatcher.build_payload(
             task_id="task_000008",
-            notion_page_id="page_008",
+            paperclip_issue_id="page_008",
             title=title,
             classification=classification,
             routing="auto_execute",
@@ -176,7 +176,7 @@ class TestDispatcher:
         task_id = "task_000009"
         payload = self.dispatcher.build_payload(
             task_id=task_id,
-            notion_page_id="page_009",
+            paperclip_issue_id="page_009",
             title="Do something",
             classification=classification,
             routing="auto_execute",
@@ -193,7 +193,7 @@ class TestDispatcher:
         )
         payload = self.dispatcher.build_payload(
             task_id="task_000010",
-            notion_page_id="page_010",
+            paperclip_issue_id="page_010",
             title="Capture data",
             classification=classification,
             routing="needs_approval",
@@ -213,7 +213,7 @@ class TestDispatcher:
         )
         payload = self.dispatcher.build_payload(
             task_id="task_000011",
-            notion_page_id="page_011",
+            paperclip_issue_id="page_011",
             title="Test",
             classification=classification,
             routing="auto_execute",
@@ -222,7 +222,7 @@ class TestDispatcher:
         # Should be able to convert to dict
         payload_dict = vars(payload)
         assert "task_id" in payload_dict
-        assert "notion_page_id" in payload_dict
+        assert "paperclip_issue_id" in payload_dict
         assert "routing" in payload_dict
         assert "agent" in payload_dict
         assert "brief" in payload_dict

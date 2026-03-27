@@ -1,6 +1,6 @@
 # agentic-os — System Specification
 
-_Current as of 2026-03-25. Phases 0–6 complete. Paperclip is the live operator surface._
+_Current as of 2026-03-26. Phases 0–7 complete. Paperclip is the live operator surface._
 
 ---
 
@@ -21,53 +21,71 @@ agentic-os is the durable backend for an OpenClaw-powered agentic OS. It owns:
 ## Architecture
 
 ```
-┌─────────────────────────────────────┐
-│           OpenClaw Runtime           │
-│  (agents: main, manager, senior,    │
-│   heartbeat, codex, claude-code)     │
-└────────────────┬────────────────────┘
-                 │ ACP sessions / tool calls / cron jobs
-                 ▼
-┌─────────────────────────────────────┐
-│           agentic-os backend         │
-│                                     │
-│  Intake → intake_classifier         │
-│        → dispatcher                 │
-│        → plan_gate (plan_first)     │
-│        → service (state machine)    │
-│        → decision_engine            │
-│        → approval workflow          │
-│        → execution_receiver         │
-│        → notifier                   │
-│                                     │
-│  Paperclip sync                     │
-│    task_control_plane  (writeback)  │
-│    paperclip_reconciler (poll)      │
-│                                     │
-│  Daily routine: calendar_poller     │
-│               + gmail_poller        │
-│               + daily_routine       │
-│               + gmail_sender        │
-│                                     │
-│  Dashboard: FastAPI (localhost:8080) │
-│  Storage: SQLite + JSONL audit log  │
-└────────────────┬────────────────────┘
-                 │ issues / comments / docs / attachments
-                 ▼
-┌─────────────────────────────────────┐
-│              Paperclip               │
-│  http://localhost:3100/api           │
-│  auth_mode: trusted                  │
-│                                     │
-│  Company: Dara OS                   │
-│  Goal: Task Execution               │
-│  Projects: personal / technical /   │
-│            finance / system         │
-│  Agents: Chief of Staff, PM, EM,    │
-│          Engineer, Codex, Content   │
-│          Writer, Accountant, EA     │
-└─────────────────────────────────────┘
+                        ┌─────────────────────────────────────────┐
+                        │          agentic-os backend              │
+                        │                                         │
+                        │  Intake → intake_classifier             │
+                        │        → dispatcher (builds brief doc)  │
+                        │        → plan_gate (plan_first)         │
+                        │        → service (state machine)        │
+                        │        → decision_engine                │
+                        │        → approval workflow              │
+                        │        → execution_receiver             │
+                        │        → notifier                       │
+                        │                                         │
+                        │  Paperclip sync                         │
+                        │    task_control_plane  (writeback)      │
+                        │    paperclip_reconciler (poll, 2 min)   │
+                        │                                         │
+                        │  Daily routine: calendar_poller         │
+                        │               + gmail_poller            │
+                        │               + daily_routine           │
+                        │               + gmail_sender            │
+                        │                                         │
+                        │  Dashboard: FastAPI (localhost:8080)    │
+                        │  Storage: SQLite + JSONL audit log      │
+                        └──────┬─────────────────▲───────────────┘
+                               │                 │
+             issues / briefs / │                 │ POST /api/executions/callback
+             comments / docs   │                 │ POST /api/tasks/{id}/submit-plan
+                               ▼                 │ (agents call back when done)
+                 ┌─────────────────────────────────────┐
+                 │              Paperclip               │
+                 │  http://localhost:3100/api           │
+                 │  auth_mode: trusted                  │
+                 │                                     │
+                 │  Company: Dara OS                   │
+                 │  Goal: Task Execution               │
+                 │  Projects: personal / technical /   │
+                 │            finance / system         │
+                 │  Agents: Chief of Staff, PM, EM,    │
+                 │          Engineer, Codex, Content   │
+                 │          Writer, Accountant, EA     │
+                 │                                     │
+                 │  ★ Owns: heartbeat scheduling,      │
+                 │    agent wakeup, session lifecycle, │
+                 │    atomic task checkout, budgets    │
+                 └─────────────────────────────────────┘
 ```
+
+**Data flow in plain terms:**
+
+1. Task is created in agentic-os → `task_control_plane` opens a Paperclip issue, attaches the brief document, assigns the correct agent.
+2. Paperclip's heartbeat timer detects the assignment and triggers the agent (Claude Code, Codex, or another executor) on its next cycle.
+3. The agent reads its Paperclip issue (brief, context), executes the work, then calls `POST /api/executions/callback` (or `POST /api/tasks/{id}/submit-plan` for plan-first) on agentic-os when done.
+4. `paperclip_reconciler` polls Paperclip activity every 2 minutes to reflect any operator comments or status changes back into agentic-os state.
+
+**Reverse flow (Paperclip → agentic-os):**
+
+Tasks can also be created manually in Paperclip. On every reconciler cycle:
+
+5. Activity events with type `issue_created` for an untracked issue trigger `import_paperclip_issue()`.
+6. A safety-net scan also checks all open `todo` issues and imports any with no matching backend task.
+7. Import: domain inferred from `project_id`, classification defaults to `execute` / `medium`, `action_source = paperclip_manual`.
+8. The existing Paperclip issue is *adopted* (not replaced): status + assignee updated, callback brief written as a document.
+9. Lifecycle proceeds as normal from `new` status.
+
+agentic-os never initiates agent sessions or owns scheduling. It only creates/updates Paperclip issues and waits for agents to call back.
 
 ---
 
@@ -84,10 +102,27 @@ new → in_progress → completed / failed / stalled
 ### Plan-first task (`task_mode = plan_first`)
 
 ```
-new → planning → awaiting_plan_review → approved_for_execution → executing → completed / failed
-                      ↑ REVISE↓              ↑ APPROVE (Paperclip comment or API)
-                   planning              paperclip_reconciler / web UI / API
+new → planning ──────────────────────────────────────────────────────────────────────────────────┐
+       (execution agent writes plan,                                                             │
+        submits via POST /submit-plan)                                                           │
+          │                                                                                      │
+          ▼                                                                                      │
+      awaiting_plan_review ──REVISE (PM comment)──────────────────────────────── back to planning
+       (assigned to PM for review)
+          │
+      APPROVE (PM Paperclip comment, web UI, or API)
+          │
+          ▼
+      approved_for_execution
+       (reassigned to original execution agent)
+          │
+          ▼
+      executing → completed / failed
 ```
+
+- The **execution agent** (engineer, codex, content writer, etc.) writes the plan — not the PM.
+- The **Project Manager** reviews and approves or requests revisions.
+- On approval, the **same execution agent** is reassigned to execute.
 
 ### Approval-required task
 
@@ -157,8 +192,10 @@ Polls Paperclip company activity every 2 minutes. Reflects operator actions into
 | Comment: `REVISE:` / `REVISION:` / `REQUEST_REVISION:` | `reject_plan()` if task in `awaiting_plan_review` |
 | Status → `cancelled` | `cancel_task()` if task not terminal |
 | Ambiguous comment | Logged only (`reconciler_comment_ignored`) |
+| `issue_created` event for untracked issue | `import_paperclip_issue()` — adopts issue as new backend task |
+| Open `todo` issue with no backend task (scan) | `import_paperclip_issue()` — safety-net catch for missed events |
 
-- **Idempotent:** seen event IDs persisted in `data/paperclip_reconciler_state.json` (rolling 2000-entry window)
+- **Idempotent:** seen event IDs + imported issue IDs persisted in `data/paperclip_reconciler_state.json` (rolling 2000-entry window for events; all imported issue IDs retained)
 - **Failure-tolerant:** per-event try/except; poll failure returns error count, never crashes
 - **No Paperclip writeback** on reconciler-sourced cancellations (avoids feedback loops)
 
@@ -166,24 +203,27 @@ Polls Paperclip company activity every 2 minutes. Reflects operator actions into
 
 | Module | Role |
 |--------|------|
-| `execution_receiver.py` | Receives ACP agent results, deduplicates by `operation_key`, stores artifact, calls `complete_task()` |
+| `execution_receiver.py` | Receives agent results via `POST /api/executions/callback`. Deduplicates by `operation_key` or `dispatch_session_key`. Stores artifact. Calls `complete_task()`. |
 | `task_control_plane.write_result()` | Writeback to Paperclip: short → comment; long → doc; artifact → attachment |
 | `notifier.py` | Discord/Gmail completion notifications |
 
-Notion writeback is fully removed from this path (Phase 3/6 complete).
+Agents (triggered by Paperclip's heartbeat) call `POST /api/executions/callback` when their work is done. agentic-os never initiates or manages the agent sessions. Notion writeback is fully removed from this path (Phase 3/6 complete).
 
 ### Intake Pipeline
 
 | Module | Role |
 |--------|------|
-| `intake_classifier.py` | Maps domain / intent_type / risk_level → route / agent |
-| `dispatcher.py` | Builds structured ACP task briefs with timeouts and metadata |
+| `intake_classifier.py` | Maps domain / intent_type / risk_level → route / agent key |
+| `dispatcher.py` | Builds structured task brief documents (posted to Paperclip issue) |
 | `decision_engine.py` | Policy evaluation → `read_ok` / `draft_required` / `approval_required` |
 
+The brief document is written to the Paperclip issue at task creation time. The assigned agent reads it when Paperclip's heartbeat wakes it. agentic-os has no further involvement in session initiation.
+
 **Current task intake sources:**
-- OpenClaw conversation (manual operator input)
-- CLI / JSON API (`POST /api/tasks` equivalent via `create_request`)
+- OpenClaw conversation (manual operator input via CLI or service call)
 - Backend internal routines (daily routine follow-up tasks)
+- `POST /api/tasks` HTTP endpoint
+- **Paperclip manual creation** — operator creates an issue directly in Paperclip; reconciler detects and imports it (`action_source = paperclip_manual`)
 - *(Notion polling: disabled as of Phase 6)*
 
 ### Deprecated Modules (Notion — retained for rollback)
@@ -256,6 +296,8 @@ POST /api/tasks/{id}/approve-plan
 POST /api/tasks/{id}/reject-plan
 POST /api/tasks/{id}/cancel
 POST /api/tasks/{id}/set-mode
+POST /api/tasks
+POST /api/tasks/{id}/submit-plan
 POST /api/artifacts/{id}/revise
 POST /api/executions/callback
 ```
@@ -322,7 +364,7 @@ Daily routine: `daily_routine_recap_created`, `daily_routine_email_prepared`, `d
 
 Notion (legacy): `notion_sync_imported`, `notion_update_failed`
 
-Paperclip projection: `paperclip_issue_created`, `paperclip_projection_failed`, `paperclip_sync_failed`
+Paperclip projection: `paperclip_issue_created`, `paperclip_issue_imported`, `paperclip_projection_failed`, `paperclip_sync_failed`
 
 Plan gate: `task_mode_set`, `plan_submitted`, `plan_awaiting_review`, `plan_approved`, `plan_rejected`
 
@@ -330,18 +372,19 @@ Reconciler: `reconciler_ran`, `reconciler_action_taken`, `reconciler_comment_ign
 
 ---
 
-## Cron Jobs
+## Scheduled Jobs
 
-| Job | Schedule | Status | Description |
-|-----|----------|--------|-------------|
-| `daily-routine-0830-london` | 08:30 London | ✅ enabled | Calendar + inbox recap + email |
-| `paperclip-reconcile` | every 2 min | ✅ enabled | Poll Paperclip activity, reflect actions into backend |
-| `task-executor` | every 5 min | ✅ enabled | Claim ready tasks, spawn ACP execution sessions |
-| `cron-health-check` | every 1h | ✅ enabled | Alert via Discord if any job fails 2x |
-| `stall-check` | every 1h | ✅ enabled | Flag stalled tasks, send Discord alert |
-| `workspace-backup` | 02:00 UTC | ✅ enabled | SQLite + artifacts backup, 7-day retention |
-| `approval-reminder` | every 1h | ✅ enabled | Remind on approvals pending >1h |
-| `notion-monitor-poll` | every 30 min | ❌ disabled | Notion inbox polling — superseded by Paperclip |
+> **Scheduling boundary:** All background jobs run inside the agentic-os FastAPI process via `scheduler.py` (`InternalScheduler`). No external cron is used. `cron/jobs.json` is deprecated. Paperclip's heartbeat timer is solely responsible for waking agents when a task is assigned to them.
+
+| Job | Schedule | Owner | Description |
+|-----|----------|-------|-------------|
+| `paperclip-reconcile` | every 2 min | `scheduler.py` | Poll Paperclip activity, reflect operator actions + import manually-created issues |
+| `stall-check` | every 1h | `scheduler.py` | Flag tasks stalled past domain threshold, send Discord alert |
+| `approval-reminder` | every 1h | `scheduler.py` | Remind on approvals pending >1h |
+| `health-check` | every 1h | `scheduler.py` | Log health snapshot, Discord alert on error |
+| `workspace-backup` | daily 02:00 UTC | `scheduler.py` | SQLite + artifacts backup, 7-day retention |
+| `daily-routine` | daily 08:30 London | `scheduler.py` | Calendar + inbox recap + email |
+| *(agent heartbeat)* | per Paperclip config | **Paperclip** | Paperclip wakes assigned agents on each heartbeat cycle — not an agentic-os concern |
 
 ---
 
@@ -356,18 +399,18 @@ Reconciler: `reconciler_ran`, `reconciler_action_taken`, `reconciler_comment_ign
 
 ### Backend → Paperclip Status Map
 
-| Backend status | Paperclip status |
-|----------------|-----------------|
-| `new` | `todo` |
-| `planning` | `in_progress` |
-| `awaiting_plan_review` | `in_review` |
-| `approved_for_execution` | `todo` |
-| `executing` / `in_progress` | `in_progress` |
-| `awaiting_approval` | `blocked` |
-| `completed` | `done` |
-| `failed` | `blocked` |
-| `stalled` | `blocked` |
-| `cancelled` | `cancelled` |
+| Backend status | Paperclip status | Paperclip assignee |
+|----------------|-----------------|-------------------|
+| `new` | `todo` | execution agent |
+| `planning` | `in_progress` | execution agent (writing plan) |
+| `awaiting_plan_review` | `in_review` | `project_manager` (reviewing plan) |
+| `approved_for_execution` | `todo` | execution agent (ready to execute) |
+| `executing` / `in_progress` | `in_progress` | execution agent |
+| `awaiting_approval` | `blocked` | — |
+| `completed` | `done` | — |
+| `failed` | `blocked` | — |
+| `stalled` | `blocked` | — |
+| `cancelled` | `cancelled` | — |
 
 ---
 
@@ -471,17 +514,19 @@ python3 -m agentic_os.backup
 
 | Capability | Status | Notes |
 |------------|--------|-------|
-| Task intake & classification | ✅ | 17 routing rules |
+| Task intake & classification | ✅ | 17 routing rules; `POST /api/tasks` HTTP endpoint |
 | Plan gate (plan_first flow) | ✅ | Phases 2 + 4 |
 | Policy decision engine | ✅ | read_ok / draft_required / approval_required |
 | Approval workflow | ✅ | Email + Discord, reply-based |
-| Execution result capture | ✅ | operation_key dedup |
+| Execution result capture | ✅ | operation_key dedup; session_key fallback; terminal-state guard |
+| Live execution loop (plan_first end-to-end) | ✅ | Phase 7: submit-plan API, planning brief, codex routing, callback hardening |
 | Paperclip issue projection | ✅ | All new tasks mirrored to Paperclip |
 | Paperclip status writeback | ✅ | All state transitions mirrored |
 | Paperclip result/plan writeback | ✅ | Comment / doc / attachment by result size |
 | Paperclip reconciler (poll) | ✅ | Every 2 min, idempotent |
 | Plan approve / reject via Paperclip | ✅ | Comment-based + API + web UI |
 | Task cancel via Paperclip | ✅ | Reconciler-driven, no feedback loop |
+| Task import from Paperclip (manual creation) | ✅ | Reconciler: issue_created events + safety-net scan |
 | Paperclip health dashboard | ✅ | /paperclip page + /api/paperclip/health |
 | Notion task monitoring | ❌ | Disabled (Phase 6) |
 | Notion result writeback | ❌ | Removed (Phase 3 + 6) |
@@ -505,33 +550,62 @@ python3 -m agentic_os.backup
 
 ## Next Phases
 
-### Phase 7 — Live Execution Loop Hardening
+### Phase 7 — Live Execution Loop Hardening ✅ Complete
 
-The task-executor cron job spawns ACP sessions. The following gaps remain:
+All gaps resolved:
+
+| Gap | Status |
+|-----|--------|
+| `submit-plan` API endpoint | ✅ `POST /api/tasks/{id}/submit-plan` added |
+| Planning brief for plan_first tasks | ✅ PM brief replaced with PLANNING INSTRUCTIONS block |
+| Codex routing (`executor_codex`) | ✅ `resolve_executor_key` reads classifier agent from `request_metadata_json` |
+| `notion_page_id` removed from live paths | ✅ Replaced with `paperclip_issue_id` throughout |
+| `execution-callback` hardening | ✅ session_key fallback; terminal guard; no 5xx; task-not-found → 400 |
+| End-to-end smoke test | ✅ `tests/test_e2e_plan_first_flow.py` (10 tests) |
+
+---
+
+### What is still required for a fully running system
+
+The agentic-os backend is complete. Paperclip owns scheduling and agent execution — that is also in place. What remains are two categories of gap:
+
+**A. agentic-os API gaps**
+
+| Missing piece | Description |
+|---------------|-------------|
+| **Task intake endpoint** (`POST /api/tasks`) | ✅ Implemented. Accepts `user_request`, `domain`, `intent_type`, `risk_level`, optional `operation_key` / `target` / `request_metadata`. Returns `task_id`, `status`, `task_mode`, `paperclip_issue_id`. |
+| **Discord interactive approvals** | Approval notifications go out via Discord DM but replies are not parsed. Operators must approve via the web UI (`http://localhost:8080/approvals`) or a Paperclip comment. |
+| **Off-site backup** | Backups are local only (`~/.openclaw/backups/`). No S3/rclone sync configured. |
+| **Personal inbox OAuth** | `gog_dapz.json` / `gog_sola.json` may need re-auth for full 3-account Gmail coverage. |
+
+**B. Paperclip agent configuration (not agentic-os code)**
+
+See **`AGENTS.md`** for the full agent runbook — output format, callback protocol, plan submission protocol, and API reference. These are configurations inside Paperclip, not changes to this codebase:
+
+| Agent config gap | Description |
+|-----------------|-------------|
+| **Agent session templates pass the brief** | Paperclip must be configured to surface the issue's brief document to the agent when the heartbeat triggers it. The brief already contains all callback/submit-plan instructions. |
+| **Codex agent template** | The Paperclip agent record for `executor_codex` must be linked to a live Codex session template. The backend correctly routes to this key — the Paperclip side just needs to be wired. |
+
+---
+
+### Phase 8 — Observability & Ops
 
 | Gap | Action |
 |-----|--------|
-| ACP result writeback to backend | `execution-callback` endpoint must be called by the executor runbook on session completion |
-| Plan submission by planner agent | Planner must call `plan submit` CLI or API after writing the plan doc to Paperclip |
-| `plan_first` end-to-end smoke test | Create task → plan → approve → execute → complete, verify Paperclip mirrors each step |
-| Stall threshold tuning | Review per-domain thresholds against observed task durations |
-
-### Phase 8 — Intake Expansion
-
-| Gap | Action |
-|-----|--------|
-| Personal inbox OAuth re-auth | Run `scripts/reauth_google.py --account dapz,sola` |
-| Discord interactive approvals | Discord bot with DM reply parsing (approve/deny) |
-| Structured intake via API | Thin intake endpoint for external triggers |
-
-### Phase 9 — Observability & Ops
-
-| Gap | Action |
-|-----|--------|
+| Discord interactive approvals | Discord bot with DM reply parsing (approve/deny). Until then: use web UI or Paperclip comments. |
+| Personal inbox OAuth re-auth | Run `scripts/reauth_google.py --account dapz,sola` if `gog_dapz.json` / `gog_sola.json` expire. |
 | Off-site backup | S3 / rclone sync after local backup |
 | Paperclip reconciler metrics | Expose reconciler run history as API endpoint |
+| Alert on `paperclip_sync_failed` | Discord alert when Paperclip writeback fails repeatedly |
+| Stall threshold tuning | Review per-domain thresholds against observed task durations |
+
+### Phase 9 — Audit & Search
+
+| Gap | Action |
+|-----|--------|
 | Audit log search | Full-text or indexed query on audit JSONL |
-| Alert on paperclip_sync_failed | Discord alert when Paperclip writeback fails repeatedly |
+| Execution history view | Per-agent execution summary (how many tasks, avg time, failure rate) |
 
 ---
 
@@ -547,8 +621,8 @@ src/agentic_os/
   artifacts.py             File-based versioning
   health.py                Health checks (DB, artifacts, cron, Paperclip)
 
-  intake_classifier.py     Domain/intent/risk → route/agent
-  dispatcher.py            ACP brief builder
+  intake_classifier.py     Domain/intent/risk → route/agent key
+  dispatcher.py            Builds brief documents posted to Paperclip issues
   plan_gate.py             plan_first vs direct classification
   decision_engine.py       Policy evaluation
   execution_receiver.py    Agent result ingestion (Paperclip writeback, no Notion)
@@ -612,5 +686,7 @@ scripts/
 cron/                               Workspace-local cron job definitions
   jobs.json
 
-tests/                              192 tests, all passing
+AGENTS.md                           Agent runbook (output format, callback, plan submission)
+tests/                              202 tests, all passing
+  test_e2e_plan_first_flow.py       Phase 7 end-to-end smoke test (10 tests)
 ```

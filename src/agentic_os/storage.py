@@ -475,6 +475,17 @@ class Database:
             return None
         return self._row_to_task(row)
 
+    def get_task_by_dispatch_session_key(self, session_key: str) -> Optional[TaskRecord]:
+        """Fallback lookup: find a task by its recorded dispatch_session_key."""
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM tasks WHERE dispatch_session_key = ? ORDER BY created_at DESC LIMIT 1",
+                (session_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_task(row)
+
     def list_tasks_by_operation_key(self, operation_key: str) -> list[TaskRecord]:
         with self.connect() as connection:
             rows = connection.execute(

@@ -80,6 +80,7 @@ class AgenticOSService:
         result_summary: Optional[str] = None,
         external_ref: Optional[str] = None,
         action_source: str = "manual",
+        adopt_paperclip_issue_id: Optional[str] = None,
     ) -> dict[str, Any]:
         validate_choice(action_source, ACTION_SOURCES, "action_source")
         if operation_key is not None:
@@ -113,6 +114,18 @@ class AgenticOSService:
         else:
             task_status, approval_state = self._task_state_for_policy(policy_decision)
 
+        # Ensure the intake classifier's agent selection is stored in request_metadata
+        # so that resolve_executor_key() can route codex tasks to executor_codex.
+        effective_metadata: dict[str, Any] = dict(request_metadata) if request_metadata else {}
+        if "agent" not in effective_metadata:
+            try:
+                from .dispatcher import Dispatcher as _Dispatcher
+                _dispatcher = _Dispatcher()
+                _, resolved_agent = _dispatcher.resolve_routing(classification)
+                effective_metadata["agent"] = resolved_agent
+            except Exception:
+                pass
+
         task = self.db.create_task(
             classification=RequestClassification(
                 domain=classification.domain,
@@ -125,7 +138,7 @@ class AgenticOSService:
             result_summary=result_summary,
             external_ref=external_ref,
             target=target,
-            request_metadata_json=self._dump_json_or_none(request_metadata),
+            request_metadata_json=self._dump_json_or_none(effective_metadata) if effective_metadata else None,
             operation_key=operation_key,
             external_write=external_write,
             policy_decision=policy_decision,
@@ -156,28 +169,62 @@ class AgenticOSService:
         # Paperclip projection (phase 1) — failure must never block task creation
         cp = self._cp
         if cp is not None:
-            try:
-                assignee_key = cp.resolve_assignee_for_task(task)
-                issue = cp.create_issue(task, assignee_key=assignee_key)
-                if issue and issue.id:
+            if adopt_paperclip_issue_id:
+                # Adopt an existing Paperclip issue (task was created there manually)
+                try:
+                    assignee_key = cp.resolve_assignee_for_task(task)
+                    issue = cp.adopt_issue(
+                        adopt_paperclip_issue_id,
+                        task,
+                        assignee_key=assignee_key,
+                    )
                     task = self.db.update_task(
                         task.id,
-                        paperclip_issue_id=issue.id,
-                        paperclip_project_id=issue.project_id or None,
-                        paperclip_goal_id=issue.goal_id or None,
-                        paperclip_assignee_agent_id=issue.assignee_id or None,
+                        paperclip_issue_id=adopt_paperclip_issue_id,
+                        paperclip_project_id=(issue.project_id if issue else None),
+                        paperclip_goal_id=(issue.goal_id if issue else None),
+                        paperclip_assignee_agent_id=(issue.assignee_id if issue else None),
                     )
                     self._append_event(
                         task_id=task.id,
-                        event_type="paperclip_issue_created",
-                        payload={"issue_id": issue.id, "assignee_key": assignee_key},
+                        event_type="paperclip_issue_imported",
+                        payload={"issue_id": adopt_paperclip_issue_id, "assignee_key": assignee_key},
                     )
-            except Exception as _pc_exc:
-                self._append_event(
-                    task_id=task.id,
-                    event_type="paperclip_projection_failed",
-                    payload={"error": str(_pc_exc)},
-                )
+                except Exception as _pc_exc:
+                    self._append_event(
+                        task_id=task.id,
+                        event_type="paperclip_sync_failed",
+                        payload={"error": str(_pc_exc), "phase": "adopt"},
+                    )
+            else:
+                try:
+                    assignee_key = cp.resolve_assignee_for_task(task)
+                    issue = cp.create_issue(task, assignee_key=assignee_key)
+                    if issue and issue.id:
+                        task = self.db.update_task(
+                            task.id,
+                            paperclip_issue_id=issue.id,
+                            paperclip_project_id=issue.project_id or None,
+                            paperclip_goal_id=issue.goal_id or None,
+                            paperclip_assignee_agent_id=issue.assignee_id or None,
+                        )
+                        self._append_event(
+                            task_id=task.id,
+                            event_type="paperclip_issue_created",
+                            payload={"issue_id": issue.id, "assignee_key": assignee_key},
+                        )
+                    else:
+                        self._append_event(
+                            task_id=task.id,
+                            event_type="paperclip_projection_failed",
+                            payload={"error": "create_issue returned None — check server logs"},
+                        )
+                except Exception as _pc_exc:
+                    self._append_event(
+                        task_id=task.id,
+                        event_type="paperclip_projection_failed",
+                        payload={"error": str(_pc_exc)},
+                    )
 
         artifact = None
         if artifact_content is not None:
@@ -199,6 +246,50 @@ class AgenticOSService:
             "approval": approval,
             "task_mode": task_mode,
         }
+
+    def import_paperclip_issue(
+        self,
+        *,
+        issue_id: str,
+        title: str,
+        description: str,
+        project_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        Import a manually-created Paperclip issue as an agentic-os task.
+
+        Called by the reconciler when it detects a new issue with no matching
+        backend task.  Infers domain from project_id, classifies with
+        sensible defaults, then calls create_request() with
+        adopt_paperclip_issue_id so the existing issue is adopted rather
+        than a new one created.
+
+        Returns the same dict as create_request(): {task, policy_decision, ...}
+        """
+        # Infer domain from project_id
+        domain = "system"  # safe default
+        if project_id and self.config.paperclip is not None:
+            reverse_map = {v: k for k, v in self.config.paperclip.project_map.items()}
+            domain = reverse_map.get(project_id, "system")
+
+        user_request = title
+        if description and description.strip() and description.strip() != title.strip():
+            user_request = f"{title}\n\n{description}"
+
+        classification = RequestClassification(
+            domain=domain,
+            intent_type="execute",
+            risk_level="medium",
+            status="new",
+            approval_state="not_needed",
+        )
+
+        return self.create_request(
+            user_request=user_request,
+            classification=classification,
+            action_source="paperclip_manual",
+            adopt_paperclip_issue_id=issue_id,
+        )
 
     def record_openclaw_read(
         self,
@@ -495,7 +586,8 @@ class AgenticOSService:
             payload={"plan_version": plan_version, "artifact_id": artifact.id},
         )
 
-        # Paperclip: write plan doc, move to in_review, assign to chief_of_staff
+        # Paperclip: write plan doc, move to in_review, assign to project_manager for review.
+        # The PM is the plan reviewer — not the author.  CoS is not involved at this step.
         cp = self._cp
         if cp is not None:
             try:
@@ -504,7 +596,7 @@ class AgenticOSService:
                     cp.update_issue_status(
                         task.paperclip_issue_id,
                         "awaiting_plan_review",
-                        assignee_key="chief_of_staff",
+                        assignee_key="project_manager",
                     )
             except Exception as _pc_exc:
                 self._append_event(
@@ -551,10 +643,12 @@ class AgenticOSService:
         if cp is not None:
             try:
                 if task.paperclip_issue_id:
+                    # Reassign to the execution agent who wrote the plan — they now execute it.
+                    executor_key = cp.resolve_executor_key(task)
                     cp.update_issue_status(
                         task.paperclip_issue_id,
                         "approved_for_execution",
-                        assignee_key="engineer",
+                        assignee_key=executor_key,
                     )
                     cp.add_comment(
                         task.paperclip_issue_id,

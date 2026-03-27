@@ -27,6 +27,9 @@ class ExecutionResult:
     success: bool
     idempotent: bool = False
     error: Optional[str] = None
+    task_not_found: bool = False
+    already_terminal: bool = False
+    terminal_status: Optional[str] = None
 
 
 def _artifact_type_for_domain(domain: str, intent_type: str) -> str:
@@ -78,19 +81,43 @@ def receive_execution_result(
         if f"TASK_DONE: {task_id}" not in raw_output:
             raise ExecutionParseError(f"Missing or mismatched TASK_DONE marker for {task_id}")
 
-        # Step 2: Load backend task
+        # Step 2: Load backend task — with session_key fallback
         config = load_app_config(paths)
         service = AgenticOSService(paths, config)
-        task = service.db.get_task(task_id)
 
-        # Step 2b: Idempotency check — if task already completed or execution record exists, return it
-        already_done = task.status in {"completed", "executed"}
-        existing_execution = (
-            service.db.get_execution(task.operation_key)
-            if task.operation_key
-            else None
-        )
-        if already_done or (existing_execution is not None and existing_execution.task_id == task_id):
+        task = None
+        resolved_task_id = task_id
+        if task_id:
+            try:
+                task = service.db.get_task(task_id)
+            except KeyError:
+                pass
+
+        if task is None:
+            # Fallback: look up by dispatch_session_key
+            task = service.db.get_task_by_dispatch_session_key(session_key)
+            if task is not None:
+                resolved_task_id = task.id
+
+        if task is None:
+            return ExecutionResult(
+                task_id=task_id,
+                artifact_id="",
+                success=False,
+                task_not_found=True,
+                error="task not found",
+            )
+
+        task_id = resolved_task_id
+
+        # Step 2b: Terminal status check — do not re-process terminal tasks.
+        #
+        # completed/executed: task was already successfully handled by the execution
+        # receiver (duplicate callback) — return idempotent so the caller can safely
+        # ignore the response.
+        # failed/cancelled: task reached a non-success terminal state; block re-processing
+        # and surface the terminal status explicitly.
+        if task.status in {"completed", "executed"}:
             service._append_event(
                 task_id=task_id,
                 event_type="action_execution_rejected",
@@ -105,6 +132,14 @@ def receive_execution_result(
                 artifact_id=task.artifact_ref or "",
                 success=True,
                 idempotent=True,
+            )
+        if task.status in {"failed", "cancelled"}:
+            return ExecutionResult(
+                task_id=task_id,
+                artifact_id=task.artifact_ref or "",
+                success=True,
+                already_terminal=True,
+                terminal_status=task.status,
             )
         
         # Step 3: Determine artifact type

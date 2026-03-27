@@ -18,8 +18,22 @@ Polls company-level activity, then for each unseen event on a known issue:
   new status = cancelled
     → cancel_task() unless already terminal
 
+  Issue-created events (Paperclip-originated tasks)
+  ──────────────────────────────────────────────────
+  issue_created / new_issue / issue_added for an untracked issue
+    → import_paperclip_issue() — creates a backend task linked to the
+      existing Paperclip issue; assigns the appropriate agent; writes
+      the callback brief document; lifecycle proceeds as normal.
+
+  Safety-net scan (scan_untracked_issues)
+  ───────────────────────────────────────
+  Scans all open Paperclip issues and imports any that have no matching
+  backend task.  Called at the end of every run_once() to catch issues
+  created before the reconciler started, or missed during a gap.
+
 Design notes
   - Idempotent: seen event IDs are persisted in a JSON state file.
+    Imported issue IDs are persisted in the same file under "imported_issues".
   - Failure-tolerant: every per-event dispatch is wrapped; one failure
     cannot abort the rest of the run.
   - No Paperclip writeback on reconciler-sourced cancellations (avoids loops).
@@ -51,6 +65,7 @@ _MAX_SEEN = 2000
 # Paperclip activity event types we care about.
 _COMMENT_EVENT_TYPES = {"comment_added", "comment", "comment_created"}
 _STATUS_EVENT_TYPES = {"status_changed", "status_change", "issue_status_changed"}
+_ISSUE_CREATED_EVENT_TYPES = {"issue_created", "new_issue", "issue_added"}
 
 
 class PaperclipReconciler:
@@ -76,31 +91,35 @@ class PaperclipReconciler:
         Poll Paperclip activity and reconcile operator actions.
 
         Returns a summary dict:
-            {events_polled, actions_taken, errors, skipped}
+            {events_polled, actions_taken, errors, skipped, imported}
         """
         if self._cp is None:
             return {"events_polled": 0, "actions_taken": 0, "errors": 0, "skipped": 0,
-                    "note": "paperclip not configured"}
+                    "imported": 0, "note": "paperclip not configured"}
 
-        seen = self._load_seen()
+        seen, imported_issues = self._load_state()
         actions_taken = 0
         errors = 0
         skipped = 0
+        imported = 0
 
         try:
             events = self._cp.poll_company_activity()
         except Exception as exc:
             log.error("reconciler: poll_company_activity failed: %s", exc)
-            return {"events_polled": 0, "actions_taken": 0, "errors": 1, "skipped": 0}
+            return {"events_polled": 0, "actions_taken": 0, "errors": 1, "skipped": 0, "imported": 0}
 
         for event in events:
             if event.id in seen:
                 skipped += 1
                 continue
             try:
-                action = self._dispatch(event)
+                action = self._dispatch(event, imported_issues)
                 if action:
                     actions_taken += 1
+                    if action == "issue_imported":
+                        imported += 1
+                        imported_issues.add(event.issue_id)
                     log.info("reconciler: action=%s issue=%s event=%s", action, event.issue_id, event.id)
             except Exception as exc:
                 errors += 1
@@ -108,12 +127,21 @@ class PaperclipReconciler:
             finally:
                 seen.add(event.id)
 
-        self._save_seen(seen)
-
-        # Emit a single audit event summarising the run (best-effort, no task_id needed
-        # but the audit API requires one — use a sentinel).
+        # Safety-net: scan for untracked issues that didn't generate an activity event
         try:
-            self._service._append_event(
+            scan_imported = self._scan_untracked_issues(imported_issues)
+            imported += scan_imported
+        except Exception as exc:
+            errors += 1
+            log.error("reconciler: scan_untracked_issues failed: %s", exc)
+
+        self._save_state(seen, imported_issues)
+
+        # Emit a single audit event summarising the run.  Write directly to the
+        # audit log (jsonl) because the sentinel task_id "__reconciler__" has no
+        # matching row in the tasks table and would violate the DB FK constraint.
+        try:
+            self._service.audit.append(
                 task_id="__reconciler__",
                 event_type="reconciler_ran",
                 payload={
@@ -121,7 +149,9 @@ class PaperclipReconciler:
                     "actions_taken": actions_taken,
                     "errors": errors,
                     "skipped": skipped,
+                    "imported": imported,
                 },
+                event_id=0,
             )
         except Exception:
             pass
@@ -131,17 +161,23 @@ class PaperclipReconciler:
             "actions_taken": actions_taken,
             "errors": errors,
             "skipped": skipped,
+            "imported": imported,
         }
 
     # ------------------------------------------------------------------
     # Dispatch
     # ------------------------------------------------------------------
 
-    def _dispatch(self, event: ActivityEvent) -> Optional[str]:
+    def _dispatch(self, event: ActivityEvent, imported_issues: set[str]) -> Optional[str]:
         """Route an activity event to the appropriate handler. Returns action name or None."""
         task = self._service.db.get_task_by_paperclip_issue_id(event.issue_id)
+
         if task is None:
-            return None  # not a tracked issue
+            # Unknown issue — check if it's a new issue we should import
+            et = event.event_type.lower()
+            if et in _ISSUE_CREATED_EVENT_TYPES and event.issue_id not in imported_issues:
+                return self._handle_new_issue(event, imported_issues)
+            return None  # not a tracked issue and not an import trigger
 
         et = event.event_type.lower()
 
@@ -155,6 +191,116 @@ class PaperclipReconciler:
     # ------------------------------------------------------------------
     # Handlers
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Paperclip-originated task import
+    # ------------------------------------------------------------------
+
+    def _handle_new_issue(self, event: ActivityEvent, imported_issues: set[str]) -> Optional[str]:
+        """
+        Import a manually-created Paperclip issue as a backend task.
+
+        Fetches the full issue, infers domain from project_id, creates a task
+        via service.import_paperclip_issue(), and marks the issue as imported.
+        """
+        if self._cp is None:
+            return None
+        try:
+            issue = self._cp._client.get_issue(event.issue_id)
+        except Exception as exc:
+            log.error("reconciler: could not fetch issue %s for import: %s", event.issue_id, exc)
+            return None
+
+        try:
+            result = self._service.import_paperclip_issue(
+                issue_id=issue.id,
+                title=issue.title,
+                description="",  # get_issue may not return description; brief is in title
+                project_id=issue.project_id,
+            )
+            task = result["task"]
+            imported_issues.add(issue.id)
+            log.info(
+                "reconciler: imported Paperclip issue %s as task %s (domain=%s)",
+                issue.id, task.id, task.domain,
+            )
+            try:
+                self._service._append_event(
+                    task_id=task.id,
+                    event_type="reconciler_action_taken",
+                    payload={
+                        "action": "issue_imported",
+                        "paperclip_event_id": event.id,
+                        "issue_id": issue.id,
+                        "issue_title": issue.title,
+                    },
+                )
+            except Exception:
+                pass
+            return "issue_imported"
+        except Exception as exc:
+            log.error("reconciler: import_paperclip_issue failed for %s: %s", event.issue_id, exc)
+            return None
+
+    def _scan_untracked_issues(self, imported_issues: set[str]) -> int:
+        """
+        Safety-net scan: list all open Paperclip issues and import any that
+        have no matching backend task and haven't been imported already.
+
+        Returns the number of issues newly imported.
+        """
+        if self._cp is None:
+            return 0
+
+        try:
+            issues = self._cp.list_all_issues(status="todo")
+        except Exception as exc:
+            log.error("reconciler: list_all_issues failed in scan: %s", exc)
+            return 0
+
+        imported = 0
+        for issue in issues:
+            if not issue.id:
+                continue
+            if issue.id in imported_issues:
+                continue
+            # Check if already tracked
+            existing = self._service.db.get_task_by_paperclip_issue_id(issue.id)
+            if existing is not None:
+                imported_issues.add(issue.id)  # mark known so we stop re-checking
+                continue
+            # Not tracked — import it
+            try:
+                result = self._service.import_paperclip_issue(
+                    issue_id=issue.id,
+                    title=issue.title,
+                    description="",
+                    project_id=issue.project_id,
+                )
+                task = result["task"]
+                imported_issues.add(issue.id)
+                imported += 1
+                log.info(
+                    "reconciler: scan imported issue %s as task %s",
+                    issue.id, task.id,
+                )
+                try:
+                    self._service._append_event(
+                        task_id=task.id,
+                        event_type="reconciler_action_taken",
+                        payload={
+                            "action": "issue_imported",
+                            "source": "scan",
+                            "issue_id": issue.id,
+                            "issue_title": issue.title,
+                        },
+                    )
+                except Exception:
+                    pass
+            except Exception as exc:
+                log.error("reconciler: scan import failed for issue %s: %s", issue.id, exc)
+
+        return imported
 
     def _handle_comment(self, task, event: ActivityEvent) -> Optional[str]:
         body: str = ""
@@ -239,28 +385,28 @@ class PaperclipReconciler:
             pass
 
     # ------------------------------------------------------------------
-    # State persistence (seen event IDs)
+    # State persistence (seen event IDs + imported issue IDs)
     # ------------------------------------------------------------------
 
-    def _load_seen(self) -> set[str]:
+    def _load_state(self) -> tuple[set[str], set[str]]:
+        """Return (seen_event_ids, imported_issue_ids)."""
         try:
             if self._state_path.exists():
                 data = json.loads(self._state_path.read_text(encoding="utf-8"))
-                return set(data.get("seen", []))
+                return set(data.get("seen", [])), set(data.get("imported_issues", []))
         except Exception as exc:
             log.warning("reconciler: could not load state file: %s", exc)
-        return set()
+        return set(), set()
 
-    def _save_seen(self, seen: set[str]) -> None:
+    def _save_state(self, seen: set[str], imported_issues: set[str]) -> None:
         try:
-            # Keep only the most recent _MAX_SEEN IDs (sets are unordered;
-            # we just trim to size to prevent unbounded growth).
-            trimmed = list(seen)
-            if len(trimmed) > _MAX_SEEN:
-                trimmed = trimmed[-_MAX_SEEN:]
+            trimmed_seen = list(seen)
+            if len(trimmed_seen) > _MAX_SEEN:
+                trimmed_seen = trimmed_seen[-_MAX_SEEN:]
+            # imported_issues is a set of Paperclip issue IDs — keep all (they're UUIDs, bounded)
             self._state_path.parent.mkdir(parents=True, exist_ok=True)
             self._state_path.write_text(
-                json.dumps({"seen": trimmed}, indent=None),
+                json.dumps({"seen": trimmed_seen, "imported_issues": list(imported_issues)}, indent=None),
                 encoding="utf-8",
             )
         except Exception as exc:
