@@ -93,6 +93,9 @@ class TaskRecord:
     delivery_thread_id: Optional[str] = None
     artifact_path: Optional[str] = None
     paperclip_issue_id: Optional[str] = None
+    paperclip_routine_id: Optional[str] = None
+    paperclip_routine_run_id: Optional[str] = None
+    paperclip_origin_kind: Optional[str] = None
     paperclip_assignee_agent_id: Optional[str] = None
     paperclip_project_id: Optional[str] = None
     paperclip_goal_id: Optional[str] = None

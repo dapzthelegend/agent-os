@@ -28,6 +28,7 @@ Chief of Staff
     ├── Engineering Manager
     ├── Engineer (Claude Code)   — agent_map key: engineer
     ├── Engineer (Codex)         — agent_map key: executor_codex
+    ├── Infrastructure Engineer (Codex) — agent_map key: infrastructure_engineer
     └── Content Writer
 ```
 
@@ -38,6 +39,7 @@ Chief of Staff
 | `engineering_manager` | Technical oversight | `/submit-result` |
 | `engineer` | Code, reads, analysis | `/submit-result`, `/submit-plan` |
 | `executor_codex` | Code generation and editing | `/submit-result`, `/submit-plan` |
+| `infrastructure_engineer` | Runtime/platform remediation via Codex adapter | `/submit-result`, `/submit-plan`, `create-task` |
 | `content_writer` | Articles, summaries, reports | `/submit-result`, `/submit-plan` |
 | `accountant` | Finance domain tasks | `/submit-result`, `/submit-plan` |
 | `executive_assistant` | Admin and recap tasks | `/submit-result`, `/submit-plan` |
@@ -88,10 +90,17 @@ Cancel tasks by setting Paperclip issue status to `cancelled`, or:
 
 | Skill | Who uses it | When |
 |-------|-------------|------|
+| `agentic-os-bridge` | Runtime/operators that need direct backend CLI persistence loop | For minimal `list-ready`/`pickup`/`mark-dispatched`/`record-result` bridging |
+| `create-task` | Infra and runtime agents | Create durable incident remediations and actionable follow-ups |
+| `infra-heal` | Infrastructure Engineer | Triage and remediation workflow for runtime/system failures |
 | `/submit-result` | All execution agents | After completing Mode A work |
 | `/submit-plan` | All execution agents | After writing a plan in Mode B |
 
-Skills are defined in `/Users/dara/agents/.claude/commands/`.
+Skill locations in projects workspace:
+- `/Users/dara/agents/projects/system/.agents/skills/agentic-os-bridge/SKILL.md`
+- `/Users/dara/agents/projects/technical/.agents/skills/agentic-os-bridge/SKILL.md`
+
+Callback command skills are defined in `/Users/dara/agents/.claude/commands/`.
 
 ---
 
@@ -119,3 +128,4 @@ Skills are defined in `/Users/dara/agents/.claude/commands/`.
 5. Plan-first: do not execute until your plan is approved.
 6. PM: only comment `APPROVE` or `REVISE:` — never write or execute.
 7. On any unexpected API error: output `WRITEBACK_FAILED: <task_id> <reason>`.
+8. If writeback fails after retries/fallback, create (or verify auto-created) an `incident_remediation` follow-up task for `infrastructure_engineer`.

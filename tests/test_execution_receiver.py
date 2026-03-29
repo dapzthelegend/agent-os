@@ -1,6 +1,7 @@
 """Tests for execution_receiver (Phase 4.2)."""
 from __future__ import annotations
 
+import json
 import shutil
 from pathlib import Path
 
@@ -14,7 +15,9 @@ from src.agentic_os.execution_receiver import (
     receive_execution_result,
 )
 from src.agentic_os.models import RequestClassification
+from src.agentic_os.paperclip_client import IssueRef
 from src.agentic_os.service import AgenticOSService
+from src.agentic_os.task_control_plane import TaskControlPlane
 
 
 # ---------------------------------------------------------------------------
@@ -34,6 +37,35 @@ def _make_service(paths: Paths) -> AgenticOSService:
     svc = AgenticOSService(paths, AppConfig())
     svc.initialize()
     return svc
+
+
+def _write_paperclip_config(paths: Paths) -> None:
+    payload = {
+        "paperclip": {
+            "base_url": "http://127.0.0.1:65535/api",
+            "auth_mode": "trusted",
+            "company_id": "company_test",
+            "goal_id": "goal_test",
+            "project_map": {
+                "personal": "proj_personal",
+                "technical": "proj_technical",
+                "finance": "proj_finance",
+                "system": "proj_system",
+            },
+            "agent_map": {
+                "chief_of_staff": "agent_cos",
+                "project_manager": "agent_pm",
+                "engineering_manager": "agent_em",
+                "engineer": "agent_eng",
+                "infrastructure_engineer": "agent_infra",
+                "executor_codex": "agent_codex",
+                "content_writer": "agent_writer",
+                "accountant": "agent_acct",
+                "executive_assistant": "agent_ea",
+            },
+        }
+    }
+    paths.config_path.write_text(json.dumps(payload), encoding="utf-8")
 
 
 def _make_output(task_id: str, content: str) -> str:
@@ -221,6 +253,98 @@ class TestReceiveExecutionResultSuccess:
             paths=paths,
         )
         assert result.success
+
+    def test_resolves_task_by_paperclip_issue_id(self, tmp_path):
+        paths = _make_paths(tmp_path)
+        svc = _make_service(paths)
+        backend_task_id = self._create_task(svc)
+        issue_id = "56439d65-edb9-4844-b29c-ec2729f356e5"
+        svc.db.update_task(backend_task_id, paperclip_issue_id=issue_id)
+
+        # Simulate a callback that passes Paperclip issue ID as task_id.
+        raw = _make_output(issue_id, "resolved via issue mapping")
+        result = receive_execution_result(
+            raw,
+            task_id=issue_id,
+            session_key="sess_xyz",
+            paths=paths,
+        )
+
+        assert result.success is True
+        assert result.task_id == backend_task_id
+
+    def test_resolves_task_by_paperclip_routine_run_id(self, tmp_path):
+        paths = _make_paths(tmp_path)
+        svc = _make_service(paths)
+        backend_task_id = self._create_task(svc)
+        run_id = "f3f2a81a-dad1-47c0-9d73-f451a1fdf9be"
+        svc.db.update_task(backend_task_id, paperclip_routine_run_id=run_id)
+
+        # Simulate a callback that passes routine run ID as task_id.
+        raw = _make_output(run_id, "resolved via run mapping")
+        result = receive_execution_result(
+            raw,
+            task_id=run_id,
+            session_key="sess_xyz",
+            paths=paths,
+        )
+
+        assert result.success is True
+        assert result.task_id == backend_task_id
+
+    def test_imports_paperclip_issue_when_callback_arrives_before_backend_import(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        paths = _make_paths(tmp_path)
+        _write_paperclip_config(paths)
+        _make_service(paths)
+
+        issue_id = "d8f51b64-f0d8-4adc-9c0f-17cdb7a1ab46"
+        run_id = "bf7f0a8f-30d7-43fb-9261-cb89bf207cb6"
+        session_key = f"paperclip:run:{run_id}"
+
+        monkeypatch.setattr(
+            TaskControlPlane,
+            "get_issue",
+            lambda self, _: IssueRef(  # noqa: ARG005
+                id=issue_id,
+                title="Daily Recap",
+                status="todo",
+                project_id="proj_system",
+            ),
+        )
+        monkeypatch.setattr(
+            TaskControlPlane,
+            "adopt_issue",
+            lambda self, issue_id, task, assignee_key=None: IssueRef(  # noqa: ARG005
+                id=issue_id,
+                title=task.title or "Imported",
+                status="todo",
+                project_id="proj_system",
+            ),
+        )
+        monkeypatch.setattr(TaskControlPlane, "_write_import_brief", lambda self, issue_id, task: None)
+
+        raw = _make_output(issue_id, "Recovered callback after import race")
+        result = receive_execution_result(
+            raw,
+            task_id=issue_id,
+            session_key=session_key,
+            paths=paths,
+        )
+
+        assert result.success is True
+        assert result.task_id.startswith("task_")
+        assert result.task_id != issue_id
+
+        svc = _make_service(paths)
+        imported_task = svc.db.get_task(result.task_id)
+        assert imported_task.paperclip_issue_id == issue_id
+        assert imported_task.paperclip_routine_run_id == run_id
+        assert imported_task.paperclip_origin_kind == "routine_execution"
+        assert imported_task.status in {"completed", "executed"}
 
     def test_returns_error_on_db_not_found(self, tmp_path):
         paths = _make_paths(tmp_path)

@@ -12,6 +12,7 @@ No real network calls.
 """
 from __future__ import annotations
 
+import json
 import shutil
 from pathlib import Path
 from unittest.mock import patch
@@ -208,6 +209,22 @@ class TestCallbackHardening:
                 "output": _make_output("task_does_not_exist"),
             })
             assert resp.status_code == 400
+            detail = resp.json().get("detail", {})
+            assert detail.get("reason") == "task not found"
+
+            # Unknown callback should create a runtime incident follow-up task.
+            tasks = svc.list_tasks(limit=20)
+            incident_tasks = []
+            for task in tasks:
+                if not task.request_metadata_json:
+                    continue
+                metadata = json.loads(task.request_metadata_json)
+                if metadata.get("task_kind") == "incident_remediation":
+                    incident_tasks.append((task, metadata))
+            assert incident_tasks, "expected incident_remediation task to be created"
+            _, metadata = incident_tasks[0]
+            assert metadata.get("origin_task_id") == "task_does_not_exist"
+            assert metadata.get("origin_session_key") == "sess-unknown"
 
     def test_session_key_fallback_resolves_task(self, tmp_path):
         """Callback with blank task_id but valid session_key succeeds via fallback lookup."""

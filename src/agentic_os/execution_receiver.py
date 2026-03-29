@@ -32,6 +32,58 @@ class ExecutionResult:
     terminal_status: Optional[str] = None
 
 
+def _extract_paperclip_run_id(session_key: str) -> Optional[str]:
+    """
+    Extract Paperclip routine run id from session key format:
+    paperclip:run:<run_id>
+    """
+    if not session_key:
+        return None
+    parts = [segment.strip() for segment in session_key.split(":")]
+    if len(parts) < 3:
+        return None
+    if parts[0] != "paperclip" or parts[1] != "run":
+        return None
+    run_id = parts[2]
+    return run_id or None
+
+
+def _import_task_from_paperclip_issue(
+    *,
+    service: AgenticOSService,
+    issue_id: str,
+    session_key: str,
+) -> Optional[TaskRecord]:
+    """
+    Best-effort emergency import when callback references an issue not yet in backend.
+    """
+    cp = service._cp
+    if cp is None or not issue_id:
+        return None
+
+    issue = cp.get_issue(issue_id)
+    if issue is None or not issue.id:
+        return None
+
+    run_id = _extract_paperclip_run_id(session_key)
+    origin_kind = "routine_execution" if run_id else "manual_issue"
+
+    try:
+        imported = service.import_paperclip_issue(
+            issue_id=issue.id,
+            title=issue.title or issue.id,
+            description="",
+            project_id=issue.project_id,
+            routine_run_id=run_id,
+            origin_kind=origin_kind,
+        )
+    except Exception:
+        return None
+
+    task = imported.get("task")
+    return task if isinstance(task, TaskRecord) else None
+
+
 def _artifact_type_for_domain(domain: str, intent_type: str) -> str:
     """Determine artifact type from task domain and intent."""
     if intent_type == "content":
@@ -81,7 +133,7 @@ def receive_execution_result(
         if f"TASK_DONE: {task_id}" not in raw_output:
             raise ExecutionParseError(f"Missing or mismatched TASK_DONE marker for {task_id}")
 
-        # Step 2: Load backend task — with session_key fallback
+        # Step 2: Load backend task — with robust fallback resolution
         config = load_app_config(paths)
         service = AgenticOSService(paths, config)
 
@@ -94,10 +146,33 @@ def receive_execution_result(
                 pass
 
         if task is None:
-            # Fallback: look up by dispatch_session_key
+            # Fallback 1: caller passed a Paperclip issue ID instead of backend task ID.
+            task = service.db.get_task_by_paperclip_issue_id(task_id)
+            if task is not None:
+                resolved_task_id = task.id
+
+        if task is None:
+            # Fallback 2: caller passed a Paperclip routine run ID.
+            task = service.db.get_task_by_paperclip_routine_run_id(task_id)
+            if task is not None:
+                resolved_task_id = task.id
+
+        if task is None:
+            # Fallback 3: look up by dispatch_session_key.
             task = service.db.get_task_by_dispatch_session_key(session_key)
             if task is not None:
                 resolved_task_id = task.id
+
+        if task is None:
+            # Fallback 4: callback arrived before Paperclip issue import completed.
+            imported_task = _import_task_from_paperclip_issue(
+                service=service,
+                issue_id=task_id,
+                session_key=session_key,
+            )
+            if imported_task is not None:
+                task = imported_task
+                resolved_task_id = imported_task.id
 
         if task is None:
             return ExecutionResult(
@@ -210,6 +285,7 @@ def receive_execution_failure(
     error: str,
     *,
     task_id: str,
+    session_key: str = "unknown",
     paths: Paths,
 ) -> None:
     """
@@ -227,6 +303,20 @@ def receive_execution_failure(
 
         # Update backend (Paperclip writeback handled inside fail_task)
         service.fail_task(task_id, reason=error)
+
+        # Trigger self-healing incident follow-up task for runtime failures.
+        try:
+            service.create_runtime_incident_task(
+                summary="Execution callback failure requires runtime remediation",
+                origin_task_id=task_id,
+                origin_session_key=session_key,
+                runtime_id=task.claimed_by,
+                component="execution_callback",
+                error_type="execution_failure",
+                error_message=error,
+            )
+        except Exception:
+            pass
     
     except Exception as e:
         print(f"Error in receive_execution_failure: {e}", file=sys.stderr)

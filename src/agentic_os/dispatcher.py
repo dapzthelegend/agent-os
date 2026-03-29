@@ -148,14 +148,10 @@ After outputting TASK_DONE: {task_id}, you MUST record the result:
 1. Write your complete output to a temp file:
    OUTPUT_FILE="/tmp/task_result_{task_id}.txt"
 
-2. Run the record-result CLI:
-   cd /Users/dara/.openclaw/workspace/agentic-os
-   PYTHONPATH=src python3 -m agentic_os.cli task record-result \\
-     --task-id {task_id} \\
-     --output-file "$OUTPUT_FILE" \\
-     --session-key "${{OPENCLAW_SESSION_ID:-unknown}}"
+2. Run the callback helper:
+   /Users/dara/agents/bin/submit-result {task_id}
 
-3. Verify exit code 0 and JSON status=success (or already_done). On failure output:
+3. Verify exit code 0 and output `RESULT_SUBMITTED` (or `ALREADY_SUBMITTED`). On failure output:
    WRITEBACK_FAILED: {task_id} <error>
    and stop.
 """
@@ -236,12 +232,8 @@ Do not begin execution until you receive an approved plan back.
 2. Post the plan as a document on the Paperclip issue (issue ID: {paperclip_issue_id}).
 
 3. Submit the plan to the backend for PM review:
-   POST http://localhost:8080/api/tasks/{task_id}/submit-plan
-   Content-Type: application/json
-   {{
-     "plan_text": "<your full plan text>",
-     "paperclip_document_id": "<the doc ID you just created>"
-   }}
+   - Write your plan to /tmp/task_plan_{task_id}.txt
+   - Run: /Users/dara/agents/bin/submit-plan {task_id} --doc-id <paperclip_document_id>
 
 4. Stop here. The Project Manager will review and respond via Paperclip comment.
    If approved, you will be reassigned with the approved plan and execution instructions.

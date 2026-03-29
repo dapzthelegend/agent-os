@@ -64,12 +64,16 @@ class DocumentRef:
 
 @dataclass
 class ActivityEvent:
-    id: str
-    issue_id: str
-    event_type: str
-    actor: Optional[str]
-    payload: dict[str, Any]
-    created_at: str
+    id: str = ""
+    issue_id: str = ""
+    event_type: str = ""
+    entity_type: str = ""
+    entity_id: str = ""
+    run_id: Optional[str] = None
+    actor: Optional[str] = None
+    payload: dict[str, Any] = None  # type: ignore[assignment]
+    details: dict[str, Any] = None  # type: ignore[assignment]
+    created_at: str = ""
 
 
 class PaperclipClient:
@@ -194,6 +198,26 @@ class PaperclipClient:
     # ------------------------------------------------------------------
     # Activity
     # ------------------------------------------------------------------
+
+    def list_routines(
+        self,
+        *,
+        company_id: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        if not company_id:
+            raise PaperclipError("company_id is required to list routines")
+        data = self._request("GET", f"/companies/{company_id}/routines")
+        items = data if isinstance(data, list) else data.get("items", [])
+        return [item for item in items if isinstance(item, dict)]
+
+    def get_routine(self, routine_id: str) -> dict[str, Any]:
+        data = self._request("GET", f"/routines/{routine_id}")
+        return data if isinstance(data, dict) else {}
+
+    def list_routine_runs(self, routine_id: str, *, limit: int = 50) -> list[dict[str, Any]]:
+        data = self._request("GET", f"/routines/{routine_id}/runs?{urlencode({'limit': limit})}")
+        items = data if isinstance(data, list) else data.get("items", [])
+        return [item for item in items if isinstance(item, dict)]
 
     def list_issues(
         self,
@@ -323,11 +347,27 @@ def _parse_issue(data: dict[str, Any]) -> IssueRef:
 
 
 def _parse_activity(item: dict[str, Any], issue_id: str) -> ActivityEvent:
+    payload = item.get("payload")
+    details = item.get("details")
+    if not isinstance(payload, dict):
+        payload = {}
+    if not isinstance(details, dict):
+        details = {}
+    issue_from_fields = item.get("issueId") or payload.get("issueId") or details.get("issueId")
+    entity_type = str(item.get("entityType", item.get("entity_type", "")))
+    entity_id = str(item.get("entityId", item.get("entity_id", "")))
+    run_id_value = item.get("runId", item.get("run_id"))
+    if run_id_value is None:
+        run_id_value = payload.get("runId") or payload.get("run_id") or details.get("runId") or details.get("run_id")
     return ActivityEvent(
         id=str(item.get("id", "")),
-        issue_id=str(item.get("issueId", issue_id)),
+        issue_id=str(issue_from_fields or issue_id or ""),
         event_type=str(item.get("eventType", item.get("type", ""))),
+        entity_type=entity_type,
+        entity_id=entity_id,
+        run_id=str(run_id_value) if run_id_value else None,
         actor=item.get("actor") or item.get("actorId"),
-        payload=item.get("payload", {}),
+        payload=payload,
+        details=details,
         created_at=str(item.get("createdAt", item.get("created_at", ""))),
     )

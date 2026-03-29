@@ -50,6 +50,7 @@ EVENT_TYPES = (
     "spawn_failed",
     # Paperclip projection (Phase 1)
     "paperclip_issue_created",
+    "paperclip_issue_imported",
     "paperclip_projection_failed",
     "paperclip_sync_failed",
     # Plan gate (Phase 2)

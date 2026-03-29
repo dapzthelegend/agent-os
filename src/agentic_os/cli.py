@@ -37,6 +37,7 @@ def build_parser() -> argparse.ArgumentParser:
     create_task_pickup_parser(task_subparsers)
     create_task_mark_dispatched_parser(task_subparsers)
     create_task_record_result_parser(task_subparsers)
+    create_task_submit_plan_parser(task_subparsers)
     create_task_requeue_parser(task_subparsers)
 
     approval_parser = subparsers.add_parser("approval", help="Approval operations")
@@ -205,6 +206,17 @@ def create_task_record_result_parser(subparsers: argparse._SubParsersAction) -> 
     parser.add_argument("--task-id", required=True)
     parser.add_argument("--output-file", required=True, help="Path to file containing full agent output")
     parser.add_argument("--session-key", default="unknown")
+
+
+def create_task_submit_plan_parser(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser(
+        "submit-plan",
+        help="Submit a plan from a file and transition task to awaiting_plan_review",
+    )
+    parser.add_argument("--task-id", required=True)
+    parser.add_argument("--plan-file", required=True, help="Path to file containing plan text")
+    parser.add_argument("--session-key", default="unknown")
+    parser.add_argument("--doc-id", default=None, help="Optional Paperclip document id for correlation")
 
 
 def create_task_requeue_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -1016,6 +1028,35 @@ def main(argv: Optional[list[str]] = None) -> int:
                 file=_sys.stderr,
             )
             return 1
+
+        if args.command == "task" and args.task_command == "submit-plan":
+            plan_path = Path(args.plan_file)
+            if not plan_path.exists():
+                import sys as _sys
+                print(
+                    json.dumps({"status": "error", "error": f"plan_file not found: {args.plan_file}"}),
+                    file=_sys.stderr,
+                )
+                return 1
+            plan_text = plan_path.read_text(encoding="utf-8").strip()
+            if not plan_text:
+                import sys as _sys
+                print(
+                    json.dumps({"status": "error", "error": "plan file is empty"}),
+                    file=_sys.stderr,
+                )
+                return 1
+            task = service.submit_plan(args.task_id, plan_text)
+            payload = {
+                "status": "ok",
+                "task_id": task.id,
+                "plan_version": task.plan_version,
+                "session_key": args.session_key,
+            }
+            if args.doc_id:
+                payload["paperclip_document_id"] = args.doc_id
+            print_json(payload)
+            return 0
 
         if args.command == "task" and args.task_command == "requeue":
             task = service.requeue_task(args.task_id)

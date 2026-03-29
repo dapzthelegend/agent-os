@@ -266,7 +266,8 @@ def _parse_paperclip_config(payload: dict[str, Any]) -> PaperclipConfig:
             missing.append(f"project_map.{key}")
     for key in (
         "chief_of_staff", "project_manager", "engineering_manager",
-        "engineer", "executor_codex", "content_writer", "accountant", "executive_assistant",
+        "engineer", "infrastructure_engineer", "executor_codex",
+        "content_writer", "accountant", "executive_assistant",
     ):
         if not str(agent_map.get(key, "")).strip():
             missing.append(f"agent_map.{key}")

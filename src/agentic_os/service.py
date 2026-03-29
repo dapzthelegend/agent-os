@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -25,6 +26,12 @@ from .daily_routine import (
 from .models import ACTION_SOURCES, ApprovalRecord, OperatorError, RequestClassification, TaskRecord, validate_choice
 from .notion import NotionAdapter, NotionTask
 from .storage import Database
+
+_RUNTIME_FOLLOWUP_INCIDENT = "incident_remediation"
+_RUNTIME_FOLLOWUP_ACTIONABLE = "actionable_followup"
+_RUNTIME_FOLLOWUP_KINDS = frozenset(
+    {_RUNTIME_FOLLOWUP_INCIDENT, _RUNTIME_FOLLOWUP_ACTIONABLE}
+)
 
 
 class AgenticOSService:
@@ -81,8 +88,12 @@ class AgenticOSService:
         external_ref: Optional[str] = None,
         action_source: str = "manual",
         adopt_paperclip_issue_id: Optional[str] = None,
+        adopt_paperclip_routine_id: Optional[str] = None,
+        adopt_paperclip_routine_run_id: Optional[str] = None,
+        adopt_paperclip_origin_kind: Optional[str] = None,
     ) -> dict[str, Any]:
         validate_choice(action_source, ACTION_SOURCES, "action_source")
+        effective_metadata: dict[str, Any] = dict(request_metadata) if request_metadata else {}
         if operation_key is not None:
             existing_tasks = self.db.list_tasks_by_operation_key(operation_key)
             if existing_tasks:
@@ -101,6 +112,9 @@ class AgenticOSService:
         task_mode = classify_task_mode(
             classification.domain, classification.intent_type, classification.risk_level
         )
+        # Runtime follow-up tasks can force explicit approval by bypassing plan_first.
+        if bool(effective_metadata.get("require_explicit_approval")):
+            task_mode = "direct"
 
         # plan_first tasks bypass the approval_required operation_key requirement —
         # the plan gate is the gating mechanism instead
@@ -116,7 +130,6 @@ class AgenticOSService:
 
         # Ensure the intake classifier's agent selection is stored in request_metadata
         # so that resolve_executor_key() can route codex tasks to executor_codex.
-        effective_metadata: dict[str, Any] = dict(request_metadata) if request_metadata else {}
         if "agent" not in effective_metadata:
             try:
                 from .dispatcher import Dispatcher as _Dispatcher
@@ -181,6 +194,9 @@ class AgenticOSService:
                     task = self.db.update_task(
                         task.id,
                         paperclip_issue_id=adopt_paperclip_issue_id,
+                        paperclip_routine_id=adopt_paperclip_routine_id,
+                        paperclip_routine_run_id=adopt_paperclip_routine_run_id,
+                        paperclip_origin_kind=adopt_paperclip_origin_kind,
                         paperclip_project_id=(issue.project_id if issue else None),
                         paperclip_goal_id=(issue.goal_id if issue else None),
                         paperclip_assignee_agent_id=(issue.assignee_id if issue else None),
@@ -204,6 +220,7 @@ class AgenticOSService:
                         task = self.db.update_task(
                             task.id,
                             paperclip_issue_id=issue.id,
+                            paperclip_origin_kind="manual_issue",
                             paperclip_project_id=issue.project_id or None,
                             paperclip_goal_id=issue.goal_id or None,
                             paperclip_assignee_agent_id=issue.assignee_id or None,
@@ -254,6 +271,9 @@ class AgenticOSService:
         title: str,
         description: str,
         project_id: Optional[str] = None,
+        routine_id: Optional[str] = None,
+        routine_run_id: Optional[str] = None,
+        origin_kind: Optional[str] = None,
     ) -> dict[str, Any]:
         """
         Import a manually-created Paperclip issue as an agentic-os task.
@@ -288,7 +308,11 @@ class AgenticOSService:
             user_request=user_request,
             classification=classification,
             action_source="paperclip_manual",
+            operation_key=f"paperclip_import:{issue_id}",
             adopt_paperclip_issue_id=issue_id,
+            adopt_paperclip_routine_id=routine_id,
+            adopt_paperclip_routine_run_id=routine_run_id,
+            adopt_paperclip_origin_kind=origin_kind,
         )
 
     def record_openclaw_read(
@@ -455,6 +479,139 @@ class AgenticOSService:
     def trace_task(self, task_id: str) -> dict[str, Any]:
         return self.get_task_detail(task_id)
 
+    def create_runtime_followup_task(
+        self,
+        *,
+        summary: str,
+        kind: str = _RUNTIME_FOLLOWUP_ACTIONABLE,
+        details: Optional[str] = None,
+        origin_task_id: Optional[str] = None,
+        origin_session_key: Optional[str] = None,
+        runtime_id: Optional[str] = None,
+        component: Optional[str] = None,
+        error_type: Optional[str] = None,
+        error_message: Optional[str] = None,
+        risk_level: str = "medium",
+        assignee_key: Optional[str] = None,
+        dedupe_key: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        Create a runtime-originated follow-up task.
+
+        Supported kinds:
+          - incident_remediation  (self-healing runtime failures)
+          - actionable_followup   (general follow-up work from runtime context)
+        """
+        if kind not in _RUNTIME_FOLLOWUP_KINDS:
+            raise ValueError(
+                f"unsupported follow-up kind: {kind!r}; expected one of: "
+                f"{', '.join(sorted(_RUNTIME_FOLLOWUP_KINDS))}"
+            )
+
+        if risk_level not in {"low", "medium", "high"}:
+            raise ValueError("risk_level must be one of: low, medium, high")
+
+        op_token = dedupe_key or uuid4().hex
+        operation_key = f"runtime_followup:{kind}:{op_token}"
+        existing = self.db.list_tasks_by_operation_key(operation_key)
+        if existing:
+            return {
+                "task": existing[0],
+                "policy_decision": existing[0].policy_decision,
+                "approval": None,
+                "task_mode": existing[0].task_mode,
+                "deduplicated": True,
+            }
+
+        classification = RequestClassification(
+            domain="system",
+            intent_type="execute",
+            risk_level=risk_level,
+        ).validate()
+
+        metadata: dict[str, Any] = {
+            "task_kind": kind,
+            "origin_task_id": origin_task_id,
+            "origin_session_key": origin_session_key,
+            "runtime_id": runtime_id,
+            "component": component,
+            "error_type": error_type,
+            "error_message": error_message,
+        }
+        if assignee_key:
+            metadata["assignee_key"] = assignee_key
+        if risk_level == "high":
+            # High-risk runtime remediation must still require explicit operator approval.
+            metadata["require_explicit_approval"] = True
+
+        request_lines = [
+            f"Runtime follow-up ({kind})",
+            "",
+            f"Summary: {summary.strip()}",
+        ]
+        if details and details.strip():
+            request_lines.extend(["", "Details:", details.strip()])
+        if origin_task_id:
+            request_lines.append(f"\nOrigin task: {origin_task_id}")
+        if origin_session_key:
+            request_lines.append(f"Origin session: {origin_session_key}")
+        if runtime_id:
+            request_lines.append(f"Runtime: {runtime_id}")
+        if component:
+            request_lines.append(f"Component: {component}")
+        if error_type:
+            request_lines.append(f"Error type: {error_type}")
+        if error_message:
+            request_lines.append(f"Error message: {error_message}")
+
+        payload = self.create_request(
+            user_request="\n".join(request_lines).strip(),
+            classification=classification,
+            target="runtime_followup_task",
+            request_metadata=metadata,
+            operation_key=operation_key,
+            action_source="openclaw_skill",
+        )
+        payload["deduplicated"] = False
+        return payload
+
+    def create_runtime_incident_task(
+        self,
+        *,
+        summary: str,
+        origin_task_id: Optional[str] = None,
+        origin_session_key: Optional[str] = None,
+        runtime_id: Optional[str] = None,
+        component: Optional[str] = None,
+        error_type: Optional[str] = None,
+        error_message: Optional[str] = None,
+        details: Optional[str] = None,
+    ) -> dict[str, Any]:
+        dedupe_source = "|".join(
+            [
+                origin_task_id or "",
+                origin_session_key or "",
+                runtime_id or "",
+                component or "",
+                error_type or "",
+                error_message or "",
+            ]
+        )
+        dedupe_key = hashlib.sha1(dedupe_source.encode("utf-8")).hexdigest()[:16]
+        return self.create_runtime_followup_task(
+            summary=summary,
+            kind=_RUNTIME_FOLLOWUP_INCIDENT,
+            details=details,
+            origin_task_id=origin_task_id,
+            origin_session_key=origin_session_key,
+            runtime_id=runtime_id,
+            component=component,
+            error_type=error_type,
+            error_message=error_message,
+            risk_level="medium",
+            dedupe_key=dedupe_key,
+        )
+
     def list_tasks(
         self,
         *,
@@ -520,6 +677,19 @@ class AgenticOSService:
             event_type="spawn_failed",
             payload={"task_id": task_id, "reason": reason},
         )
+        if not self._is_runtime_followup_task(task):
+            try:
+                self.create_runtime_incident_task(
+                    summary="Agent spawn failed for runtime task",
+                    origin_task_id=task_id,
+                    origin_session_key=task.dispatch_session_key,
+                    runtime_id=task.claimed_by,
+                    component="runtime_spawn",
+                    error_type="spawn_failed",
+                    error_message=reason,
+                )
+            except Exception:
+                pass
         return task
 
     def requeue_task(self, task_id: str) -> TaskRecord:
@@ -2132,6 +2302,22 @@ class AgenticOSService:
         if payload is None:
             return None
         return json.dumps(payload, sort_keys=True)
+
+    @staticmethod
+    def _request_metadata_dict(task: TaskRecord) -> dict[str, Any]:
+        if not task.request_metadata_json:
+            return {}
+        try:
+            payload = json.loads(task.request_metadata_json)
+            if isinstance(payload, dict):
+                return payload
+        except Exception:
+            pass
+        return {}
+
+    def _is_runtime_followup_task(self, task: TaskRecord) -> bool:
+        metadata = self._request_metadata_dict(task)
+        return str(metadata.get("task_kind", "")).strip() in _RUNTIME_FOLLOWUP_KINDS
 
     @staticmethod
     def _load_json_or_none(payload: Optional[str]) -> Optional[dict[str, Any]]:

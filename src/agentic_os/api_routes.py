@@ -316,6 +316,17 @@ def api_execution_callback(payload: ExecutionCallbackPayload) -> dict:
             paths=paths,
         )
         if result.task_not_found:
+            try:
+                get_service().create_runtime_incident_task(
+                    summary="Execution callback referenced unknown task",
+                    origin_task_id=payload.task_id or None,
+                    origin_session_key=payload.session_key,
+                    component="execution_callback_lookup",
+                    error_type="task_not_found",
+                    error_message=result.error or "task not found",
+                )
+            except Exception:
+                pass
             raise HTTPException(
                 status_code=400,
                 detail={"status": "error", "reason": "task not found"},
@@ -336,8 +347,30 @@ def api_execution_callback(payload: ExecutionCallbackPayload) -> dict:
     except HTTPException:
         raise
     except ExecutionParseError as exc:
+        try:
+            get_service().create_runtime_incident_task(
+                summary="Execution callback payload could not be parsed",
+                origin_task_id=payload.task_id,
+                origin_session_key=payload.session_key,
+                component="execution_callback_parser",
+                error_type="execution_parse_error",
+                error_message=str(exc),
+            )
+        except Exception:
+            pass
         return {"status": "error", "reason": str(exc)}
     except Exception as exc:
+        try:
+            get_service().create_runtime_incident_task(
+                summary="Execution callback processing crashed",
+                origin_task_id=payload.task_id,
+                origin_session_key=payload.session_key,
+                component="execution_callback_handler",
+                error_type="execution_callback_exception",
+                error_message=str(exc),
+            )
+        except Exception:
+            pass
         return {"status": "error", "reason": str(exc)}
 
 

@@ -49,13 +49,21 @@ def _activity_event(
     issue_id: str,
     event_type: str,
     payload: dict[str, Any],
+    *,
+    entity_type: str = "",
+    entity_id: str = "",
+    run_id: str | None = None,
 ) -> ActivityEvent:
     return ActivityEvent(
         id=event_id,
         issue_id=issue_id,
         event_type=event_type,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        run_id=run_id,
         actor="operator",
         payload=payload,
+        details={},
         created_at="2026-01-01T00:00:00Z",
     )
 
@@ -350,3 +358,49 @@ class TestRunOnceSummary:
         result = r.run_once()
         assert result["errors"] == 1
         assert result["events_polled"] == 0
+
+
+class TestRoutineRunEvents:
+    def test_coalesced_routine_run_does_not_create_task(self, tmp_path):
+        r, svc = _make_reconciler(tmp_path)
+        before = len(svc.db.list_tasks(limit=100))
+
+        event = _activity_event(
+            "e1",
+            "",
+            "routine.run_triggered",
+            {"status": "coalesced", "routineId": "routine-1"},
+            entity_type="routine_run",
+            entity_id="run-1",
+            run_id="run-1",
+        )
+        action = r._dispatch(event)
+
+        assert action == "routine_run_non_task_terminal"
+        after = len(svc.db.list_tasks(limit=100))
+        assert after == before
+
+    def test_routine_run_links_to_existing_issue_task(self, tmp_path):
+        r, svc = _make_reconciler(tmp_path)
+        task = _make_plan_first_task(svc)
+
+        event = _activity_event(
+            "e2",
+            "issue-abc",
+            "routine.run_triggered",
+            {
+                "status": "issue_created",
+                "routineId": "routine-xyz",
+                "linkedIssueId": "issue-abc",
+            },
+            entity_type="routine_run",
+            entity_id="run-xyz",
+            run_id="run-xyz",
+        )
+        action = r._dispatch(event)
+
+        assert action == "routine_run_linked"
+        updated = svc.db.get_task(task.id)
+        assert updated.paperclip_routine_id == "routine-xyz"
+        assert updated.paperclip_routine_run_id == "run-xyz"
+        assert updated.paperclip_origin_kind == "routine_execution"

@@ -12,7 +12,8 @@ def utc_now_sql() -> str:
 
 
 # Canonical schema — no incremental migrations.
-# If the DB has an old schema (missing paperclip_issue_id), run scripts/reset_db.py.
+# If the DB has an old schema (missing routine-aware Paperclip columns),
+# run scripts/reset_db.py.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
     id TEXT PRIMARY KEY,
@@ -48,6 +49,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     dispatch_attempts INTEGER NOT NULL DEFAULT 0,
     -- paperclip
     paperclip_issue_id TEXT,
+    paperclip_routine_id TEXT,
+    paperclip_routine_run_id TEXT,
+    paperclip_origin_kind TEXT,
     paperclip_assignee_agent_id TEXT,
     paperclip_project_id TEXT,
     paperclip_goal_id TEXT,
@@ -110,6 +114,8 @@ CREATE INDEX IF NOT EXISTS idx_tasks_target ON tasks(target, created_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_action_source ON tasks(action_source, created_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_ready ON tasks(status, policy_decision, created_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_paperclip_issue ON tasks(paperclip_issue_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_paperclip_routine ON tasks(paperclip_routine_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_paperclip_routine_run ON tasks(paperclip_routine_run_id);
 CREATE INDEX IF NOT EXISTS idx_audit_events_task_id ON audit_events(task_id, id);
 CREATE INDEX IF NOT EXISTS idx_audit_events_created_at ON audit_events(created_at, id);
 CREATE INDEX IF NOT EXISTS idx_artifacts_task_id ON artifacts(task_id, created_at);
@@ -117,8 +123,8 @@ CREATE INDEX IF NOT EXISTS idx_approvals_task_id ON approvals(task_id, created_a
 CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status, created_at);
 """
 
-# Sentinel column used to detect an incompatible (pre-phase-0) schema.
-_REQUIRED_COLUMN = "paperclip_issue_id"
+# Sentinel column used to detect an incompatible schema.
+_REQUIRED_COLUMN = "paperclip_routine_run_id"
 
 
 class Database:
@@ -228,6 +234,9 @@ class Database:
         retry_count: Optional[int] = None,
         # Paperclip fields
         paperclip_issue_id: Optional[str] = None,
+        paperclip_routine_id: Optional[str] = None,
+        paperclip_routine_run_id: Optional[str] = None,
+        paperclip_origin_kind: Optional[str] = None,
         paperclip_assignee_agent_id: Optional[str] = None,
         paperclip_project_id: Optional[str] = None,
         paperclip_goal_id: Optional[str] = None,
@@ -255,6 +264,9 @@ class Database:
             ("policy_decision", policy_decision),
             ("action_source", action_source),
             ("paperclip_issue_id", paperclip_issue_id),
+            ("paperclip_routine_id", paperclip_routine_id),
+            ("paperclip_routine_run_id", paperclip_routine_run_id),
+            ("paperclip_origin_kind", paperclip_origin_kind),
             ("paperclip_assignee_agent_id", paperclip_assignee_agent_id),
             ("paperclip_project_id", paperclip_project_id),
             ("paperclip_goal_id", paperclip_goal_id),
@@ -470,6 +482,16 @@ class Database:
             row = connection.execute(
                 "SELECT * FROM tasks WHERE paperclip_issue_id = ? ORDER BY created_at DESC LIMIT 1",
                 (issue_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_task(row)
+
+    def get_task_by_paperclip_routine_run_id(self, run_id: str) -> Optional[TaskRecord]:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM tasks WHERE paperclip_routine_run_id = ? ORDER BY created_at DESC LIMIT 1",
+                (run_id,),
             ).fetchone()
         if row is None:
             return None
@@ -774,6 +796,9 @@ class Database:
             delivery_thread_id=row["delivery_thread_id"] if "delivery_thread_id" in keys else None,
             artifact_path=row["artifact_path"] if "artifact_path" in keys else None,
             paperclip_issue_id=row["paperclip_issue_id"] if "paperclip_issue_id" in keys else None,
+            paperclip_routine_id=row["paperclip_routine_id"] if "paperclip_routine_id" in keys else None,
+            paperclip_routine_run_id=row["paperclip_routine_run_id"] if "paperclip_routine_run_id" in keys else None,
+            paperclip_origin_kind=row["paperclip_origin_kind"] if "paperclip_origin_kind" in keys else None,
             paperclip_assignee_agent_id=row["paperclip_assignee_agent_id"] if "paperclip_assignee_agent_id" in keys else None,
             paperclip_project_id=row["paperclip_project_id"] if "paperclip_project_id" in keys else None,
             paperclip_goal_id=row["paperclip_goal_id"] if "paperclip_goal_id" in keys else None,

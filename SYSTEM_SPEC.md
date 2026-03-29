@@ -209,6 +209,27 @@ Polls Paperclip company activity every 2 minutes. Reflects operator actions into
 
 Agents (triggered by Paperclip's heartbeat) call `POST /api/executions/callback` when their work is done. agentic-os never initiates or manages the agent sessions. Notion writeback is fully removed from this path (Phase 3/6 complete).
 
+### Runtime Skill Symlink Hydration
+
+Runtime-visible skills are materialized into each workspace as symlinks (not copies):
+
+- Target path: `projects/<project>/.agents/skills/<skill_name>`
+- Source spec: `/Users/dara/agents/runtime-skills-spec.json`
+- Hydrator: `/Users/dara/agents/bin/hydrate-runtime-skills`
+
+Hydration rules:
+
+1. Effective project skillset = `global_defaults + shared_integrations + project_defaults[project]` (deduped, order preserved).
+2. Each skill is resolved from `source_roots` in order (first match wins).
+3. Hydrator creates/updates symlinks in workspace `.agents/skills`.
+4. Existing local skill directories with `SKILL.md` are preserved.
+5. Existing symlinks that already point to a valid skill of the same name are preserved.
+
+Automation:
+
+- `bin/agents-stack` runs `bin/hydrate-runtime-skills` at stack startup before runtime services launch.
+- This ensures Paperclip/Codex runs starting from `projects/<project>` see the project-appropriate skills without per-workspace duplication.
+
 ### Intake Pipeline
 
 | Module | Role |
@@ -470,7 +491,7 @@ Re-authorize: `python3 scripts/reauth_google.py --all`
 ### Prerequisites
 
 ```bash
-cd /Users/dara/.openclaw/workspace/agentic-os
+cd /Users/dara/agents/agentic-os
 pip install -e .
 export PYTHONPATH=src
 ```

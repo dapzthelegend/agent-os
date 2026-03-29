@@ -33,6 +33,7 @@ class TestDispatcher:
         assert "RESULT_START" in payload.brief
         assert "RESULT_END" in payload.brief
         assert "TASK_DONE: task_000001" in payload.brief
+        assert "/Users/dara/agents/bin/submit-result task_000001" in payload.brief
 
     def test_technical_execute_brief(self):
         """Technical execute should use code/research template."""
@@ -54,6 +55,7 @@ class TestDispatcher:
         assert "RESULT_START" in payload.brief
         assert "RESULT_END" in payload.brief
         assert "TASK_DONE: task_000002" in payload.brief
+        assert "/Users/dara/agents/bin/submit-result task_000002" in payload.brief
         assert "code" in payload.brief.lower() or "write" in payload.brief.lower()
 
     def test_technical_read_brief(self):

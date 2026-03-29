@@ -12,6 +12,7 @@ All failures are logged and swallowed so Paperclip outages never crash backend f
 """
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import Optional
@@ -84,6 +85,7 @@ _CODEX_AGENT = "executor_codex"
 _WRITING_AGENT = "content_writer"
 _FINANCE_AGENT = "accountant"
 _ADMIN_AGENT = "executive_assistant"
+_INFRA_ENGINEER_AGENT = "infrastructure_engineer"
 
 
 class TaskControlPlane:
@@ -136,6 +138,14 @@ class TaskControlPlane:
             return self._client.update_issue(issue_id, **kwargs)
         except Exception as exc:  # noqa: BLE001
             log.error("control_plane.update_issue_status failed for issue %s: %s", issue_id, exc)
+            return None
+
+    def get_issue(self, issue_id: str) -> Optional[IssueRef]:
+        """Fetch a Paperclip issue by id. Returns None on failure."""
+        try:
+            return self._client.get_issue(issue_id)
+        except Exception as exc:  # noqa: BLE001
+            log.error("control_plane.get_issue failed for issue %s: %s", issue_id, exc)
             return None
 
     # ------------------------------------------------------------------
@@ -312,23 +322,27 @@ class TaskControlPlane:
     def _write_import_brief(self, issue_id: str, task: "TaskRecord") -> None:
         """Write the agentic-os callback instructions to a Paperclip-originated issue."""
         try:
+            callback_instructions = (
+                f"Write your result to `/tmp/task_result_{task.id}.txt` with "
+                f"`RESULT_START` / `RESULT_END` / `TASK_DONE: {task.id}` markers, then run:\n\n"
+                f"`/Users/dara/agents/bin/submit-result {task.id}`"
+            )
+            if task.task_mode == "plan_first" and task.status in ("new", "planning"):
+                callback_instructions = (
+                    f"Write your plan to `/tmp/task_plan_{task.id}.txt`, then run:\n\n"
+                    f"`/Users/dara/agents/bin/submit-plan {task.id}`\n\n"
+                    f"Stop after submission and wait for PM review."
+                )
+
             brief = (
                 f"# agentic-os task registered\n\n"
                 f"**Task ID:** `{task.id}`  \n"
                 f"**Domain:** {task.domain}  \n"
                 f"**Mode:** {task.task_mode}  \n\n"
                 f"## Instructions\n\n"
-                f"When your work is complete, call back:\n\n"
-                f"```\n"
-                f"POST http://localhost:8080/api/executions/callback\n"
-                f"{{\n"
-                f'  "task_id": "{task.id}",\n'
-                f'  "status": "completed",\n'
-                f'  "result_summary": "<your result here>",\n'
-                f'  "session_key": "${{OPENCLAW_SESSION_ID:-unknown}}"\n'
-                f"}}\n"
-                f"```\n\n"
-                f"Output `TASK_DONE: {task.id}` before calling back."
+                f"{callback_instructions}\n\n"
+                f"Session key fallback for callbacks is automatic: "
+                f"`OPENCLAW_SESSION_ID` → `PAPERCLIP_RUN_ID`."
             )
             self._client.write_document(
                 issue_id,
@@ -358,6 +372,25 @@ class TaskControlPlane:
             log.error("control_plane.list_all_issues failed: %s", exc)
             return []
 
+    def list_routine_runs(
+        self,
+        routine_id: str,
+        *,
+        limit: int = 50,
+    ) -> list[dict]:
+        try:
+            return self._client.list_routine_runs(routine_id, limit=limit)
+        except Exception as exc:  # noqa: BLE001
+            log.error("control_plane.list_routine_runs failed for routine %s: %s", routine_id, exc)
+            return []
+
+    def get_routine(self, routine_id: str) -> Optional[dict]:
+        try:
+            return self._client.get_routine(routine_id)
+        except Exception as exc:  # noqa: BLE001
+            log.error("control_plane.get_routine failed for routine %s: %s", routine_id, exc)
+            return None
+
     # ------------------------------------------------------------------
     # Routing helpers
     # ------------------------------------------------------------------
@@ -382,6 +415,18 @@ class TaskControlPlane:
           classifier agent=codex  → executor_codex
           everything else         → engineer
         """
+        metadata = self._task_metadata(task)
+
+        preferred_assignee = str(metadata.get("assignee_key", "")).strip()
+        if preferred_assignee and preferred_assignee in self._config.agent_map:
+            return preferred_assignee
+
+        task_kind = str(metadata.get("task_kind", "")).strip()
+        if task_kind == "incident_remediation":
+            if _INFRA_ENGINEER_AGENT in self._config.agent_map:
+                return _INFRA_ENGINEER_AGENT
+            return _ENGINEER_AGENT
+
         if task.intent_type == "content":
             return _WRITING_AGENT
         if task.domain == "finance":
@@ -389,16 +434,23 @@ class TaskControlPlane:
         if task.intent_type in ("capture", "recap") and task.domain == "system":
             return _ADMIN_AGENT
         # Route to Codex if the intake classifier selected it
-        import json as _json
         classifier_agent = ""
-        if task.request_metadata_json:
-            try:
-                classifier_agent = (_json.loads(task.request_metadata_json) or {}).get("agent", "")
-            except Exception:
-                pass
+        classifier_agent = str(metadata.get("agent", "")).strip()
         if classifier_agent == "codex":
             return _CODEX_AGENT
         return _ENGINEER_AGENT
+
+    @staticmethod
+    def _task_metadata(task: TaskRecord) -> dict:
+        if not task.request_metadata_json:
+            return {}
+        try:
+            payload = json.loads(task.request_metadata_json)
+            if isinstance(payload, dict):
+                return payload
+        except Exception:
+            pass
+        return {}
 
     # ------------------------------------------------------------------
     # Internal

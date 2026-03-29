@@ -66,6 +66,8 @@ _MAX_SEEN = 2000
 _COMMENT_EVENT_TYPES = {"comment_added", "comment", "comment_created"}
 _STATUS_EVENT_TYPES = {"status_changed", "status_change", "issue_status_changed"}
 _ISSUE_CREATED_EVENT_TYPES = {"issue_created", "new_issue", "issue_added"}
+_ROUTINE_ENTITY_TYPES = {"routine", "routine_trigger", "routine_run"}
+_ROUTINE_NON_TASK_TERMINAL_STATUSES = {"coalesced", "skipped"}
 
 
 class PaperclipReconciler:
@@ -168,14 +170,37 @@ class PaperclipReconciler:
     # Dispatch
     # ------------------------------------------------------------------
 
-    def _dispatch(self, event: ActivityEvent, imported_issues: set[str]) -> Optional[str]:
+    def _dispatch(self, event: ActivityEvent, imported_issues: Optional[set[str]] = None) -> Optional[str]:
         """Route an activity event to the appropriate handler. Returns action name or None."""
-        task = self._service.db.get_task_by_paperclip_issue_id(event.issue_id)
+        if imported_issues is None:
+            imported_issues = set()
+        entity_type = (event.entity_type or "").lower()
+        # Routine run events are first-class and may not reference an issue.
+        if entity_type == "routine_run":
+            return self._handle_routine_run(event, imported_issues)
+
+        # Routine / trigger events are metadata-level for now; capture in audit only.
+        if entity_type in _ROUTINE_ENTITY_TYPES:
+            self._emit_global(
+                "reconciler_routine_event_seen",
+                {
+                    "paperclip_event_id": event.id,
+                    "entity_type": event.entity_type,
+                    "entity_id": event.entity_id,
+                    "event_type": event.event_type,
+                    "run_id": event.run_id,
+                },
+            )
+            return None
+
+        task = None
+        if event.issue_id:
+            task = self._service.db.get_task_by_paperclip_issue_id(event.issue_id)
 
         if task is None:
             # Unknown issue — check if it's a new issue we should import
             et = event.event_type.lower()
-            if et in _ISSUE_CREATED_EVENT_TYPES and event.issue_id not in imported_issues:
+            if et in _ISSUE_CREATED_EVENT_TYPES and event.issue_id and event.issue_id not in imported_issues:
                 return self._handle_new_issue(event, imported_issues)
             return None  # not a tracked issue and not an import trigger
 
@@ -191,6 +216,183 @@ class PaperclipReconciler:
     # ------------------------------------------------------------------
     # Handlers
     # ------------------------------------------------------------------
+
+    def _handle_routine_run(self, event: ActivityEvent, imported_issues: set[str]) -> Optional[str]:
+        """
+        Reflect routine run activity into backend linkage.
+
+        Routine runs are first-class in Paperclip and may complete without an
+        issue (`coalesced` / `skipped`). For those cases we log a global audit
+        event but intentionally do not create a backend task.
+        """
+        run_id = self._extract_run_id(event)
+        if not run_id:
+            return None
+        routine_id = self._extract_routine_id(event)
+        linked_issue_id = self._extract_linked_issue_id(event)
+        run_status = self._extract_routine_run_status(event)
+
+        task = self._service.db.get_task_by_paperclip_routine_run_id(run_id)
+        if task is None and linked_issue_id:
+            task = self._service.db.get_task_by_paperclip_issue_id(linked_issue_id)
+
+        # If routine run has no issue-backed task, keep visibility in global audit.
+        if task is None:
+            if run_status in _ROUTINE_NON_TASK_TERMINAL_STATUSES:
+                self._emit_global(
+                    "reconciler_routine_run_non_task_terminal",
+                    {
+                        "paperclip_event_id": event.id,
+                        "paperclip_routine_run_id": run_id,
+                        "paperclip_routine_id": routine_id,
+                        "paperclip_issue_id": linked_issue_id,
+                        "status": run_status,
+                    },
+                )
+                return "routine_run_non_task_terminal"
+
+            # `issue_created` can race before issue activity arrives; attempt import
+            # immediately when we have a linked issue id.
+            if run_status == "issue_created" and linked_issue_id and linked_issue_id not in imported_issues:
+                return self._import_issue_for_routine_run(
+                    event,
+                    imported_issues=imported_issues,
+                    issue_id=linked_issue_id,
+                    routine_id=routine_id,
+                    run_id=run_id,
+                )
+
+            self._emit_global(
+                "reconciler_routine_run_unlinked",
+                {
+                    "paperclip_event_id": event.id,
+                    "paperclip_routine_run_id": run_id,
+                    "paperclip_routine_id": routine_id,
+                    "paperclip_issue_id": linked_issue_id,
+                    "status": run_status,
+                },
+            )
+            return None
+
+        # Attach routine metadata to existing task.
+        self._service.db.update_task(
+            task.id,
+            paperclip_routine_id=routine_id,
+            paperclip_routine_run_id=run_id,
+            paperclip_origin_kind="routine_execution",
+            paperclip_issue_id=linked_issue_id or task.paperclip_issue_id,
+        )
+        self._emit_action(
+            task.id,
+            "routine_run_linked",
+            event,
+            {
+                "paperclip_routine_id": routine_id,
+                "paperclip_routine_run_id": run_id,
+                "paperclip_issue_id": linked_issue_id,
+                "status": run_status,
+            },
+        )
+        return "routine_run_linked"
+
+    def _import_issue_for_routine_run(
+        self,
+        event: ActivityEvent,
+        *,
+        imported_issues: set[str],
+        issue_id: str,
+        routine_id: Optional[str],
+        run_id: str,
+    ) -> Optional[str]:
+        if self._cp is None:
+            return None
+        try:
+            issue = self._cp._client.get_issue(issue_id)
+        except Exception as exc:
+            log.error("reconciler: could not fetch linked issue %s for routine run import: %s", issue_id, exc)
+            return None
+        try:
+            result = self._service.import_paperclip_issue(
+                issue_id=issue.id,
+                title=issue.title,
+                description="",
+                project_id=issue.project_id,
+                routine_id=routine_id,
+                routine_run_id=run_id,
+                origin_kind="routine_execution",
+            )
+            task = result["task"]
+            imported_issues.add(issue.id)
+            self._emit_action(
+                task.id,
+                "routine_run_issue_imported",
+                event,
+                {
+                    "paperclip_issue_id": issue.id,
+                    "paperclip_routine_id": routine_id,
+                    "paperclip_routine_run_id": run_id,
+                },
+            )
+            return "routine_run_issue_imported"
+        except Exception as exc:
+            log.error("reconciler: routine run import failed for issue %s: %s", issue_id, exc)
+            return None
+
+    @staticmethod
+    def _extract_run_id(event: ActivityEvent) -> str:
+        if event.run_id:
+            return event.run_id
+        if event.entity_id and (event.entity_type or "").lower() == "routine_run":
+            return event.entity_id
+        payload = event.payload or {}
+        details = event.details or {}
+        value = payload.get("runId") or payload.get("run_id") or details.get("runId") or details.get("run_id")
+        return str(value) if value else ""
+
+    @staticmethod
+    def _extract_routine_id(event: ActivityEvent) -> Optional[str]:
+        payload = event.payload or {}
+        details = event.details or {}
+        value = (
+            payload.get("routineId")
+            or payload.get("routine_id")
+            or details.get("routineId")
+            or details.get("routine_id")
+        )
+        if value:
+            return str(value)
+        if (event.entity_type or "").lower() == "routine" and event.entity_id:
+            return event.entity_id
+        return None
+
+    @staticmethod
+    def _extract_linked_issue_id(event: ActivityEvent) -> Optional[str]:
+        payload = event.payload or {}
+        details = event.details or {}
+        value = (
+            payload.get("linkedIssueId")
+            or payload.get("linked_issue_id")
+            or details.get("linkedIssueId")
+            or details.get("linked_issue_id")
+            or payload.get("issueId")
+            or details.get("issueId")
+            or event.issue_id
+        )
+        return str(value) if value else None
+
+    @staticmethod
+    def _extract_routine_run_status(event: ActivityEvent) -> str:
+        payload = event.payload or {}
+        details = event.details or {}
+        value = (
+            payload.get("status")
+            or payload.get("newStatus")
+            or payload.get("new_status")
+            or details.get("status")
+            or details.get("newStatus")
+            or details.get("new_status")
+        )
+        return str(value).lower() if value else ""
 
     # ------------------------------------------------------------------
     # Paperclip-originated task import
@@ -217,6 +419,9 @@ class PaperclipReconciler:
                 title=issue.title,
                 description="",  # get_issue may not return description; brief is in title
                 project_id=issue.project_id,
+                routine_id=self._extract_routine_id(event),
+                routine_run_id=self._extract_run_id(event) or None,
+                origin_kind="manual_issue",
             )
             task = result["task"]
             imported_issues.add(issue.id)
@@ -276,6 +481,7 @@ class PaperclipReconciler:
                     title=issue.title,
                     description="",
                     project_id=issue.project_id,
+                    origin_kind="manual_issue",
                 )
                 task = result["task"]
                 imported_issues.add(issue.id)
@@ -384,6 +590,18 @@ class PaperclipReconciler:
         except Exception:
             pass
 
+    def _emit_global(self, event_type: str, payload: dict[str, Any]) -> None:
+        # Reconciler-global events are persisted in jsonl audit only.
+        try:
+            self._service.audit.append(
+                task_id="__reconciler__",
+                event_type=event_type,
+                payload=payload,
+                event_id=0,
+            )
+        except Exception:
+            pass
+
     # ------------------------------------------------------------------
     # State persistence (seen event IDs + imported issue IDs)
     # ------------------------------------------------------------------
@@ -411,6 +629,15 @@ class PaperclipReconciler:
             )
         except Exception as exc:
             log.warning("reconciler: could not save state file: %s", exc)
+
+    # Back-compat helpers retained for legacy tests and tooling.
+    def _load_seen(self) -> set[str]:
+        seen, _ = self._load_state()
+        return seen
+
+    def _save_seen(self, seen: set[str]) -> None:
+        _, imported_issues = self._load_state()
+        self._save_state(seen, imported_issues)
 
 
 # ------------------------------------------------------------------

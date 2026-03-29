@@ -20,7 +20,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-BASE_DIR = Path("/Users/dara/.openclaw/workspace/agentic-os")
+BASE_DIR = Path("/Users/dara/agents/agentic-os")
 DB_SRC = BASE_DIR / "data" / "agentic_os.sqlite3"
 BACKUP_ROOT = Path("/Users/dara/.openclaw/backups/agentic-os")
 RETAIN_DAYS = 7
