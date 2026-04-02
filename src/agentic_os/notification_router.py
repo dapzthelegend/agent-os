@@ -2,11 +2,11 @@
 Smart notification router — priority chain: Discord DM → Gmail → stderr.
 
 Routing rules:
-  approval_requested  → Discord DM (approve/deny instructions) + Gmail fallback
-  task_completed      → Discord DM → Gmail fallback
-  task_failed         → Discord DM → Gmail fallback
-  overdue_task        → Discord DM → Gmail fallback
-  approval_reminder   → Discord DM → Gmail fallback
+  approval_requested  → Discord DM + Gmail fallback (email always sent for approvals)
+  task_completed      → Discord DM only (no email)
+  task_failed         → Discord DM only (no email)
+  overdue_task        → Discord DM only (no email)
+  approval_reminder   → Discord DM only (no email)
 
 Environment variables (read at call time, not import time):
   DISCORD_BOT_TOKEN   — Bot token for Discord REST API
@@ -69,10 +69,8 @@ def route_approval_requested(
         f"Approval ID: `{approval.id}`",
         f"Domain: {task.domain} | Risk: {task.risk_level}",
         "",
-        "To approve: reply **APPROVE** to the notification email, or run:",
-        f"  `python3 -m agentic_os.cli approval approve {approval.id}`",
-        "To deny: reply **DENY**, or run:",
-        f"  `python3 -m agentic_os.cli approval deny {approval.id}`",
+        f"To approve: reply **APPROVE {approval.id}** in this chat",
+        f"To deny: reply **DENY {approval.id}** or **DENY {approval.id} <reason>** in this chat",
     ]
     message = "\n".join(lines)
     subject = f"[Agent] Approval required: {title}"
@@ -85,7 +83,7 @@ def route_task_completed(
     result_link: Optional[str] = None,
     word_count: Optional[int] = None,
 ) -> NotificationResult:
-    """Send task completion notification via Discord DM → Gmail."""
+    """Send task completion notification via Discord DM only (no email)."""
     title = _task_title(task)
     lines = [f"✅ **Task completed**: {title}"]
     if task.domain == "content" or task.intent_type == "content":
@@ -97,12 +95,11 @@ def route_task_completed(
     if result_link:
         lines.append(f"→ {result_link}")
     message = "\n".join(lines)
-    subject = f"[Agent] Task completed: {title}"
-    return _send_with_fallback(message, subject=subject)
+    return _send_discord_only(message)
 
 
 def route_task_failed(task: TaskRecord) -> NotificationResult:
-    """Send task failure alert via Discord DM → Gmail."""
+    """Send task failure alert via Discord DM only (no email)."""
     title = _task_title(task)
     reason = (task.result_summary or "no reason recorded")[:200]
     message = (
@@ -110,15 +107,14 @@ def route_task_failed(task: TaskRecord) -> NotificationResult:
         f"Task ID: `{task.id}`\n"
         f"Reason: {reason}"
     )
-    subject = f"[Agent] Task failed: {title}"
-    return _send_with_fallback(message, subject=subject)
+    return _send_discord_only(message)
 
 
 def route_overdue_task(
     task: TaskRecord,
     hours_overdue: float,
 ) -> NotificationResult:
-    """Send overdue task alert via Discord DM → Gmail (fires when >48h no update)."""
+    """Send overdue task alert via Discord DM only (no email)."""
     title = _task_title(task)
     message = (
         f"🕐 **Overdue task** ({hours_overdue:.0f}h no update): {title}\n"
@@ -126,8 +122,7 @@ def route_overdue_task(
         f"Status: {task.status} | Domain: {task.domain}\n"
         "Action needed: check, complete, or cancel this task."
     )
-    subject = f"[Agent] Overdue task ({hours_overdue:.0f}h): {title}"
-    return _send_with_fallback(message, subject=subject)
+    return _send_discord_only(message)
 
 
 def route_approval_reminder(
@@ -136,7 +131,7 @@ def route_approval_reminder(
     hours_pending: float,
 ) -> NotificationResult:
     """
-    Send approval reminder if no decision after APPROVAL_REMINDER_THRESHOLD_HOURS.
+    Send approval reminder via Discord DM only (no email).
     Only sends if actually overdue; caller is responsible for checking threshold.
     """
     title = _task_title(task)
@@ -145,16 +140,28 @@ def route_approval_reminder(
         f"Approval ID: `{approval.id}`\n"
         "This approval is still waiting for your decision."
     )
-    subject = f"[Agent] Approval reminder ({hours_pending:.0f}h): {title}"
-    return _send_with_fallback(message, subject=subject)
+    return _send_discord_only(message)
 
 
 # ---------------------------------------------------------------------------
 # Internal delivery chain
 # ---------------------------------------------------------------------------
 
+def _send_discord_only(message: str) -> NotificationResult:
+    """Try Discord DM; log to stderr on failure. No email fallback."""
+    bot_token = os.environ.get(DISCORD_BOT_TOKEN_ENV)
+    user_id = os.environ.get(DISCORD_USER_ID_ENV)
+    if bot_token and user_id:
+        ok, err = _send_discord_dm(message, bot_token=bot_token, user_id=user_id)
+        if ok:
+            return NotificationResult(channel="discord", success=True, message=message)
+        print(f"[notification_router] Discord DM failed: {err}", file=sys.stderr)
+    print(f"[notification_router] {message}", file=sys.stderr)
+    return NotificationResult(channel="stderr", success=False, message=message, error="discord_failed")
+
+
 def _send_with_fallback(message: str, *, subject: str = "") -> NotificationResult:
-    """Try Discord DM; fall back to Gmail; last resort: stderr."""
+    """Try Discord DM; fall back to Gmail; last resort: stderr. Used for approvals only."""
     # --- Discord Bot DM ---
     bot_token = os.environ.get(DISCORD_BOT_TOKEN_ENV)
     user_id = os.environ.get(DISCORD_USER_ID_ENV)

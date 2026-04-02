@@ -34,6 +34,7 @@ def build_parser() -> argparse.ArgumentParser:
     create_task_fail_parser(task_subparsers)
     create_task_execute_parser(task_subparsers)
     create_task_list_ready_parser(task_subparsers)
+    create_task_resolve_paperclip_parser(task_subparsers)
     create_task_pickup_parser(task_subparsers)
     create_task_mark_dispatched_parser(task_subparsers)
     create_task_record_result_parser(task_subparsers)
@@ -179,6 +180,14 @@ def create_task_list_ready_parser(subparsers: argparse._SubParsersAction) -> Non
         "list-ready", help="List tasks eligible for execution (approved or new+read_ok)"
     )
     parser.add_argument("--limit", type=int, default=20)
+
+
+def create_task_resolve_paperclip_parser(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser(
+        "resolve-by-paperclip-issue",
+        help="Resolve (or import) a backend task for a Paperclip issue ID — for runtimes started by routines",
+    )
+    parser.add_argument("--paperclip-issue-id", required=True, help="Paperclip issue ID")
 
 
 def create_task_pickup_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -976,6 +985,15 @@ def main(argv: Optional[list[str]] = None) -> int:
             tasks = service.list_ready_tasks(limit=args.limit)
             print_json({"count": len(tasks), "tasks": [asdict(t) for t in tasks]})
             return 0
+
+        if args.command == "task" and args.task_command == "resolve-by-paperclip-issue":
+            try:
+                result = service.ensure_task_for_paperclip_issue(args.paperclip_issue_id)
+                print_json(result)
+                return 0
+            except RuntimeError as exc:
+                print(json.dumps({"status": "error", "error": str(exc)}), file=sys.stderr)
+                return 1
 
         if args.command == "task" and args.task_command == "pickup":
             result = service.pickup_task(args.task_id, claimed_by=args.claimed_by)
