@@ -218,6 +218,12 @@ def api_audit(limit: int = 50, domain: Optional[str] = None, target: Optional[st
     return payload
 
 
+@router.get("/api/audit")
+def api_audit_compat(limit: int = 50, domain: Optional[str] = None, target: Optional[str] = None) -> dict:
+    """Compatibility alias for clients that already include '/api' in base URL."""
+    return api_audit(limit=limit, domain=domain, target=target)
+
+
 @router.get("/recap/today")
 def api_recap_today(domain: Optional[str] = None) -> dict:
     return get_service().recap_today(domain=domain)
@@ -445,3 +451,22 @@ def api_set_task_mode(task_id: str, payload: SetTaskModePayload) -> dict:
 def api_paperclip_health() -> dict:
     from .health import get_paperclip_health
     return get_paperclip_health(get_service())
+
+
+@router.get("/paperclip/diagnostics")
+def api_paperclip_diagnostics(
+    task_id: Optional[str] = None,
+    paperclip_issue_id: Optional[str] = None,
+    activity_lookback_seconds: int = 86400,
+) -> dict:
+    from .health import get_paperclip_diagnostics
+
+    try:
+        return get_paperclip_diagnostics(
+            get_service(),
+            task_id=task_id,
+            issue_id=paperclip_issue_id,
+            activity_lookback_seconds=activity_lookback_seconds,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc

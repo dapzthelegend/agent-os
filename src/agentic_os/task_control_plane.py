@@ -53,7 +53,8 @@ def _mime_for_path(path: Path) -> str:
 
 _STATUS_MAP: dict[str, str] = {
     "new": "todo",
-    "planning": "in_progress",
+    # Planning work should be pickup-eligible for execution agents.
+    "planning": "todo",
     "awaiting_plan_review": "in_review",
     "approved_for_execution": "todo",
     "executing": "in_progress",
@@ -165,6 +166,13 @@ class TaskControlPlane:
     def post_failure_comment(self, issue_id: str, reason: str) -> Optional[CommentRef]:
         return self.add_comment(issue_id, f"**Failed:** {reason}")
 
+    def list_comments(self, issue_id: str) -> list[CommentRef]:
+        try:
+            return self._client.list_comments(issue_id)
+        except Exception as exc:  # noqa: BLE001
+            log.error("control_plane.list_comments failed for issue %s: %s", issue_id, exc)
+            return []
+
     # ------------------------------------------------------------------
     # Plan documents
     # ------------------------------------------------------------------
@@ -181,6 +189,13 @@ class TaskControlPlane:
             )
         except Exception as exc:  # noqa: BLE001
             log.error("control_plane.write_plan_doc failed for issue %s: %s", issue_id, exc)
+            return None
+
+    def get_document(self, issue_id: str, doc_id: str) -> Optional[DocumentRef]:
+        try:
+            return self._client.get_document(issue_id, doc_id)
+        except Exception as exc:  # noqa: BLE001
+            log.error("control_plane.get_document failed for issue %s/%s: %s", issue_id, doc_id, exc)
             return None
 
     # ------------------------------------------------------------------

@@ -47,6 +47,7 @@ Health snapshot schema
 """
 from __future__ import annotations
 
+from dataclasses import asdict
 import json
 import os
 import sqlite3
@@ -141,6 +142,105 @@ def get_paperclip_health(service: "AgenticOSService") -> dict[str, Any]:
         "tasks_with_issue": task_counts["with_issue"],
         "tasks_without_issue": task_counts["without_issue"],
     }
+
+
+def get_paperclip_diagnostics(
+    service: "AgenticOSService",
+    *,
+    task_id: Optional[str] = None,
+    issue_id: Optional[str] = None,
+    activity_lookback_seconds: int = 86400,
+) -> dict[str, Any]:
+    """Return a focused backend+Paperclip diagnostic snapshot for one task/issue."""
+    if not task_id and not issue_id:
+        raise ValueError("provide task_id or issue_id")
+
+    out: dict[str, Any] = {
+        "configured": service.config.paperclip is not None,
+        "requested": {
+            "task_id": task_id,
+            "issue_id": issue_id,
+            "activity_lookback_seconds": activity_lookback_seconds,
+        },
+    }
+
+    task = None
+    task_lookup_error: Optional[str] = None
+    if task_id:
+        try:
+            task = service.db.get_task(task_id)
+        except KeyError:
+            task_lookup_error = f"unknown task_id: {task_id}"
+
+    if task is None and issue_id:
+        task = service.db.get_task_by_paperclip_issue_id(issue_id)
+
+    if task is not None:
+        out["task"] = asdict(task)
+        detail = service.get_task_detail(task.id)
+        out["task_audit_events"] = detail.get("audit_events", [])[-30:]
+        out["task_artifacts"] = detail.get("artifacts", [])
+    elif task_lookup_error:
+        out["task_lookup_error"] = task_lookup_error
+
+    resolved_issue_id = issue_id or (task.paperclip_issue_id if task is not None else None)
+    out["resolved_issue_id"] = resolved_issue_id
+    if not resolved_issue_id:
+        out["note"] = "No Paperclip issue linked to the resolved task."
+        return out
+
+    if service.config.paperclip is None:
+        out["paperclip_error"] = "paperclip not configured"
+        return out
+
+    cp = service._cp
+    if cp is None:
+        out["paperclip_error"] = "paperclip control plane unavailable"
+        return out
+
+    issue = cp.get_issue(resolved_issue_id)
+    out["paperclip_issue"] = None if issue is None else asdict(issue)
+
+    comments = cp.list_comments(resolved_issue_id)
+    out["paperclip_comments"] = [
+        {"id": comment.id, "issue_id": comment.issue_id, "body": comment.body, "body_length": len(comment.body)}
+        for comment in comments
+    ]
+
+    activity = cp.poll_activity(resolved_issue_id, lookback_seconds=activity_lookback_seconds)
+    out["paperclip_activity"] = [
+        {
+            "id": event.id,
+            "event_type": event.event_type,
+            "entity_type": event.entity_type,
+            "entity_id": event.entity_id,
+            "run_id": event.run_id,
+            "created_at": event.created_at,
+            "payload": event.payload or {},
+            "details": event.details or {},
+        }
+        for event in activity
+    ]
+
+    plan_doc = cp.get_document(resolved_issue_id, "plan")
+    out["paperclip_plan_document"] = (
+        None
+        if plan_doc is None
+        else {
+            "id": plan_doc.id,
+            "issue_id": plan_doc.issue_id,
+            "title": plan_doc.title,
+            "content": plan_doc.content,
+            "content_length": len(plan_doc.content),
+        }
+    )
+    out["checks"] = {
+        "has_task_link": task is not None,
+        "has_issue_projection": issue is not None,
+        "comments_visible": len(comments) > 0,
+        "plan_document_visible": plan_doc is not None and bool(plan_doc.content),
+    }
+    return out
 
 
 def validate_startup_config(paths: "Paths", config: "AppConfig") -> list[str]:

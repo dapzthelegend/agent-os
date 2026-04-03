@@ -110,6 +110,9 @@ def build_parser() -> argparse.ArgumentParser:
     retry_parser.add_argument("--feedback", default="operator retry")
 
     subparsers.add_parser("health", help="Print system health snapshot")
+    paperclip_parser = subparsers.add_parser("paperclip", help="Paperclip diagnostics")
+    paperclip_subparsers = paperclip_parser.add_subparsers(dest="paperclip_command", required=True)
+    create_paperclip_diagnostics_parser(paperclip_subparsers)
 
     stall_parser = subparsers.add_parser("stall-check", help="Scan and flag stalled tasks, send Discord alerts")
     stall_parser.add_argument("--threshold-hours", type=float, default=2.0)
@@ -531,6 +534,16 @@ def create_audit_tail_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument("--limit", type=int, default=20)
     parser.add_argument("--domain", choices=DOMAINS)
     parser.add_argument("--target")
+
+
+def create_paperclip_diagnostics_parser(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser(
+        "diagnostics",
+        help="Show backend+Paperclip diagnostics for a task/issue",
+    )
+    parser.add_argument("--task-id")
+    parser.add_argument("--paperclip-issue-id")
+    parser.add_argument("--activity-lookback-seconds", type=int, default=86400)
 
 
 def create_recap_today_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -1353,6 +1366,19 @@ def main(argv: Optional[list[str]] = None) -> int:
         if args.command == "health":
             from .health import get_system_health
             print_json(get_system_health(service))
+            return 0
+
+        if args.command == "paperclip" and args.paperclip_command == "diagnostics":
+            from .health import get_paperclip_diagnostics
+
+            print_json(
+                get_paperclip_diagnostics(
+                    service,
+                    task_id=args.task_id,
+                    issue_id=args.paperclip_issue_id,
+                    activity_lookback_seconds=args.activity_lookback_seconds,
+                )
+            )
             return 0
 
         if args.command == "stall-check":
