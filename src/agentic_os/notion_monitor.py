@@ -1,4 +1,12 @@
-"""Notion monitor — polls Notion for unclaimed Inbox tasks, creates backend tasks, dispatches them."""
+"""
+DEPRECATED (Phase 6 — Paperclip cutover).
+
+Notion monitor — polls Notion for unclaimed Inbox tasks, creates backend tasks, dispatches them.
+
+This module is no longer part of the live execution path. The `notion-monitor-poll` cron job
+has been disabled. Task intake now originates from Paperclip via the task-executor job.
+Retained for rollback capability only — do not import from live code.
+"""
 
 from __future__ import annotations
 

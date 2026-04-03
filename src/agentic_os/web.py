@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI, Request
@@ -13,8 +14,32 @@ from .web_routes import router as web_router
 from .web_support import STATIC_DIR, TEMPLATES_DIR
 
 
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    """Start the background scheduler on startup; stop it on shutdown."""
+    import logging
+    from .config import default_paths, load_app_config
+    from .scheduler import BackgroundScheduler
+    from .jobs import register_all_jobs
+
+    scheduler = BackgroundScheduler()
+    try:
+        paths = default_paths()
+        config = load_app_config(paths)
+        register_all_jobs(scheduler, paths, config)
+        scheduler.start()
+        app.state.scheduler = scheduler
+    except Exception as exc:
+        logging.getLogger(__name__).error("scheduler startup failed: %s", exc)
+        app.state.scheduler = None
+
+    yield
+
+    scheduler.stop()
+
+
 def create_app() -> FastAPI:
-    app = FastAPI(title="agentic-os dashboard")
+    app = FastAPI(title="agentic-os dashboard", lifespan=_lifespan)
     app.state.templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
     app.state.templates.env.filters["status_tone"] = _status_tone
     app.state.templates.env.filters["risk_tone"] = _risk_tone
@@ -90,17 +115,6 @@ def _event_tone(value: Optional[str]) -> str:
 
 
 app = create_app()
-
-
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(
-        "agentic_os.web:app",
-        host="127.0.0.1",
-        port=8000,
-        reload=False,
-    )
 
 
 if __name__ == "__main__":

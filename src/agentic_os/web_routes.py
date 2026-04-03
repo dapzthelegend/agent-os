@@ -235,6 +235,53 @@ def retry_stalled(task_id: str, feedback: str = Form(default="operator retry")):
     return _redirect("/stalled", message=f"Task {task_id} reset for retry.")
 
 
+@router.post("/tasks/{task_id}/approve-plan")
+def approve_plan(task_id: str, revision_id: str = Form(default="")):
+    try:
+        service = get_service()
+        if not revision_id:
+            task = service.db.get_task(task_id)
+            revision_id = f"plan-v{task.plan_version or 1}-operator"
+        service.approve_plan(task_id, revision_id=revision_id)
+    except Exception as exc:
+        return _redirect(f"/tasks/{task_id}", error=str(exc))
+    return _redirect(f"/tasks/{task_id}", message=f"Plan approved ({revision_id}).")
+
+
+@router.post("/tasks/{task_id}/reject-plan")
+def reject_plan(task_id: str, feedback: str = Form(default="")):
+    try:
+        get_service().reject_plan(task_id, feedback=feedback or "Revision requested by operator")
+    except Exception as exc:
+        return _redirect(f"/tasks/{task_id}", error=str(exc))
+    return _redirect(f"/tasks/{task_id}", message=f"Plan rejected for task {task_id}.")
+
+
+@router.post("/tasks/{task_id}/cancel")
+def cancel_task(task_id: str, reason: str = Form(default="Cancelled by operator")):
+    try:
+        get_service().cancel_task(task_id, reason=reason)
+    except Exception as exc:
+        return _redirect(f"/tasks/{task_id}", error=str(exc))
+    return _redirect(f"/tasks/{task_id}", message=f"Task {task_id} cancelled.")
+
+
+@router.post("/tasks/{task_id}/set-mode")
+def set_task_mode(task_id: str, mode: str = Form(...)):
+    try:
+        get_service().set_task_mode(task_id, mode=mode)
+    except Exception as exc:
+        return _redirect(f"/tasks/{task_id}", error=str(exc))
+    return _redirect(f"/tasks/{task_id}", message=f"Task mode set to '{mode}'.")
+
+
+@router.get("/paperclip")
+def paperclip_page(request: Request):
+    from .health import get_paperclip_health
+    health = get_paperclip_health(get_service())
+    return _render(request, "paperclip.html", {"paperclip": health})
+
+
 @router.get("/recaps")
 def recaps_page(request: Request, domain: Optional[str] = None):
     service = get_service()

@@ -47,9 +47,12 @@ Health snapshot schema
 """
 from __future__ import annotations
 
+from dataclasses import asdict
 import json
 import os
 import sqlite3
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
@@ -99,6 +102,145 @@ def get_system_health(service: "AgenticOSService") -> dict[str, Any]:
         "config": config_section,
         "cron": cron_section,
     }
+
+
+def get_paperclip_health(service: "AgenticOSService") -> dict[str, Any]:
+    """
+    Return Paperclip connectivity and reconciler status.
+
+    Schema:
+        configured: bool
+        base_url: str | None
+        company_id: str | None
+        reachable: bool | None   (None = not configured)
+        last_reconcile_at: ISO8601 str | None
+        tasks_with_issue: int
+        tasks_without_issue: int
+    """
+    config = service.config
+    if config.paperclip is None:
+        return {
+            "configured": False,
+            "base_url": None,
+            "company_id": None,
+            "reachable": None,
+            "last_reconcile_at": None,
+            "tasks_with_issue": 0,
+            "tasks_without_issue": 0,
+        }
+
+    reachable = _check_paperclip_reachable(config.paperclip.base_url)
+    last_reconcile_at = _get_last_reconcile_at(service)
+    task_counts = _get_paperclip_task_counts(service)
+
+    return {
+        "configured": True,
+        "base_url": config.paperclip.base_url,
+        "company_id": config.paperclip.company_id,
+        "reachable": reachable,
+        "last_reconcile_at": last_reconcile_at,
+        "tasks_with_issue": task_counts["with_issue"],
+        "tasks_without_issue": task_counts["without_issue"],
+    }
+
+
+def get_paperclip_diagnostics(
+    service: "AgenticOSService",
+    *,
+    task_id: Optional[str] = None,
+    issue_id: Optional[str] = None,
+    activity_lookback_seconds: int = 86400,
+) -> dict[str, Any]:
+    """Return a focused backend+Paperclip diagnostic snapshot for one task/issue."""
+    if not task_id and not issue_id:
+        raise ValueError("provide task_id or issue_id")
+
+    out: dict[str, Any] = {
+        "configured": service.config.paperclip is not None,
+        "requested": {
+            "task_id": task_id,
+            "issue_id": issue_id,
+            "activity_lookback_seconds": activity_lookback_seconds,
+        },
+    }
+
+    task = None
+    task_lookup_error: Optional[str] = None
+    if task_id:
+        try:
+            task = service.db.get_task(task_id)
+        except KeyError:
+            task_lookup_error = f"unknown task_id: {task_id}"
+
+    if task is None and issue_id:
+        task = service.db.get_task_by_paperclip_issue_id(issue_id)
+
+    if task is not None:
+        out["task"] = asdict(task)
+        detail = service.get_task_detail(task.id)
+        out["task_audit_events"] = detail.get("audit_events", [])[-30:]
+        out["task_artifacts"] = detail.get("artifacts", [])
+    elif task_lookup_error:
+        out["task_lookup_error"] = task_lookup_error
+
+    resolved_issue_id = issue_id or (task.paperclip_issue_id if task is not None else None)
+    out["resolved_issue_id"] = resolved_issue_id
+    if not resolved_issue_id:
+        out["note"] = "No Paperclip issue linked to the resolved task."
+        return out
+
+    if service.config.paperclip is None:
+        out["paperclip_error"] = "paperclip not configured"
+        return out
+
+    cp = service._cp
+    if cp is None:
+        out["paperclip_error"] = "paperclip control plane unavailable"
+        return out
+
+    issue = cp.get_issue(resolved_issue_id)
+    out["paperclip_issue"] = None if issue is None else asdict(issue)
+
+    comments = cp.list_comments(resolved_issue_id)
+    out["paperclip_comments"] = [
+        {"id": comment.id, "issue_id": comment.issue_id, "body": comment.body, "body_length": len(comment.body)}
+        for comment in comments
+    ]
+
+    activity = cp.poll_activity(resolved_issue_id, lookback_seconds=activity_lookback_seconds)
+    out["paperclip_activity"] = [
+        {
+            "id": event.id,
+            "event_type": event.event_type,
+            "entity_type": event.entity_type,
+            "entity_id": event.entity_id,
+            "run_id": event.run_id,
+            "created_at": event.created_at,
+            "payload": event.payload or {},
+            "details": event.details or {},
+        }
+        for event in activity
+    ]
+
+    plan_doc = cp.get_document(resolved_issue_id, "plan")
+    out["paperclip_plan_document"] = (
+        None
+        if plan_doc is None
+        else {
+            "id": plan_doc.id,
+            "issue_id": plan_doc.issue_id,
+            "title": plan_doc.title,
+            "content": plan_doc.content,
+            "content_length": len(plan_doc.content),
+        }
+    )
+    out["checks"] = {
+        "has_task_link": task is not None,
+        "has_issue_projection": issue is not None,
+        "comments_visible": len(comments) > 0,
+        "plan_document_visible": plan_doc is not None and bool(plan_doc.content),
+    }
+    return out
 
 
 def validate_startup_config(paths: "Paths", config: "AppConfig") -> list[str]:
@@ -216,6 +358,47 @@ def _check_config(config: "AppConfig") -> dict[str, Any]:
             )
 
     return {"notion_token_set": notion_token_set, "issues": issues}
+
+
+def _check_paperclip_reachable(base_url: str) -> bool:
+    """Attempt a lightweight GET to the Paperclip base URL. Returns True if reachable."""
+    try:
+        req = urllib.request.Request(base_url, method="GET")
+        with urllib.request.urlopen(req, timeout=3):
+            return True
+    except Exception:
+        return False
+
+
+def _get_last_reconcile_at(service: "AgenticOSService") -> Optional[str]:
+    """
+    Return the created_at timestamp of the most recent reconciler_ran audit event,
+    or the mtime of the reconciler state file — whichever we can find first.
+    """
+    # Fast path: check state file mtime
+    state_path = service.paths.data_dir / "paperclip_reconciler_state.json"
+    if state_path.exists():
+        try:
+            mtime = state_path.stat().st_mtime
+            return datetime.fromtimestamp(mtime, tz=timezone.utc).replace(microsecond=0).isoformat()
+        except Exception:
+            pass
+    return None
+
+
+def _get_paperclip_task_counts(service: "AgenticOSService") -> dict[str, int]:
+    """Count tasks with and without a paperclip_issue_id."""
+    try:
+        with service.db.connect() as conn:
+            (with_issue,) = conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE paperclip_issue_id IS NOT NULL AND paperclip_issue_id != ''"
+            ).fetchone()
+            (without_issue,) = conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE paperclip_issue_id IS NULL OR paperclip_issue_id = ''"
+            ).fetchone()
+        return {"with_issue": with_issue, "without_issue": without_issue}
+    except Exception:
+        return {"with_issue": 0, "without_issue": 0}
 
 
 def _check_cron(repo_root: Path) -> dict[str, Any]:

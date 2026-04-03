@@ -1,4 +1,14 @@
-"""Notion result writeback — updates Notion after task completion or failure."""
+"""
+DEPRECATED (Phase 6 — Paperclip cutover).
+
+Notion result writeback — updates Notion after task completion or failure.
+
+This module is no longer part of the live execution path. Completion and failure
+writebacks now go to Paperclip exclusively (via TaskControlPlane inside service.py).
+The fail_task() Notion writeback was removed in Phase 6; execution_receiver.py
+Notion writeback was removed in Phase 3.
+Retained for rollback capability only — do not import from live code.
+"""
 from __future__ import annotations
 
 import json

@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+{% block title %}Paperclip · agentic-os{% endblock %}
+{% block content %}
+<section class="section">
+  <div class="section-header">
+    <h1>Paperclip</h1>
+    <p>Control plane integration status</p>
+    {% if paperclip.configured %}
+      {% if paperclip.reachable %}
+      <span class="badge success">reachable</span>
+      {% else %}
+      <span class="badge danger">unreachable</span>
+      {% endif %}
+    {% else %}
+    <span class="badge warning">not configured</span>
+    {% endif %}
+  </div>
+
+  <div class="grid two-up">
+
+    <!-- Connection -->
+    <article class="card">
+      <h2>Connection</h2>
+      {% if paperclip.configured %}
+      <table class="table-sm">
+        <tbody>
+          <tr><td>Base URL</td><td>{{ paperclip.base_url }}</td></tr>
+          <tr><td>Company</td><td>{{ paperclip.company_id }}</td></tr>
+          <tr>
+            <td>Reachable</td>
+            <td>
+              <span class="badge {% if paperclip.reachable %}success{% else %}danger{% endif %}">
+                {{ "yes" if paperclip.reachable else "no" }}
+              </span>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      {% else %}
+      <p class="muted">No Paperclip configuration found in config.json.</p>
+      {% endif %}
+    </article>
+
+    <!-- Reconciler -->
+    <article class="card">
+      <h2>Reconciler</h2>
+      {% if paperclip.configured %}
+      <table class="table-sm">
+        <tbody>
+          <tr>
+            <td>Last run</td>
+            <td>{{ paperclip.last_reconcile_at or "never" }}</td>
+          </tr>
+        </tbody>
+      </table>
+      <p class="muted" style="margin-top:0.5rem">
+        The reconciler polls Paperclip activity every 2 minutes and reflects
+        operator comments (APPROVE / REVISE) and status changes into backend state.
+      </p>
+      {% else %}
+      <p class="muted">Reconciler is inactive — Paperclip not configured.</p>
+      {% endif %}
+    </article>
+
+    <!-- Task coverage -->
+    <article class="card">
+      <h2>Task Coverage</h2>
+      {% if paperclip.configured %}
+      <table class="table-sm">
+        <tbody>
+          <tr>
+            <td>Tracked (have issue ID)</td>
+            <td><strong>{{ paperclip.tasks_with_issue }}</strong></td>
+          </tr>
+          <tr>
+            <td>Untracked (no issue ID)</td>
+            <td>{{ paperclip.tasks_without_issue }}</td>
+          </tr>
+        </tbody>
+      </table>
+      {% else %}
+      <p class="muted">No task coverage data — Paperclip not configured.</p>
+      {% endif %}
+    </article>
+
+  </div>
+</section>
+{% endblock %}

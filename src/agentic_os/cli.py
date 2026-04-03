@@ -34,9 +34,11 @@ def build_parser() -> argparse.ArgumentParser:
     create_task_fail_parser(task_subparsers)
     create_task_execute_parser(task_subparsers)
     create_task_list_ready_parser(task_subparsers)
+    create_task_resolve_paperclip_parser(task_subparsers)
     create_task_pickup_parser(task_subparsers)
     create_task_mark_dispatched_parser(task_subparsers)
     create_task_record_result_parser(task_subparsers)
+    create_task_submit_plan_parser(task_subparsers)
     create_task_requeue_parser(task_subparsers)
 
     approval_parser = subparsers.add_parser("approval", help="Approval operations")
@@ -108,6 +110,9 @@ def build_parser() -> argparse.ArgumentParser:
     retry_parser.add_argument("--feedback", default="operator retry")
 
     subparsers.add_parser("health", help="Print system health snapshot")
+    paperclip_parser = subparsers.add_parser("paperclip", help="Paperclip diagnostics")
+    paperclip_subparsers = paperclip_parser.add_subparsers(dest="paperclip_command", required=True)
+    create_paperclip_diagnostics_parser(paperclip_subparsers)
 
     stall_parser = subparsers.add_parser("stall-check", help="Scan and flag stalled tasks, send Discord alerts")
     stall_parser.add_argument("--threshold-hours", type=float, default=2.0)
@@ -180,6 +185,14 @@ def create_task_list_ready_parser(subparsers: argparse._SubParsersAction) -> Non
     parser.add_argument("--limit", type=int, default=20)
 
 
+def create_task_resolve_paperclip_parser(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser(
+        "resolve-by-paperclip-issue",
+        help="Resolve (or import) a backend task for a Paperclip issue ID — for runtimes started by routines",
+    )
+    parser.add_argument("--paperclip-issue-id", required=True, help="Paperclip issue ID")
+
+
 def create_task_pickup_parser(subparsers: argparse._SubParsersAction) -> None:
     parser = subparsers.add_parser(
         "pickup", help="Atomically claim a task for execution (→ in_progress)"
@@ -205,6 +218,17 @@ def create_task_record_result_parser(subparsers: argparse._SubParsersAction) -> 
     parser.add_argument("--task-id", required=True)
     parser.add_argument("--output-file", required=True, help="Path to file containing full agent output")
     parser.add_argument("--session-key", default="unknown")
+
+
+def create_task_submit_plan_parser(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser(
+        "submit-plan",
+        help="Submit a plan from a file and transition task to awaiting_plan_review",
+    )
+    parser.add_argument("--task-id", required=True)
+    parser.add_argument("--plan-file", required=True, help="Path to file containing plan text")
+    parser.add_argument("--session-key", default="unknown")
+    parser.add_argument("--doc-id", default=None, help="Optional Paperclip document id for correlation")
 
 
 def create_task_requeue_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -510,6 +534,16 @@ def create_audit_tail_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument("--limit", type=int, default=20)
     parser.add_argument("--domain", choices=DOMAINS)
     parser.add_argument("--target")
+
+
+def create_paperclip_diagnostics_parser(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser(
+        "diagnostics",
+        help="Show backend+Paperclip diagnostics for a task/issue",
+    )
+    parser.add_argument("--task-id")
+    parser.add_argument("--paperclip-issue-id")
+    parser.add_argument("--activity-lookback-seconds", type=int, default=86400)
 
 
 def create_recap_today_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -965,6 +999,15 @@ def main(argv: Optional[list[str]] = None) -> int:
             print_json({"count": len(tasks), "tasks": [asdict(t) for t in tasks]})
             return 0
 
+        if args.command == "task" and args.task_command == "resolve-by-paperclip-issue":
+            try:
+                result = service.ensure_task_for_paperclip_issue(args.paperclip_issue_id)
+                print_json(result)
+                return 0
+            except RuntimeError as exc:
+                print(json.dumps({"status": "error", "error": str(exc)}), file=sys.stderr)
+                return 1
+
         if args.command == "task" and args.task_command == "pickup":
             result = service.pickup_task(args.task_id, claimed_by=args.claimed_by)
             print_json(result)
@@ -1016,6 +1059,35 @@ def main(argv: Optional[list[str]] = None) -> int:
                 file=_sys.stderr,
             )
             return 1
+
+        if args.command == "task" and args.task_command == "submit-plan":
+            plan_path = Path(args.plan_file)
+            if not plan_path.exists():
+                import sys as _sys
+                print(
+                    json.dumps({"status": "error", "error": f"plan_file not found: {args.plan_file}"}),
+                    file=_sys.stderr,
+                )
+                return 1
+            plan_text = plan_path.read_text(encoding="utf-8").strip()
+            if not plan_text:
+                import sys as _sys
+                print(
+                    json.dumps({"status": "error", "error": "plan file is empty"}),
+                    file=_sys.stderr,
+                )
+                return 1
+            task = service.submit_plan(args.task_id, plan_text)
+            payload = {
+                "status": "ok",
+                "task_id": task.id,
+                "plan_version": task.plan_version,
+                "session_key": args.session_key,
+            }
+            if args.doc_id:
+                payload["paperclip_document_id"] = args.doc_id
+            print_json(payload)
+            return 0
 
         if args.command == "task" and args.task_command == "requeue":
             task = service.requeue_task(args.task_id)
@@ -1294,6 +1366,19 @@ def main(argv: Optional[list[str]] = None) -> int:
         if args.command == "health":
             from .health import get_system_health
             print_json(get_system_health(service))
+            return 0
+
+        if args.command == "paperclip" and args.paperclip_command == "diagnostics":
+            from .health import get_paperclip_diagnostics
+
+            print_json(
+                get_paperclip_diagnostics(
+                    service,
+                    task_id=args.task_id,
+                    issue_id=args.paperclip_issue_id,
+                    activity_lookback_seconds=args.activity_lookback_seconds,
+                )
+            )
             return 0
 
         if args.command == "stall-check":

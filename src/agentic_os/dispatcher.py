@@ -18,7 +18,7 @@ from .config import Paths, default_paths
 class DispatchPayload:
     """Structured payload for ACP agent dispatch."""
     task_id: str
-    notion_page_id: str
+    paperclip_issue_id: Optional[str]
     routing: str                     # auto_execute | needs_approval | escalate
     agent: str                       # primary model alias, e.g. "openrouter-free", "gemini-flash", "sonnet"
     brief: str                       # full prompt string for ACP session
@@ -84,23 +84,29 @@ class Dispatcher:
     def build_payload(
         self,
         task_id: str,
-        notion_page_id: str,
+        paperclip_issue_id: Optional[str],
         title: str,
         classification: RequestClassification,
         routing: str,
         agent: str,
         fallback_agent: Optional[str] = None,
+        approved_plan: Optional[str] = None,
+        task_mode: Optional[str] = None,
+        task_status: Optional[str] = None,
     ) -> DispatchPayload:
         """
         Build dispatch payload for a classified task.
 
         Args:
             task_id: backend task ID
-            notion_page_id: Notion page ID
+            paperclip_issue_id: Paperclip issue ID (nullable)
             title: task title / description
             classification: RequestClassification
             routing: auto_execute | needs_approval | escalate
             agent: main | manager | senior (from routing rules or decision engine)
+            approved_plan: approved plan text for plan_first tasks (included in brief)
+            task_mode: 'plan_first' or 'direct'
+            task_status: current task status (used to detect planning phase)
 
         Returns:
             DispatchPayload with full brief (compressed if very long)
@@ -111,6 +117,10 @@ class Dispatcher:
             domain=classification.domain,
             intent_type=classification.intent_type,
             risk_level=classification.risk_level,
+            approved_plan=approved_plan,
+            task_mode=task_mode,
+            task_status=task_status,
+            paperclip_issue_id=paperclip_issue_id,
         )
 
         # Phase 3: compress very long briefs before dispatch
@@ -122,7 +132,7 @@ class Dispatcher:
 
         return DispatchPayload(
             task_id=task_id,
-            notion_page_id=notion_page_id,
+            paperclip_issue_id=paperclip_issue_id,
             routing=routing,
             agent=agent,
             brief=brief,
@@ -138,14 +148,10 @@ After outputting TASK_DONE: {task_id}, you MUST record the result:
 1. Write your complete output to a temp file:
    OUTPUT_FILE="/tmp/task_result_{task_id}.txt"
 
-2. Run the record-result CLI:
-   cd /Users/dara/.openclaw/workspace/agentic-os
-   PYTHONPATH=src python3 -m agentic_os.cli task record-result \\
-     --task-id {task_id} \\
-     --output-file "$OUTPUT_FILE" \\
-     --session-key "${{OPENCLAW_SESSION_ID:-unknown}}"
+2. Run the callback helper:
+   /Users/dara/agents/bin/submit-result {task_id}
 
-3. Verify exit code 0 and JSON status=success (or already_done). On failure output:
+3. Verify exit code 0 and output `RESULT_SUBMITTED` (or `ALREADY_SUBMITTED`). On failure output:
    WRITEBACK_FAILED: {task_id} <error>
    and stop.
 """
@@ -157,17 +163,82 @@ After outputting TASK_DONE: {task_id}, you MUST record the result:
         domain: str,
         intent_type: str,
         risk_level: str,
+        approved_plan: Optional[str] = None,
+        task_mode: Optional[str] = None,
+        task_status: Optional[str] = None,
+        paperclip_issue_id: Optional[str] = None,
     ) -> str:
         """Build the full prompt brief for an ACP session."""
 
+        # Plan-first tasks in the planning phase get a planning brief, not an execution brief
+        if task_mode == "plan_first" and task_status in ("new", "planning"):
+            return self._build_planning_brief(title, task_id, paperclip_issue_id or "")
+
         if intent_type == "content":
-            return self._build_content_brief(title, task_id, risk_level)
+            brief = self._build_content_brief(title, task_id, risk_level)
         elif domain == "personal" and intent_type == "draft":
-            return self._build_draft_brief(title, task_id, domain, risk_level)
+            brief = self._build_draft_brief(title, task_id, domain, risk_level)
         elif domain == "technical" and intent_type in ("execute", "read"):
-            return self._build_technical_brief(title, task_id, domain, intent_type, risk_level)
+            brief = self._build_technical_brief(title, task_id, domain, intent_type, risk_level)
         else:
-            return self._build_generic_brief(title, task_id, domain, intent_type, risk_level)
+            brief = self._build_generic_brief(title, task_id, domain, intent_type, risk_level)
+
+        if approved_plan:
+            plan_section = (
+                f"\n== APPROVED EXECUTION PLAN ==\n"
+                f"The following plan has been reviewed and approved by the operator.\n"
+                f"You MUST follow this plan. Do not deviate without explicit instruction.\n\n"
+                f"{approved_plan.strip()}\n"
+                f"== END OF PLAN ==\n"
+            )
+            # Insert the plan block right before the write-back instructions
+            writeback_marker = "== MANDATORY WRITE-BACK =="
+            if writeback_marker in brief:
+                idx = brief.index(writeback_marker)
+                brief = brief[:idx] + plan_section + "\n" + brief[idx:]
+            else:
+                brief = brief + plan_section
+
+        return brief
+
+    def _build_planning_brief(self, title: str, task_id: str, paperclip_issue_id: str) -> str:
+        """
+        Planning brief for the execution agent on a plan_first task.
+
+        The execution agent (engineer, content writer, etc.) writes the plan.
+        The Project Manager reviews it and approves or requests revisions.
+        The agent does NOT execute until the plan is approved.
+        """
+        return f"""You have been assigned a task that requires a plan before execution.
+
+Task: {title}
+Task ID: {task_id}
+Paperclip Issue ID: {paperclip_issue_id}
+
+PLANNING INSTRUCTIONS
+=====================
+Before doing any work, you must write a plan and submit it for review.
+The Project Manager will review your plan and either approve it or request revisions.
+Do not begin execution until you receive an approved plan back.
+
+1. Write a structured plan document. Include:
+   - Objective: what this task is trying to achieve
+   - Approach: your recommended strategy
+   - Steps: ordered, concrete action items
+   - Risks: what could go wrong and how to mitigate
+   - Expected output: what a successful result looks like
+   - Estimated effort: rough time/complexity estimate
+
+2. Post the plan as a document on the Paperclip issue (issue ID: {paperclip_issue_id}).
+
+3. Submit the plan to the backend for PM review:
+   - Write your plan to /tmp/task_plan_{task_id}.txt
+   - Run: /Users/dara/agents/bin/submit-plan {task_id} --doc-id <paperclip_document_id>
+
+4. Stop here. The Project Manager will review and respond via Paperclip comment.
+   If approved, you will be reassigned with the approved plan and execution instructions.
+   If revision is requested, you will receive feedback and be asked to replan.
+"""
 
     def _build_content_brief(self, title: str, task_id: str, risk_level: str) -> str:
         """
@@ -312,13 +383,37 @@ def main() -> None:
         risk_level=task.risk_level,
     )
     routing, agent = dispatcher.resolve_routing(classification)
+
+    # Load approved plan for plan_first tasks
+    approved_plan: Optional[str] = None
+    if task.task_mode == "plan_first" and task.approved_plan_revision_id:
+        from pathlib import Path
+        from .artifacts import ArtifactStore
+        import json as _json
+        try:
+            store = ArtifactStore(paths.artifacts_dir)
+            plan_artifacts = [
+                a for a in db.list_artifacts(task.id)
+                if a.get("artifact_type") == "plan_document"
+            ]
+            if plan_artifacts:
+                latest = sorted(plan_artifacts, key=lambda a: a.get("version", 0))[-1]
+                raw = store.read_text(latest["path"])
+                parsed = _json.loads(raw)
+                approved_plan = parsed.get("plan_text") or raw
+        except Exception:
+            pass
+
     payload = dispatcher.build_payload(
         task_id=task.id,
-        notion_page_id=task.external_ref or "",
+        paperclip_issue_id=task.paperclip_issue_id or "",
         title=task.user_request,
         classification=classification,
         routing=routing,
         agent=agent,
+        approved_plan=approved_plan,
+        task_mode=task.task_mode,
+        task_status=task.status,
     )
 
     # Output as JSON

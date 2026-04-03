@@ -7,19 +7,28 @@ from typing import Any, Optional
 DOMAINS = ("personal", "technical", "finance", "system")
 INTENT_TYPES = ("read", "draft", "execute", "capture", "recap", "content")
 RISK_LEVELS = ("low", "medium", "high")
-ACTION_SOURCES = ("openclaw_tool", "openclaw_skill", "custom_adapter", "manual")
+ACTION_SOURCES = ("openclaw_tool", "openclaw_skill", "custom_adapter", "manual", "api", "paperclip_manual")
 STATUSES = (
+    # legacy live-path statuses (phase 0 compat)
     "new",
     "in_progress",
     "awaiting_input",
     "awaiting_approval",
     "approved",
     "executed",
+    # new statuses (phase 1+)
+    "planning",
+    "awaiting_plan_review",
+    "approved_for_execution",
+    "executing",
+    # terminal
     "completed",
     "failed",
     "cancelled",
     "stalled",
 )
+
+TASK_MODES = ("direct", "plan_first")
 APPROVAL_STATES = ("not_needed", "pending", "approved", "denied", "cancelled")
 POLICY_DECISIONS = ("read_ok", "draft_required", "approval_required")
 APPROVAL_RECORD_STATES = ("pending", "approved", "denied", "cancelled")
@@ -72,11 +81,26 @@ class TaskRecord:
     policy_decision: Optional[str]
     action_source: str
     retry_count: int = 0
-    # Phase 2 — dispatch tracking (added via TASK_COLUMNS migration)
     claimed_at: Optional[str] = None
     claimed_by: Optional[str] = None
     dispatch_session_key: Optional[str] = None
     dispatch_attempts: int = 0
+    # Paperclip / new-schema fields (phase 0+)
+    title: Optional[str] = None
+    description: Optional[str] = None
+    task_mode: str = "direct"
+    delivery_target: Optional[str] = None
+    delivery_thread_id: Optional[str] = None
+    artifact_path: Optional[str] = None
+    paperclip_issue_id: Optional[str] = None
+    paperclip_routine_id: Optional[str] = None
+    paperclip_routine_run_id: Optional[str] = None
+    paperclip_origin_kind: Optional[str] = None
+    paperclip_assignee_agent_id: Optional[str] = None
+    paperclip_project_id: Optional[str] = None
+    paperclip_goal_id: Optional[str] = None
+    plan_version: int = 0
+    approved_plan_revision_id: Optional[str] = None
 
 
 @dataclass(frozen=True)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -26,6 +27,12 @@ from .models import ACTION_SOURCES, ApprovalRecord, OperatorError, RequestClassi
 from .notion import NotionAdapter, NotionTask
 from .storage import Database
 
+_RUNTIME_FOLLOWUP_INCIDENT = "incident_remediation"
+_RUNTIME_FOLLOWUP_ACTIONABLE = "actionable_followup"
+_RUNTIME_FOLLOWUP_KINDS = frozenset(
+    {_RUNTIME_FOLLOWUP_INCIDENT, _RUNTIME_FOLLOWUP_ACTIONABLE}
+)
+
 
 class AgenticOSService:
     def __init__(self, paths: Paths, config: Optional[AppConfig] = None) -> None:
@@ -35,6 +42,18 @@ class AgenticOSService:
         self.audit = AuditLog(paths.audit_log_path)
         self.artifacts = ArtifactStore(paths.artifacts_dir)
         self._notion_adapter: Optional[NotionAdapter] = None
+        self._cp_cache: Any = None
+        self._cp_initialized: bool = False
+
+    @property
+    def _cp(self) -> Any:
+        """Lazy TaskControlPlane — None when Paperclip is not configured."""
+        if not self._cp_initialized:
+            if self.config.paperclip is not None:
+                from .task_control_plane import TaskControlPlane
+                self._cp_cache = TaskControlPlane(self.config.paperclip)
+            self._cp_initialized = True
+        return self._cp_cache
 
     def initialize(self) -> None:
         self.db.initialize()
@@ -68,8 +87,13 @@ class AgenticOSService:
         result_summary: Optional[str] = None,
         external_ref: Optional[str] = None,
         action_source: str = "manual",
+        adopt_paperclip_issue_id: Optional[str] = None,
+        adopt_paperclip_routine_id: Optional[str] = None,
+        adopt_paperclip_routine_run_id: Optional[str] = None,
+        adopt_paperclip_origin_kind: Optional[str] = None,
     ) -> dict[str, Any]:
         validate_choice(action_source, ACTION_SOURCES, "action_source")
+        effective_metadata: dict[str, Any] = dict(request_metadata) if request_metadata else {}
         if operation_key is not None:
             existing_tasks = self.db.list_tasks_by_operation_key(operation_key)
             if existing_tasks:
@@ -83,9 +107,38 @@ class AgenticOSService:
             external_write=external_write,
             action_source=action_source,
         )
-        if policy_decision == "approval_required" and not operation_key:
+
+        from .plan_gate import classify_task_mode
+        task_mode = classify_task_mode(
+            classification.domain, classification.intent_type, classification.risk_level
+        )
+        # Runtime follow-up tasks can force explicit approval by bypassing plan_first.
+        if bool(effective_metadata.get("require_explicit_approval")):
+            task_mode = "direct"
+
+        # plan_first tasks bypass the approval_required operation_key requirement —
+        # the plan gate is the gating mechanism instead
+        if policy_decision == "approval_required" and not operation_key and task_mode != "plan_first":
             raise ValueError("approval_required requests must include an operation_key")
-        task_status, approval_state = self._task_state_for_policy(policy_decision)
+
+        if task_mode == "plan_first":
+            # Plan gate supersedes the policy-based status: task starts in planning
+            task_status = "planning"
+            approval_state = "not_needed"
+        else:
+            task_status, approval_state = self._task_state_for_policy(policy_decision)
+
+        # Ensure the intake classifier's agent selection is stored in request_metadata
+        # so that resolve_executor_key() can route codex tasks to executor_codex.
+        if "agent" not in effective_metadata:
+            try:
+                from .dispatcher import Dispatcher as _Dispatcher
+                _dispatcher = _Dispatcher()
+                _, resolved_agent = _dispatcher.resolve_routing(classification)
+                effective_metadata["agent"] = resolved_agent
+            except Exception:
+                pass
+
         task = self.db.create_task(
             classification=RequestClassification(
                 domain=classification.domain,
@@ -98,7 +151,7 @@ class AgenticOSService:
             result_summary=result_summary,
             external_ref=external_ref,
             target=target,
-            request_metadata_json=self._dump_json_or_none(request_metadata),
+            request_metadata_json=self._dump_json_or_none(effective_metadata) if effective_metadata else None,
             operation_key=operation_key,
             external_write=external_write,
             policy_decision=policy_decision,
@@ -117,6 +170,79 @@ class AgenticOSService:
             },
         )
 
+        # Persist task_mode (plan_first or direct)
+        if task_mode != "direct":
+            task = self.db.update_task(task.id, task_mode=task_mode)
+            self._append_event(
+                task_id=task.id,
+                event_type="task_mode_set",
+                payload={"task_mode": task_mode},
+            )
+
+        # Paperclip projection (phase 1) — failure must never block task creation
+        cp = self._cp
+        if cp is not None:
+            if adopt_paperclip_issue_id:
+                # Adopt an existing Paperclip issue (task was created there manually)
+                try:
+                    assignee_key = cp.resolve_assignee_for_task(task)
+                    issue = cp.adopt_issue(
+                        adopt_paperclip_issue_id,
+                        task,
+                        assignee_key=assignee_key,
+                    )
+                    task = self.db.update_task(
+                        task.id,
+                        paperclip_issue_id=adopt_paperclip_issue_id,
+                        paperclip_routine_id=adopt_paperclip_routine_id,
+                        paperclip_routine_run_id=adopt_paperclip_routine_run_id,
+                        paperclip_origin_kind=adopt_paperclip_origin_kind,
+                        paperclip_project_id=(issue.project_id if issue else None),
+                        paperclip_goal_id=(issue.goal_id if issue else None),
+                        paperclip_assignee_agent_id=(issue.assignee_id if issue else None),
+                    )
+                    self._append_event(
+                        task_id=task.id,
+                        event_type="paperclip_issue_imported",
+                        payload={"issue_id": adopt_paperclip_issue_id, "assignee_key": assignee_key},
+                    )
+                except Exception as _pc_exc:
+                    self._append_event(
+                        task_id=task.id,
+                        event_type="paperclip_sync_failed",
+                        payload={"error": str(_pc_exc), "phase": "adopt"},
+                    )
+            else:
+                try:
+                    assignee_key = cp.resolve_assignee_for_task(task)
+                    issue = cp.create_issue(task, assignee_key=assignee_key)
+                    if issue and issue.id:
+                        task = self.db.update_task(
+                            task.id,
+                            paperclip_issue_id=issue.id,
+                            paperclip_origin_kind="manual_issue",
+                            paperclip_project_id=issue.project_id or None,
+                            paperclip_goal_id=issue.goal_id or None,
+                            paperclip_assignee_agent_id=issue.assignee_id or None,
+                        )
+                        self._append_event(
+                            task_id=task.id,
+                            event_type="paperclip_issue_created",
+                            payload={"issue_id": issue.id, "assignee_key": assignee_key},
+                        )
+                    else:
+                        self._append_event(
+                            task_id=task.id,
+                            event_type="paperclip_projection_failed",
+                            payload={"error": "create_issue returned None — check server logs"},
+                        )
+                except Exception as _pc_exc:
+                    self._append_event(
+                        task_id=task.id,
+                        event_type="paperclip_projection_failed",
+                        payload={"error": str(_pc_exc)},
+                    )
+
         artifact = None
         if artifact_content is not None:
             artifact = self._create_artifact(
@@ -128,14 +254,66 @@ class AgenticOSService:
             task = self.db.update_task(task.id, artifact_ref=artifact.id)
 
         approval = None
-        if policy_decision == "approval_required":
+        if policy_decision == "approval_required" and task_mode != "plan_first":
             approval = self._create_approval_for_task(task=task, artifact=artifact)
 
         return {
             "task": task,
             "policy_decision": policy_decision,
             "approval": approval,
+            "task_mode": task_mode,
         }
+
+    def import_paperclip_issue(
+        self,
+        *,
+        issue_id: str,
+        title: str,
+        description: str,
+        project_id: Optional[str] = None,
+        routine_id: Optional[str] = None,
+        routine_run_id: Optional[str] = None,
+        origin_kind: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        Import a manually-created Paperclip issue as an agentic-os task.
+
+        Called by the reconciler when it detects a new issue with no matching
+        backend task.  Infers domain from project_id, classifies with
+        sensible defaults, then calls create_request() with
+        adopt_paperclip_issue_id so the existing issue is adopted rather
+        than a new one created.
+
+        Returns the same dict as create_request(): {task, policy_decision, ...}
+        """
+        # Infer domain from project_id
+        domain = "system"  # safe default
+        if project_id and self.config.paperclip is not None:
+            reverse_map = {v: k for k, v in self.config.paperclip.project_map.items()}
+            domain = reverse_map.get(project_id, "system")
+
+        user_request = title
+        if description and description.strip() and description.strip() != title.strip():
+            user_request = f"{title}\n\n{description}"
+
+        classification = RequestClassification(
+            domain=domain,
+            intent_type="execute",
+            risk_level="medium",
+            status="new",
+            approval_state="not_needed",
+        )
+
+        return self.create_request(
+            user_request=user_request,
+            classification=classification,
+            action_source="paperclip_manual",
+            operation_key=f"paperclip_import:{issue_id}",
+            adopt_paperclip_issue_id=issue_id,
+            adopt_paperclip_routine_id=routine_id,
+            adopt_paperclip_routine_run_id=routine_run_id,
+            adopt_paperclip_origin_kind=origin_kind,
+        )
 
     def record_openclaw_read(
         self,
@@ -301,6 +479,139 @@ class AgenticOSService:
     def trace_task(self, task_id: str) -> dict[str, Any]:
         return self.get_task_detail(task_id)
 
+    def create_runtime_followup_task(
+        self,
+        *,
+        summary: str,
+        kind: str = _RUNTIME_FOLLOWUP_ACTIONABLE,
+        details: Optional[str] = None,
+        origin_task_id: Optional[str] = None,
+        origin_session_key: Optional[str] = None,
+        runtime_id: Optional[str] = None,
+        component: Optional[str] = None,
+        error_type: Optional[str] = None,
+        error_message: Optional[str] = None,
+        risk_level: str = "medium",
+        assignee_key: Optional[str] = None,
+        dedupe_key: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        Create a runtime-originated follow-up task.
+
+        Supported kinds:
+          - incident_remediation  (self-healing runtime failures)
+          - actionable_followup   (general follow-up work from runtime context)
+        """
+        if kind not in _RUNTIME_FOLLOWUP_KINDS:
+            raise ValueError(
+                f"unsupported follow-up kind: {kind!r}; expected one of: "
+                f"{', '.join(sorted(_RUNTIME_FOLLOWUP_KINDS))}"
+            )
+
+        if risk_level not in {"low", "medium", "high"}:
+            raise ValueError("risk_level must be one of: low, medium, high")
+
+        op_token = dedupe_key or uuid4().hex
+        operation_key = f"runtime_followup:{kind}:{op_token}"
+        existing = self.db.list_tasks_by_operation_key(operation_key)
+        if existing:
+            return {
+                "task": existing[0],
+                "policy_decision": existing[0].policy_decision,
+                "approval": None,
+                "task_mode": existing[0].task_mode,
+                "deduplicated": True,
+            }
+
+        classification = RequestClassification(
+            domain="system",
+            intent_type="execute",
+            risk_level=risk_level,
+        ).validate()
+
+        metadata: dict[str, Any] = {
+            "task_kind": kind,
+            "origin_task_id": origin_task_id,
+            "origin_session_key": origin_session_key,
+            "runtime_id": runtime_id,
+            "component": component,
+            "error_type": error_type,
+            "error_message": error_message,
+        }
+        if assignee_key:
+            metadata["assignee_key"] = assignee_key
+        if risk_level == "high":
+            # High-risk runtime remediation must still require explicit operator approval.
+            metadata["require_explicit_approval"] = True
+
+        request_lines = [
+            f"Runtime follow-up ({kind})",
+            "",
+            f"Summary: {summary.strip()}",
+        ]
+        if details and details.strip():
+            request_lines.extend(["", "Details:", details.strip()])
+        if origin_task_id:
+            request_lines.append(f"\nOrigin task: {origin_task_id}")
+        if origin_session_key:
+            request_lines.append(f"Origin session: {origin_session_key}")
+        if runtime_id:
+            request_lines.append(f"Runtime: {runtime_id}")
+        if component:
+            request_lines.append(f"Component: {component}")
+        if error_type:
+            request_lines.append(f"Error type: {error_type}")
+        if error_message:
+            request_lines.append(f"Error message: {error_message}")
+
+        payload = self.create_request(
+            user_request="\n".join(request_lines).strip(),
+            classification=classification,
+            target="runtime_followup_task",
+            request_metadata=metadata,
+            operation_key=operation_key,
+            action_source="openclaw_skill",
+        )
+        payload["deduplicated"] = False
+        return payload
+
+    def create_runtime_incident_task(
+        self,
+        *,
+        summary: str,
+        origin_task_id: Optional[str] = None,
+        origin_session_key: Optional[str] = None,
+        runtime_id: Optional[str] = None,
+        component: Optional[str] = None,
+        error_type: Optional[str] = None,
+        error_message: Optional[str] = None,
+        details: Optional[str] = None,
+    ) -> dict[str, Any]:
+        dedupe_source = "|".join(
+            [
+                origin_task_id or "",
+                origin_session_key or "",
+                runtime_id or "",
+                component or "",
+                error_type or "",
+                error_message or "",
+            ]
+        )
+        dedupe_key = hashlib.sha1(dedupe_source.encode("utf-8")).hexdigest()[:16]
+        return self.create_runtime_followup_task(
+            summary=summary,
+            kind=_RUNTIME_FOLLOWUP_INCIDENT,
+            details=details,
+            origin_task_id=origin_task_id,
+            origin_session_key=origin_session_key,
+            runtime_id=runtime_id,
+            component=component,
+            error_type=error_type,
+            error_message=error_message,
+            risk_level="medium",
+            dedupe_key=dedupe_key,
+        )
+
     def list_tasks(
         self,
         *,
@@ -333,6 +644,20 @@ class AgenticOSService:
                 event_type="task_picked_up",
                 payload={"task_id": task_id, "claimed_by": claimed_by},
             )
+            cp = self._cp
+            if cp is not None:
+                try:
+                    task = self.db.get_task(task_id)
+                    if task.paperclip_issue_id:
+                        # plan_first tasks move to 'executing'; direct tasks to 'in_progress'
+                        backend_status = "executing" if task.task_mode == "plan_first" else "in_progress"
+                        cp.update_issue_status(task.paperclip_issue_id, backend_status)
+                except Exception as _pc_exc:
+                    self._append_event(
+                        task_id=task_id,
+                        event_type="paperclip_sync_failed",
+                        payload={"error": str(_pc_exc), "op": "pickup"},
+                    )
         return result
 
     def mark_dispatched(self, task_id: str, *, session_key: str, agent: str) -> None:
@@ -352,6 +677,19 @@ class AgenticOSService:
             event_type="spawn_failed",
             payload={"task_id": task_id, "reason": reason},
         )
+        if not self._is_runtime_followup_task(task):
+            try:
+                self.create_runtime_incident_task(
+                    summary="Agent spawn failed for runtime task",
+                    origin_task_id=task_id,
+                    origin_session_key=task.dispatch_session_key,
+                    runtime_id=task.claimed_by,
+                    component="runtime_spawn",
+                    error_type="spawn_failed",
+                    error_message=reason,
+                )
+            except Exception:
+                pass
         return task
 
     def requeue_task(self, task_id: str) -> TaskRecord:
@@ -371,6 +709,214 @@ class AgenticOSService:
             payload={"task_id": task_id, "from_status": task.status, "to_status": target_status},
         )
         return self.db.get_task(task_id)
+
+    # ── Plan gate (phase 2) ───────────────────────────────────────────────────
+
+    def submit_plan(
+        self,
+        task_id: str,
+        plan_text: str,
+        *,
+        version: Optional[int] = None,
+    ) -> TaskRecord:
+        """
+        Submit a plan for an operator review.
+
+        Transitions: planning → awaiting_plan_review
+        Writes plan to local artifact store + Paperclip document.
+        Paperclip issue moves to in_review, assigned to chief_of_staff.
+        """
+        task = self.db.get_task(task_id)
+        if task.task_mode != "plan_first":
+            raise ValueError(f"task {task_id} is not in plan_first mode (mode={task.task_mode})")
+        if task.status != "planning":
+            raise ValueError(
+                f"task {task_id} must be in 'planning' status to submit a plan (status={task.status})"
+            )
+
+        plan_version = version if version is not None else (task.plan_version or 0) + 1
+
+        # Store plan as a local artifact
+        artifact = self._create_artifact(
+            task_id=task_id,
+            artifact_type="plan_document",
+            artifact_content={"plan_text": plan_text, "version": plan_version},
+            event_type="plan_submitted",
+        )
+
+        # Advance task status
+        task = self.db.update_task(
+            task_id,
+            status="awaiting_plan_review",
+            plan_version=plan_version,
+        )
+        self._append_event(
+            task_id=task_id,
+            event_type="plan_awaiting_review",
+            payload={"plan_version": plan_version, "artifact_id": artifact.id},
+        )
+
+        # Paperclip: write plan doc, move to in_review, assign to project_manager for review.
+        # The PM is the plan reviewer — not the author.  CoS is not involved at this step.
+        cp = self._cp
+        if cp is not None:
+            try:
+                if task.paperclip_issue_id:
+                    cp.write_plan_doc(task.paperclip_issue_id, plan_text, version=plan_version)
+                    cp.update_issue_status(
+                        task.paperclip_issue_id,
+                        "awaiting_plan_review",
+                        assignee_key="project_manager",
+                    )
+            except Exception as _pc_exc:
+                self._append_event(
+                    task_id=task_id,
+                    event_type="paperclip_sync_failed",
+                    payload={"error": str(_pc_exc), "op": "submit_plan"},
+                )
+
+        return task
+
+    def approve_plan(
+        self,
+        task_id: str,
+        *,
+        revision_id: str,
+    ) -> TaskRecord:
+        """
+        Approve a submitted plan.
+
+        Transitions: awaiting_plan_review → approved_for_execution
+        Stores approved_plan_revision_id — execution is now unblocked.
+        Paperclip: status → todo, assignee → engineer.
+        """
+        task = self.db.get_task(task_id)
+        if task.task_mode != "plan_first":
+            raise ValueError(f"task {task_id} is not in plan_first mode")
+        if task.status != "awaiting_plan_review":
+            raise ValueError(
+                f"task {task_id} must be in 'awaiting_plan_review' to approve (status={task.status})"
+            )
+
+        task = self.db.update_task(
+            task_id,
+            status="approved_for_execution",
+            approved_plan_revision_id=revision_id,
+        )
+        self._append_event(
+            task_id=task_id,
+            event_type="plan_approved",
+            payload={"revision_id": revision_id},
+        )
+
+        cp = self._cp
+        if cp is not None:
+            try:
+                if task.paperclip_issue_id:
+                    # Reassign to the execution agent who wrote the plan — they now execute it.
+                    executor_key = cp.resolve_executor_key(task)
+                    cp.update_issue_status(
+                        task.paperclip_issue_id,
+                        "approved_for_execution",
+                        assignee_key=executor_key,
+                    )
+                    cp.add_comment(
+                        task.paperclip_issue_id,
+                        f"Plan approved (revision {revision_id}). Ready for execution.",
+                    )
+            except Exception as _pc_exc:
+                self._append_event(
+                    task_id=task_id,
+                    event_type="paperclip_sync_failed",
+                    payload={"error": str(_pc_exc), "op": "approve_plan"},
+                )
+
+        return task
+
+    def reject_plan(
+        self,
+        task_id: str,
+        *,
+        feedback: str,
+    ) -> TaskRecord:
+        """
+        Reject a submitted plan and send it back for revision.
+
+        Transitions: awaiting_plan_review → planning
+        Paperclip: comment with feedback, status back to in_progress.
+        """
+        task = self.db.get_task(task_id)
+        if task.task_mode != "plan_first":
+            raise ValueError(f"task {task_id} is not in plan_first mode")
+        if task.status != "awaiting_plan_review":
+            raise ValueError(
+                f"task {task_id} must be in 'awaiting_plan_review' to reject (status={task.status})"
+            )
+
+        task = self.db.update_task(task_id, status="planning")
+        self._append_event(
+            task_id=task_id,
+            event_type="plan_rejected",
+            payload={"feedback": feedback},
+        )
+
+        cp = self._cp
+        if cp is not None:
+            try:
+                if task.paperclip_issue_id:
+                    cp.update_issue_status(task.paperclip_issue_id, "planning")
+                    cp.add_comment(
+                        task.paperclip_issue_id,
+                        f"REVISE: {feedback}",
+                    )
+            except Exception as _pc_exc:
+                self._append_event(
+                    task_id=task_id,
+                    event_type="paperclip_sync_failed",
+                    payload={"error": str(_pc_exc), "op": "reject_plan"},
+                )
+
+        return task
+
+    def cancel_task(self, task_id: str, *, reason: str = "Cancelled by operator") -> TaskRecord:
+        """
+        Cancel a task directly by task_id (no approval record required).
+
+        Used by the Paperclip reconciler when an operator sets a task to
+        'cancelled' in Paperclip.  Does NOT write back to Paperclip — the
+        signal originated there, so we only update backend state.
+
+        No-ops if task is already in a terminal state.
+        """
+        task = self.db.get_task(task_id)
+        if task.status in {"cancelled", "completed", "failed"}:
+            return task
+        task = self.db.update_task(task_id, status="cancelled", result_summary=reason)
+        self._append_event(
+            task_id=task_id,
+            event_type="task_cancelled",
+            payload={"reason": reason, "source": "paperclip_reconciler"},
+        )
+        return task
+
+    def set_task_mode(self, task_id: str, *, mode: str) -> TaskRecord:
+        """
+        Set the task_mode field for a task.
+
+        Valid modes: 'plan_first', 'direct'.
+        Intended for operator use via the dashboard or API to override
+        the mode assigned at creation time.
+        """
+        if mode not in {"plan_first", "direct"}:
+            raise ValueError(f"invalid task_mode: {mode!r} — must be 'plan_first' or 'direct'")
+        self.db.get_task(task_id)  # raises KeyError if not found
+        task = self.db.update_task(task_id, task_mode=mode)
+        self._append_event(
+            task_id=task_id,
+            event_type="task_mode_set",
+            payload={"task_mode": mode, "source": "operator"},
+        )
+        return task
 
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -938,6 +1484,18 @@ class AgenticOSService:
             event_type="task_cancelled",
             payload={"reason": task.result_summary or "Approval denied."},
         )
+        cp = self._cp
+        if cp is not None:
+            try:
+                if task.paperclip_issue_id:
+                    cp.update_issue_status(task.paperclip_issue_id, "cancelled")
+                    cp.add_comment(task.paperclip_issue_id, f"Cancelled: {task.result_summary or 'Approval denied.'}")
+            except Exception as _pc_exc:
+                self._append_event(
+                    task_id=task.id,
+                    event_type="paperclip_sync_failed",
+                    payload={"error": str(_pc_exc), "op": "deny"},
+                )
         return {"task": task, "approval": approval}
 
     def cancel(self, approval_id: str, decision_note: Optional[str] = None) -> dict[str, Any]:
@@ -964,6 +1522,18 @@ class AgenticOSService:
             event_type="task_cancelled",
             payload={"reason": task.result_summary or "Approval cancelled."},
         )
+        cp = self._cp
+        if cp is not None:
+            try:
+                if task.paperclip_issue_id:
+                    cp.update_issue_status(task.paperclip_issue_id, "cancelled")
+                    cp.add_comment(task.paperclip_issue_id, f"Cancelled: {task.result_summary or 'Approval cancelled.'}")
+            except Exception as _pc_exc:
+                self._append_event(
+                    task_id=task.id,
+                    event_type="paperclip_sync_failed",
+                    payload={"error": str(_pc_exc), "op": "cancel"},
+                )
         return {"task": task, "approval": approval}
 
     def execute_action(
@@ -1450,8 +2020,22 @@ class AgenticOSService:
             "notion_task": self._serialize_notion_task(notion_task),
         }
 
-    def complete_task(self, task_id: str, result_summary: str = "", *, artifact_ref: Optional[str] = None) -> TaskRecord:
-        """Mark task as executed with result summary and optional artifact reference."""
+    def complete_task(
+        self,
+        task_id: str,
+        result_summary: str = "",
+        *,
+        artifact_ref: Optional[str] = None,
+        paperclip_content: Optional[str] = None,
+        artifact_path: Optional[str] = None,
+    ) -> TaskRecord:
+        """
+        Mark task as executed with result summary and optional artifact reference.
+
+        paperclip_content: full result text for Paperclip writeback (uses long-doc path
+            when len > LONG_RESULT_THRESHOLD). Defaults to result_summary when not provided.
+        artifact_path: filesystem path to the result artifact for Paperclip attachment upload.
+        """
         task = self.db.get_task(task_id)
         if task.status in {"completed", "cancelled"}:
             self._record_task_operation_rejection(
@@ -1475,22 +2059,31 @@ class AgenticOSService:
             payload={"result_summary": result_summary, "artifact_ref": artifact_ref},
         )
 
-        # Full Notion writeback when task has an external Notion page
-        if task.external_ref:
+        # Paperclip writeback — status + rich result (doc/comment/artifact)
+        cp = self._cp
+        if cp is not None:
             try:
-                from .notion_result_writer import write_success
-                write_success(
-                    page_id=task.external_ref,
-                    task=task,
-                    result_summary=result_summary,
-                    config=self.config,
-                    artifact_id=artifact_ref,
-                )
-            except Exception as exc:
+                if task.paperclip_issue_id:
+                    executor_key = cp.resolve_executor_key(task)
+                    cp.update_issue_status(
+                        task.paperclip_issue_id,
+                        task.status,
+                        assignee_key=executor_key,
+                    )
+                    pc_text = paperclip_content or result_summary
+                    if pc_text:
+                        from pathlib import Path as _Path
+                        cp.write_result(
+                            task.paperclip_issue_id,
+                            pc_text,
+                            task_id=task_id,
+                            artifact_path=_Path(artifact_path) if artifact_path else None,
+                        )
+            except Exception as _pc_exc:
                 self._append_event(
                     task_id=task_id,
-                    event_type="notion_update_failed",
-                    payload={"error": str(exc)},
+                    event_type="paperclip_sync_failed",
+                    payload={"error": str(_pc_exc), "op": "complete"},
                 )
 
         # Send completion notification
@@ -1516,16 +2109,18 @@ class AgenticOSService:
         task = self.db.update_task(task_id, status="failed", result_summary=reason)
         self._append_event(task_id=task.id, event_type="task_failed", payload={"reason": reason})
 
-        # Update Notion status → Blocked (if task has an external Notion page)
-        if task.external_ref:
+        # Paperclip writeback — status + failure comment
+        cp = self._cp
+        if cp is not None:
             try:
-                from .notion_result_writer import write_failure
-                write_failure(task.external_ref, reason, config=self.config)
-            except Exception as exc:
+                if task.paperclip_issue_id:
+                    cp.update_issue_status(task.paperclip_issue_id, "failed")
+                    cp.post_failure_comment(task.paperclip_issue_id, reason[:500])
+            except Exception as _pc_exc:
                 self._append_event(
                     task_id=task_id,
-                    event_type="notion_update_failed",
-                    payload={"error": str(exc)},
+                    event_type="paperclip_sync_failed",
+                    payload={"error": str(_pc_exc), "op": "fail"},
                 )
 
         # Send Discord notification
@@ -1707,6 +2302,22 @@ class AgenticOSService:
         if payload is None:
             return None
         return json.dumps(payload, sort_keys=True)
+
+    @staticmethod
+    def _request_metadata_dict(task: TaskRecord) -> dict[str, Any]:
+        if not task.request_metadata_json:
+            return {}
+        try:
+            payload = json.loads(task.request_metadata_json)
+            if isinstance(payload, dict):
+                return payload
+        except Exception:
+            pass
+        return {}
+
+    def _is_runtime_followup_task(self, task: TaskRecord) -> bool:
+        metadata = self._request_metadata_dict(task)
+        return str(metadata.get("task_kind", "")).strip() in _RUNTIME_FOLLOWUP_KINDS
 
     @staticmethod
     def _load_json_or_none(payload: Optional[str]) -> Optional[dict[str, Any]]:

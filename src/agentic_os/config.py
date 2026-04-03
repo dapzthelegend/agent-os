@@ -7,6 +7,10 @@ from pathlib import Path
 from typing import Any, Optional
 
 
+class ConfigurationError(ValueError):
+    """Raised when a required configuration block is present but incomplete."""
+
+
 @dataclass(frozen=True)
 class Paths:
     root: Path
@@ -70,9 +74,22 @@ class NotionConfig:
 
 
 @dataclass(frozen=True)
+class PaperclipConfig:
+    base_url: str
+    auth_mode: str  # "trusted" or "api_key"
+    company_id: str
+    goal_id: str
+    project_map: dict[str, str]
+    agent_map: dict[str, str]
+    reconcile_poll_interval_seconds: int = 120
+    reconcile_activity_lookback_seconds: int = 300
+
+
+@dataclass(frozen=True)
 class AppConfig:
     notion: Optional[NotionConfig] = None
     notion_databases: dict[str, NotionConfig] = field(default_factory=dict)
+    paperclip: Optional[PaperclipConfig] = None
     agent_override: Optional[str] = None   # primary model for all cron-dispatched tasks
     agent_fallback: Optional[str] = None   # fallback if primary model is unavailable
     stall_thresholds: dict[str, float] = field(default_factory=dict)  # per-domain stall hours
@@ -161,9 +178,15 @@ def load_app_config(paths: Paths) -> AppConfig:
             except (TypeError, ValueError):
                 pass
 
+    paperclip_payload = payload.get("paperclip")
+    paperclip_config: Optional[PaperclipConfig] = None
+    if paperclip_payload is not None:
+        paperclip_config = _parse_paperclip_config(paperclip_payload)
+
     return AppConfig(
         notion=main_notion_config,
         notion_databases=notion_databases,
+        paperclip=paperclip_config,
         agent_override=payload.get("agentOverride") or None,
         agent_fallback=payload.get("agentFallback") or None,
         stall_thresholds=stall_thresholds,
@@ -218,6 +241,51 @@ def _parse_notion_config(payload: dict[str, Any]) -> NotionConfig:
         status_map={str(key): str(value) for key, value in status_map.items()},
         api_base_url=str(payload.get("apiBaseUrl", "https://api.notion.com/v1")),
         notion_version=str(payload.get("notionVersion", "2022-06-28")),
+    )
+
+
+def _parse_paperclip_config(payload: dict[str, Any]) -> PaperclipConfig:
+    """Parse and validate the paperclip config block."""
+    company_id = str(payload.get("company_id", "")).strip()
+    goal_id = str(payload.get("goal_id", "")).strip()
+    project_map = payload.get("project_map", {})
+    agent_map = payload.get("agent_map", {})
+
+    if not isinstance(project_map, dict):
+        raise ConfigurationError("paperclip.project_map must be an object")
+    if not isinstance(agent_map, dict):
+        raise ConfigurationError("paperclip.agent_map must be an object")
+
+    missing: list[str] = []
+    if not company_id:
+        missing.append("company_id")
+    if not goal_id:
+        missing.append("goal_id")
+    for key in ("personal", "technical", "finance", "system"):
+        if not str(project_map.get(key, "")).strip():
+            missing.append(f"project_map.{key}")
+    for key in (
+        "chief_of_staff", "project_manager", "engineering_manager",
+        "engineer", "infrastructure_engineer", "executor_codex",
+        "content_writer", "accountant", "executive_assistant",
+    ):
+        if not str(agent_map.get(key, "")).strip():
+            missing.append(f"agent_map.{key}")
+
+    if missing:
+        raise ConfigurationError(
+            f"Paperclip config is enabled but missing required fields: {', '.join(missing)}"
+        )
+
+    return PaperclipConfig(
+        base_url=str(payload.get("base_url", "http://localhost:3100/api")).rstrip("/"),
+        auth_mode=str(payload.get("auth_mode", "trusted")),
+        company_id=company_id,
+        goal_id=goal_id,
+        project_map={str(k): str(v) for k, v in project_map.items()},
+        agent_map={str(k): str(v) for k, v in agent_map.items()},
+        reconcile_poll_interval_seconds=int(payload.get("reconcile_poll_interval_seconds", 120)),
+        reconcile_activity_lookback_seconds=int(payload.get("reconcile_activity_lookback_seconds", 300)),
     )
 
 
