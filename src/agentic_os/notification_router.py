@@ -1,8 +1,8 @@
 """
-Smart notification router — priority chain: Discord DM → Gmail → stderr.
+Smart notification router — priority chain: Discord DM → stderr.
 
 Routing rules:
-  approval_requested  → Discord DM + Gmail fallback (email always sent for approvals)
+  approval_requested  → Discord DM only (no email)
   task_completed      → Discord DM only (no email)
   task_failed         → Discord DM only (no email)
   overdue_task        → Discord DM only (no email)
@@ -11,7 +11,6 @@ Routing rules:
 Environment variables (read at call time, not import time):
   DISCORD_BOT_TOKEN   — Bot token for Discord REST API
   DISCORD_USER_ID     — Target user's snowflake ID for DM delivery
-  GOOGLE_CREDENTIALS_PATH — Path to gog.json (OAuth2 web client credentials)
 """
 from __future__ import annotations
 
@@ -30,6 +29,10 @@ from .models import ApprovalRecord, TaskRecord
 DISCORD_BOT_TOKEN_ENV = "DISCORD_BOT_TOKEN"
 DISCORD_USER_ID_ENV = "DISCORD_USER_ID"
 DISCORD_API_BASE = "https://discord.com/api/v10"
+# Discord's API is behind Cloudflare, which blocks Python's default urllib UA with 403.
+# All requests must identify as a Discord bot per the API docs.
+DISCORD_USER_AGENT = "DiscordBot (https://github.com/agentic-os, 1.0)"
+DISCORD_OVERDUE_PUSH_ENABLED_ENV = "DISCORD_OVERDUE_PUSH_ENABLED"
 
 APPROVAL_REMINDER_THRESHOLD_HOURS = 1.0
 OVERDUE_THRESHOLD_HOURS = 48.0
@@ -41,7 +44,7 @@ OVERDUE_THRESHOLD_HOURS = 48.0
 
 @dataclass(frozen=True)
 class NotificationResult:
-    channel: str          # discord | gmail | stderr
+    channel: str          # discord | stderr
     success: bool
     message: str
     error: Optional[str] = None
@@ -56,13 +59,26 @@ def route_approval_requested(
     approval: ApprovalRecord,
 ) -> NotificationResult:
     """
-    Send approval request notification.
+    Send approval request notification via Discord DM with interactive buttons.
 
-    Priority: Discord DM → Gmail fallback.
-    Message includes task summary, approval_id, and plain-text approve/deny
-    instructions for email reply or Discord reaction.
+    If DISCORD_APPLICATION_ID is set (i.e. the Interactions endpoint is live)
+    the DM is sent as a rich embed with Approve/Deny/Open buttons. Otherwise
+    falls back to plain text with APPROVE/DENY instructions for the poller.
     """
     title = _task_title(task)
+
+    # Prefer the buttoned payload when the Interactions endpoint is configured.
+    if os.environ.get("DISCORD_APPLICATION_ID"):
+        from .discord_interactions import approval_request_payload
+
+        payload = approval_request_payload(task=task, approval=approval)
+        fallback_text = (
+            f"⏳ Approval required: {title}\n"
+            f"Task `{task.id}` · Approval `{approval.id}`"
+        )
+        return _send_discord_payload(payload, fallback_text=fallback_text)
+
+    # Legacy text fallback (APPROVE/DENY poller path)
     lines = [
         f"⏳ **Approval required**: {title}",
         f"Task ID: `{task.id}`",
@@ -73,8 +89,7 @@ def route_approval_requested(
         f"To deny: reply **DENY {approval.id}** or **DENY {approval.id} <reason>** in this chat",
     ]
     message = "\n".join(lines)
-    subject = f"[Agent] Approval required: {title}"
-    return _send_with_fallback(message, subject=subject)
+    return _send_discord_only(message)
 
 
 def route_task_completed(
@@ -115,6 +130,18 @@ def route_overdue_task(
     hours_overdue: float,
 ) -> NotificationResult:
     """Send overdue task alert via Discord DM only (no email)."""
+    if os.environ.get(DISCORD_OVERDUE_PUSH_ENABLED_ENV, "false").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return NotificationResult(
+            channel="disabled",
+            success=False,
+            message="overdue push notifications disabled",
+        )
+
     title = _task_title(task)
     message = (
         f"🕐 **Overdue task** ({hours_overdue:.0f}h no update): {title}\n"
@@ -161,39 +188,93 @@ def _send_discord_only(message: str) -> NotificationResult:
 
 
 def _send_with_fallback(message: str, *, subject: str = "") -> NotificationResult:
-    """Try Discord DM; fall back to Gmail; last resort: stderr. Used for approvals only."""
-    # --- Discord Bot DM ---
+    """Compatibility shim; subject is ignored and delivery stays Discord-only."""
+    del subject
+    return _send_discord_only(message)
+
+
+def _send_discord_payload(
+    payload: dict,
+    *,
+    fallback_text: str,
+) -> NotificationResult:
+    """
+    Send a rich Discord DM with embeds + components.
+
+    payload must be a dict with keys like `embeds` and `components`. On
+    delivery failure, falls back to plain text via `_send_discord_only`.
+    """
     bot_token = os.environ.get(DISCORD_BOT_TOKEN_ENV)
     user_id = os.environ.get(DISCORD_USER_ID_ENV)
-    if bot_token and user_id:
-        ok, err = _send_discord_dm(message, bot_token=bot_token, user_id=user_id)
-        if ok:
-            return NotificationResult(channel="discord", success=True, message=message)
-        # log discord failure but continue to Gmail
-        print(f"[notification_router] Discord DM failed: {err}", file=sys.stderr)
+    if not (bot_token and user_id):
+        return _send_discord_only(fallback_text)
 
-    # --- Gmail fallback ---
-    try:
-        from .gmail_sender import send_email  # lazy import keeps startup fast
-        email_subject = subject or "[Agent] Notification"
-        ok = send_email(
-            to="franchieinc@gmail.com",
-            subject=email_subject,
-            body=_strip_discord_markdown(message),
-        )
-        if ok:
-            return NotificationResult(channel="gmail", success=True, message=message)
-    except Exception as exc:  # noqa: BLE001
-        print(f"[notification_router] Gmail fallback failed: {exc}", file=sys.stderr)
+    channel_id, err = _open_dm_channel(bot_token=bot_token, user_id=user_id)
+    if channel_id is None:
+        print(f"[notification_router] DM open failed: {err}", file=sys.stderr)
+        return _send_discord_only(fallback_text)
 
-    # --- Last resort: stderr ---
-    print(f"[notification_router] {subject}: {message}", file=sys.stderr)
-    return NotificationResult(
-        channel="stderr",
-        success=False,
-        message=message,
-        error="all_channels_failed",
+    body = {"content": fallback_text, **payload}
+    ok, err = _post_channel_message(
+        channel_id, body=body, bot_token=bot_token
     )
+    if ok:
+        return NotificationResult(channel="discord", success=True, message=fallback_text)
+    print(f"[notification_router] rich DM failed: {err}", file=sys.stderr)
+    return _send_discord_only(fallback_text)
+
+
+def _open_dm_channel(
+    *, bot_token: str, user_id: str
+) -> tuple[Optional[str], Optional[str]]:
+    try:
+        req = urllib_request.Request(
+            f"{DISCORD_API_BASE}/users/@me/channels",
+            data=json.dumps({"recipient_id": user_id}).encode(),
+            headers={
+                "Authorization": f"Bot {bot_token}",
+                "Content-Type": "application/json",
+                "User-Agent": DISCORD_USER_AGENT,
+            },
+            method="POST",
+        )
+        with urllib_request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+        cid = data.get("id")
+        if not cid:
+            return None, f"no id in response: {data}"
+        return cid, None
+    except urllib_error.HTTPError as exc:
+        body = exc.read().decode(errors="replace")
+        return None, f"HTTP {exc.code}: {body}"
+    except urllib_error.URLError as exc:
+        return None, str(exc)
+
+
+def _post_channel_message(
+    channel_id: str,
+    *,
+    body: dict,
+    bot_token: str,
+) -> tuple[bool, Optional[str]]:
+    try:
+        req = urllib_request.Request(
+            f"{DISCORD_API_BASE}/channels/{channel_id}/messages",
+            data=json.dumps(body).encode(),
+            headers={
+                "Authorization": f"Bot {bot_token}",
+                "Content-Type": "application/json",
+                "User-Agent": DISCORD_USER_AGENT,
+            },
+            method="POST",
+        )
+        with urllib_request.urlopen(req, timeout=10) as resp:
+            return resp.status in (200, 201), None
+    except urllib_error.HTTPError as exc:
+        err_body = exc.read().decode(errors="replace")
+        return False, f"HTTP {exc.code}: {err_body}"
+    except urllib_error.URLError as exc:
+        return False, str(exc)
 
 
 def _send_discord_dm(
@@ -216,6 +297,7 @@ def _send_discord_dm(
             headers={
                 "Authorization": f"Bot {bot_token}",
                 "Content-Type": "application/json",
+                "User-Agent": DISCORD_USER_AGENT,
             },
             method="POST",
         )
@@ -236,6 +318,7 @@ def _send_discord_dm(
             headers={
                 "Authorization": f"Bot {bot_token}",
                 "Content-Type": "application/json",
+                "User-Agent": DISCORD_USER_AGENT,
             },
             method="POST",
         )
@@ -248,9 +331,6 @@ def _send_discord_dm(
         return False, str(exc)
 
 
-def _strip_discord_markdown(text: str) -> str:
-    """Remove Discord markdown formatting for plain-text email body."""
-    return text.replace("**", "").replace("`", "").replace("__", "")
 
 
 def _task_title(task: TaskRecord) -> str:

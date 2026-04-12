@@ -220,10 +220,7 @@ def health_page(request: Request):
 
 @router.get("/stalled")
 def stalled_page(request: Request):
-    service = get_service()
-    from .recovery import find_stalled_tasks
-    tasks = find_stalled_tasks(service, threshold_hours=2.0)
-    return _render(request, "stalled.html", {"stalled_tasks": tasks, "threshold_hours": 2.0})
+    return _render(request, "stalled.html", {"stalled_tasks": [], "threshold_hours": 2.0})
 
 
 @router.post("/stalled/{task_id}/retry")
@@ -257,13 +254,27 @@ def reject_plan(task_id: str, feedback: str = Form(default="")):
     return _redirect(f"/tasks/{task_id}", message=f"Plan rejected for task {task_id}.")
 
 
+@router.post("/tasks/close-all")
+def close_all_tasks(reason: str = Form(default="Closed by operator")):
+    try:
+        result = get_service().bulk_close_tasks(reason=reason)
+    except Exception as exc:
+        return _redirect("/tasks", error=str(exc))
+    closed_count = result["closed_count"]
+    error_count = result["error_count"]
+    msg = f"Closed {closed_count} task(s)."
+    if error_count:
+        msg += f" {error_count} could not be closed."
+    return _redirect("/tasks", message=msg)
+
+
 @router.post("/tasks/{task_id}/cancel")
 def cancel_task(task_id: str, reason: str = Form(default="Cancelled by operator")):
     try:
-        get_service().cancel_task(task_id, reason=reason)
+        get_service().operator_close_task(task_id, reason=reason)
     except Exception as exc:
         return _redirect(f"/tasks/{task_id}", error=str(exc))
-    return _redirect(f"/tasks/{task_id}", message=f"Task {task_id} cancelled.")
+    return _redirect(f"/tasks/{task_id}", message=f"Task {task_id} closed.")
 
 
 @router.post("/tasks/{task_id}/set-mode")
@@ -292,7 +303,7 @@ def recaps_page(request: Request, domain: Optional[str] = None):
             "domain": domain or "",
             "recap_today": service.recap_today(domain=domain),
             "recap_approvals": service.recap_approvals(domain=domain),
-            "recap_drafts": service.recap_drafts(domain=domain),
+            "recap_awaiting_input": service.recap_awaiting_input(domain=domain),
             "recap_failures": service.recap_failures(domain=domain, limit=10),
             "recap_external_actions": service.recap_external_actions(domain=domain, limit=10),
             "domains": [""] + list(task_filter_options(service)["domains"]),

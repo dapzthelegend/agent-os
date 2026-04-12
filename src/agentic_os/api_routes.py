@@ -3,13 +3,13 @@ from __future__ import annotations
 from dataclasses import asdict
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from .config import default_paths, load_app_config
 from .health import get_system_health
 from .execution_receiver import ExecutionParseError, receive_execution_result
-from .models import OperatorError
+from .models import InvalidTransitionError, OperatorError
 from .web_support import (
     annotate_audit_events,
     approval_groups,
@@ -23,6 +23,19 @@ from .web_support import (
 )
 
 
+# ---------------------------------------------------------------------------
+# Guards — clamp list limits and reject oversized payloads
+# ---------------------------------------------------------------------------
+
+_MAX_LIST_LIMIT = 200
+_MAX_CALLBACK_OUTPUT_BYTES = 2 * 1024 * 1024  # 2 MB
+
+
+def _clamp_limit(limit: int) -> int:
+    """Clamp a caller-supplied list limit to a sane maximum."""
+    return max(1, min(limit, _MAX_LIST_LIMIT))
+
+
 router = APIRouter(prefix="/api", tags=["api"])
 
 
@@ -32,6 +45,7 @@ class RetryTaskPayload(BaseModel):
 
 class ApprovalDecisionPayload(BaseModel):
     note: Optional[str] = None
+    decided_by: Optional[str] = None
 
 
 class ArtifactRevisionPayload(BaseModel):
@@ -67,15 +81,21 @@ class SubmitPlanPayload(BaseModel):
     paperclip_document_id: Optional[str] = None
 
 
+class BulkCloseTasksPayload(BaseModel):
+    reason: str = "Closed by operator"
+
+
 class CreateTaskPayload(BaseModel):
     user_request: str
     domain: str
     intent_type: str
     risk_level: str
+    agent_key: str
     operation_key: Optional[str] = None
     target: Optional[str] = None
     request_metadata: Optional[dict] = None
-    action_source: str = "api"
+    labels: Optional[list[str]] = None
+    action_source: Optional[str] = None
 
 
 @router.get("/health")
@@ -122,10 +142,13 @@ def api_create_task(payload: CreateTaskPayload) -> dict:
         result = get_service().create_request(
             user_request=payload.user_request,
             classification=classification,
+            agent_key=payload.agent_key,
             operation_key=payload.operation_key,
             target=payload.target,
             request_metadata=payload.request_metadata,
+            labels=payload.labels,
             action_source=payload.action_source,
+            default_action_source="api",
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -150,6 +173,7 @@ def api_tasks(
     target: Optional[str] = None,
     action_source: Optional[str] = None,
 ) -> dict:
+    limit = _clamp_limit(limit)
     service = get_service()
     tasks = service.list_tasks(
         limit=limit,
@@ -168,6 +192,20 @@ def api_tasks(
         },
         "tasks": [serialize_task(task) for task in tasks],
     }
+
+
+@router.post("/tasks/close-all")
+def api_bulk_close_tasks(payload: BulkCloseTasksPayload) -> dict:
+    """
+    Close all tasks that are in a closeable state, syncing each cancellation to Paperclip.
+
+    Skips tasks that are already terminal (completed, executed, cancelled) or that
+    cannot transition to cancelled (failed, stalled).
+    """
+    try:
+        return get_service().bulk_close_tasks(reason=payload.reason)
+    except Exception as exc:
+        raise _handle_operator_error(exc) from exc
 
 
 @router.get("/tasks/{task_id}")
@@ -213,6 +251,7 @@ def api_execution_detail(operation_key: str) -> dict:
 
 @router.get("/audit")
 def api_audit(limit: int = 50, domain: Optional[str] = None, target: Optional[str] = None) -> dict:
+    limit = _clamp_limit(limit)
     payload = get_service().list_recent_audit_activity(limit=limit, domain=domain, target=target)
     payload["events"] = annotate_audit_events(payload["events"])
     return payload
@@ -234,19 +273,19 @@ def api_recap_approvals(domain: Optional[str] = None) -> dict:
     return get_service().recap_approvals(domain=domain)
 
 
-@router.get("/recap/drafts")
-def api_recap_drafts(domain: Optional[str] = None) -> dict:
-    return get_service().recap_drafts(domain=domain)
+@router.get("/recap/awaiting-input")
+def api_recap_awaiting_input(domain: Optional[str] = None) -> dict:
+    return get_service().recap_awaiting_input(domain=domain)
 
 
 @router.get("/recap/failures")
 def api_recap_failures(domain: Optional[str] = None, limit: int = 20) -> dict:
-    return get_service().recap_failures(domain=domain, limit=limit)
+    return get_service().recap_failures(domain=domain, limit=_clamp_limit(limit))
 
 
 @router.get("/recap/external-actions")
 def api_recap_external_actions(domain: Optional[str] = None, limit: int = 20) -> dict:
-    return get_service().recap_external_actions(domain=domain, limit=limit)
+    return get_service().recap_external_actions(domain=domain, limit=_clamp_limit(limit))
 
 
 @router.post("/tasks/{task_id}/retry")
@@ -270,6 +309,8 @@ def api_recap_in_progress(domain: Optional[str] = None) -> dict:
 def _handle_operator_error(exc: Exception) -> HTTPException:
     if isinstance(exc, KeyError):
         return HTTPException(status_code=404, detail=str(exc))
+    if isinstance(exc, InvalidTransitionError):
+        return HTTPException(status_code=409, detail={"message": str(exc), "details": exc.details})
     if isinstance(exc, OperatorError):
         return HTTPException(status_code=400, detail={"message": str(exc), "details": exc.details})
     if isinstance(exc, ValueError):
@@ -280,7 +321,11 @@ def _handle_operator_error(exc: Exception) -> HTTPException:
 @router.post("/approvals/{approval_id}/approve")
 def api_approve(approval_id: str, payload: ApprovalDecisionPayload) -> dict:
     try:
-        return get_service().approve(approval_id, decision_note=payload.note)
+        return get_service().approve(
+            approval_id,
+            decision_note=payload.note,
+            decided_by=payload.decided_by or "api",
+        )
     except Exception as exc:
         raise _handle_operator_error(exc) from exc
 
@@ -288,7 +333,11 @@ def api_approve(approval_id: str, payload: ApprovalDecisionPayload) -> dict:
 @router.post("/approvals/{approval_id}/deny")
 def api_deny(approval_id: str, payload: ApprovalDecisionPayload) -> dict:
     try:
-        return get_service().deny(approval_id, decision_note=payload.note)
+        return get_service().deny(
+            approval_id,
+            decision_note=payload.note,
+            decided_by=payload.decided_by or "api",
+        )
     except Exception as exc:
         raise _handle_operator_error(exc) from exc
 
@@ -296,7 +345,11 @@ def api_deny(approval_id: str, payload: ApprovalDecisionPayload) -> dict:
 @router.post("/approvals/{approval_id}/cancel")
 def api_cancel(approval_id: str, payload: ApprovalDecisionPayload) -> dict:
     try:
-        return get_service().cancel(approval_id, decision_note=payload.note)
+        return get_service().cancel(
+            approval_id,
+            decision_note=payload.note,
+            decided_by=payload.decided_by or "api",
+        )
     except Exception as exc:
         raise _handle_operator_error(exc) from exc
 
@@ -313,6 +366,14 @@ def api_execution_callback(payload: ExecutionCallbackPayload) -> dict:
     - Duplicate submission (operation_key dedup): 200 { status: success, idempotent: true }
     - Any internal error: 200 { status: error, reason: ... } — never 5xx
     """
+    if len(payload.output.encode("utf-8", errors="replace")) > _MAX_CALLBACK_OUTPUT_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail={
+                "status": "error",
+                "reason": f"output exceeds maximum size ({_MAX_CALLBACK_OUTPUT_BYTES // (1024*1024)} MB)",
+            },
+        )
     paths = default_paths()
     try:
         result = receive_execution_result(
@@ -418,7 +479,7 @@ def api_reject_plan(task_id: str, payload: RejectPlanPayload) -> dict:
 @router.post("/tasks/{task_id}/cancel")
 def api_cancel_task(task_id: str, payload: CancelTaskPayload) -> dict:
     try:
-        return asdict(get_service().cancel_task(task_id, reason=payload.reason))
+        return asdict(get_service().operator_close_task(task_id, reason=payload.reason))
     except Exception as exc:
         raise _handle_operator_error(exc) from exc
 

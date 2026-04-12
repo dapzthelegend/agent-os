@@ -58,19 +58,6 @@ def _make_reconcile_job(paths: "Paths", config: "AppConfig") -> ScheduledJob:
     )
 
 
-def _make_stall_check_job(paths: "Paths", config: "AppConfig") -> ScheduledJob:
-    def _run():
-        from .service import AgenticOSService
-        return AgenticOSService(paths, config).flag_stalled_tasks()
-
-    return ScheduledJob(
-        name="stall-check",
-        func=_run,
-        next_run_at=_every(3600),
-        run_immediately=False,
-    )
-
-
 def _make_approval_reminder_job(paths: "Paths", config: "AppConfig") -> ScheduledJob:
     def _run():
         from .service import AgenticOSService
@@ -116,6 +103,21 @@ def _make_backup_job(paths: "Paths", config: "AppConfig") -> ScheduledJob:
     )
 
 
+def _make_discord_approval_poll_job(paths: "Paths", config: "AppConfig") -> ScheduledJob:
+    def _run():
+        from .discord_approval_poller import poll_discord_approvals
+        from .service import AgenticOSService
+        service = AgenticOSService(paths, config)
+        return poll_discord_approvals(paths, service)
+
+    return ScheduledJob(
+        name="discord-approval-poll",
+        func=_run,
+        next_run_at=_every(60),
+        run_immediately=True,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -123,10 +125,10 @@ def _make_backup_job(paths: "Paths", config: "AppConfig") -> ScheduledJob:
 def register_all_jobs(scheduler: BackgroundScheduler, paths: "Paths", config: "AppConfig") -> None:
     """Register all agentic-os background jobs with the given scheduler."""
     scheduler.register(_make_reconcile_job(paths, config))
-    scheduler.register(_make_stall_check_job(paths, config))
     scheduler.register(_make_approval_reminder_job(paths, config))
     scheduler.register(_make_health_check_job(paths, config))
     scheduler.register(_make_backup_job(paths, config))
+    scheduler.register(_make_discord_approval_poll_job(paths, config))
     # Daily recap is owned by the Paperclip routine:
     # http://127.0.0.1:3100/FRA/routines/8d3baf2d-4615-4461-aa11-f2886f41237d
 
@@ -150,7 +152,7 @@ def _alert_health(health: dict) -> None:
         detail = "; ".join(problems) or "see /health"
         _send_with_fallback(
             f"agentic-os health check: **{status}** — {detail}",
-            channel_hint="health_alert",
+            subject=f"agentic-os health check: {status}",
         )
     except Exception as exc:
         log.warning("health alert send failed: %s", exc)

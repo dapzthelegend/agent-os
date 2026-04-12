@@ -5,6 +5,12 @@
   <div class="section-header">
     <h1>{{ task.id }}</h1>
     <p>{{ task.user_request }}</p>
+    {% if task.status != "done" %}
+    <form method="post" action="/tasks/{{ task.id }}/cancel" style="width:auto" onsubmit="return confirm('Close task {{ task.id }}? This will cancel it in both agentic-os and Paperclip.')">
+      <input type="hidden" name="reason" value="Closed by operator">
+      <button type="submit" class="danger btn-sm">Close task</button>
+    </form>
+    {% endif %}
   </div>
 
   <div class="grid two-up">

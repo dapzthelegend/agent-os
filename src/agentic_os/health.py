@@ -30,7 +30,7 @@ Health snapshot schema
         "path": "<str>"
     },
     "config": {
-        "notion_token_set": true,
+        "paperclip_configured": true,
         "issues": []
     },
     "cron": {
@@ -268,21 +268,6 @@ def validate_startup_config(paths: "Paths", config: "AppConfig") -> list[str]:
     except Exception as exc:
         issues.append(f"db not reachable: {exc}")
 
-    # Notion token env var must be set (if notion is configured)
-    if config.notion is not None:
-        token = os.environ.get(config.notion.api_token_env)
-        if not token:
-            issues.append(
-                f"Notion API token env var '{config.notion.api_token_env}' is not set"
-            )
-
-    for db_key, notion_cfg in config.notion_databases.items():
-        token = os.environ.get(notion_cfg.api_token_env)
-        if not token:
-            issues.append(
-                f"Notion DB '{db_key}': token env var '{notion_cfg.api_token_env}' is not set"
-            )
-
     return issues
 
 
@@ -342,30 +327,20 @@ def _check_artifacts_dir(path: Path) -> dict[str, Any]:
 
 def _check_config(config: "AppConfig") -> dict[str, Any]:
     issues: list[str] = []
-
-    notion_token_set = False
-    if config.notion is not None:
-        token = os.environ.get(config.notion.api_token_env)
-        notion_token_set = bool(token)
-        if not notion_token_set:
-            issues.append(f"Notion token env var '{config.notion.api_token_env}' not set")
-
-    for db_key, notion_cfg in config.notion_databases.items():
-        token = os.environ.get(notion_cfg.api_token_env)
-        if not token:
-            issues.append(
-                f"Notion DB '{db_key}': token '{notion_cfg.api_token_env}' not set"
-            )
-
-    return {"notion_token_set": notion_token_set, "issues": issues}
+    paperclip_configured = config.paperclip is not None
+    if not paperclip_configured:
+        issues.append("Paperclip control plane is not configured")
+    return {"paperclip_configured": paperclip_configured, "issues": issues}
 
 
 def _check_paperclip_reachable(base_url: str) -> bool:
-    """Attempt a lightweight GET to the Paperclip base URL. Returns True if reachable."""
+    """Attempt a lightweight GET to the Paperclip API health endpoint."""
     try:
-        req = urllib.request.Request(base_url, method="GET")
-        with urllib.request.urlopen(req, timeout=3):
-            return True
+        health_url = base_url.rstrip("/") + "/health"
+        req = urllib.request.Request(health_url, method="GET")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            status = int(getattr(resp, "status", 0))
+            return 200 <= status < 500
     except Exception:
         return False
 
@@ -402,18 +377,15 @@ def _get_paperclip_task_counts(service: "AgenticOSService") -> dict[str, int]:
 
 
 def _check_cron(repo_root: Path) -> dict[str, Any]:
-    """
-    Read the OpenClaw cron jobs.json (two levels up from the agentic-os repo)
-    and report last-run/consecutive-error state for each job.
-    """
-    # The agentic-os repo lives at <openclaw_root>/workspace/agentic-os.
-    # cron/jobs.json lives at <openclaw_root>/cron/jobs.json.
-    cron_path = repo_root.parents[1] / "cron" / "jobs.json"
+    """Report scheduler state. Legacy cron/jobs.json is optional metadata only."""
+    cron_path = repo_root / "cron" / "jobs.json"
     if not cron_path.exists():
-        return {"jobs": [], "note": "cron/jobs.json not found"}
+        return {"jobs": [], "note": "internal scheduler active (no legacy cron file)"}
 
     try:
         data = json.loads(cron_path.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and data.get("_note"):
+            return {"jobs": [], "note": str(data.get("_note"))}
         jobs_raw = data if isinstance(data, list) else data.get("jobs", [])
     except Exception as exc:
         return {"jobs": [], "error": str(exc)}

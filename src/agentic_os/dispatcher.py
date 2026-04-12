@@ -8,7 +8,6 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-from .intake_classifier import ClassifierResult
 from .models import RequestClassification
 from .storage import Database
 from .config import Paths, default_paths
@@ -19,8 +18,8 @@ class DispatchPayload:
     """Structured payload for ACP agent dispatch."""
     task_id: str
     paperclip_issue_id: Optional[str]
-    routing: str                     # auto_execute | needs_approval | escalate
-    agent: str                       # primary model alias, e.g. "openrouter-free", "gemini-flash", "sonnet"
+    routing: str                     # policy action (execute, plan, approve, approve_plan)
+    agent: str                       # Paperclip agent key (e.g. engineer, project_manager)
     brief: str                       # full prompt string for ACP session
     timeout_seconds: int = 300
     fallback_agent: Optional[str] = None  # model to use if primary is unavailable
@@ -34,52 +33,6 @@ class Dispatcher:
 
     def __init__(self) -> None:
         pass
-
-    def resolve_routing(
-        self,
-        classification: RequestClassification,
-        routing_rules_path: Optional[Path] = None,
-    ) -> tuple[str, str]:
-        """
-        Determine (routing, agent) from intake_routing.json rules.
-
-        Falls back to ("auto_execute", "main") if rules cannot be loaded.
-        When the deterministic rules are ambiguous, calls decision_engine.resolve_agent.
-        """
-        if routing_rules_path is None:
-            routing_rules_path = default_paths().root / "intake_routing.json"
-
-        try:
-            rules_data = json.loads(routing_rules_path.read_text(encoding="utf-8"))
-            rules = rules_data.get("rules", [])
-        except Exception:
-            rules = []
-
-        domain = classification.domain
-        intent = classification.intent_type
-        risk = classification.risk_level
-
-        matched_routing = "auto_execute"
-        matched_agent = None
-
-        for rule in rules:
-            r_domain = rule.get("domain", "*")
-            r_intent = rule.get("intent_type", "*")
-            r_risk = rule.get("risk", "*")
-            if (r_domain in ("*", domain)
-                    and r_intent in ("*", intent)
-                    and r_risk in ("*", risk)):
-                matched_routing = rule.get("routing", "auto_execute")
-                matched_agent = rule.get("agent")
-                break
-
-        if matched_agent and matched_agent in ("main", "manager", "senior"):
-            return matched_routing, matched_agent
-
-        # No clear rule match — ask decision engine
-        from .decision_engine import resolve_agent as _resolve_agent
-        agent = _resolve_agent(domain, intent, risk, matched_routing)
-        return matched_routing, agent
 
     def build_payload(
         self,
@@ -102,8 +55,8 @@ class Dispatcher:
             paperclip_issue_id: Paperclip issue ID (nullable)
             title: task title / description
             classification: RequestClassification
-            routing: auto_execute | needs_approval | escalate
-            agent: main | manager | senior (from routing rules or decision engine)
+            routing: execute | plan | approve | approve_plan (from policy_engine)
+            agent: Paperclip agent key (from routing rules or decision engine)
             approved_plan: approved plan text for plan_first tasks (included in brief)
             task_mode: 'plan_first' or 'direct'
             task_status: current task status (used to detect planning phase)
@@ -128,7 +81,19 @@ class Dispatcher:
             from .decision_engine import compress_brief as _compress_brief
             brief = _compress_brief(brief, max_chars=self._COMPRESS_THRESHOLD)
 
-        timeout = 600 if agent == "opus" else 180 if "gemini" in agent or "openrouter" in agent else 300
+        # Timeouts are tuned by task ownership role, not model aliases.
+        timeout_by_agent = {
+            "chief_of_staff": 600,
+            "engineering_manager": 600,
+            "engineer": 600,
+            "infrastructure_engineer": 600,
+            "project_manager": 300,
+            "executor_codex": 240,
+            "content_writer": 300,
+            "accountant": 300,
+            "executive_assistant": 300,
+        }
+        timeout = timeout_by_agent.get(agent, 300)
 
         return DispatchPayload(
             task_id=task_id,
@@ -171,7 +136,7 @@ After outputting TASK_DONE: {task_id}, you MUST record the result:
         """Build the full prompt brief for an ACP session."""
 
         # Plan-first tasks in the planning phase get a planning brief, not an execution brief
-        if task_mode == "plan_first" and task_status in ("new", "planning"):
+        if task_mode == "plan_first" and task_status == "to_do":
             return self._build_planning_brief(title, task_id, paperclip_issue_id or "")
 
         if intent_type == "content":
@@ -212,8 +177,14 @@ After outputting TASK_DONE: {task_id}, you MUST record the result:
         return f"""You have been assigned a task that requires a plan before execution.
 
 Task: {title}
-Task ID: {task_id}
-Paperclip Issue ID: {paperclip_issue_id}
+
+CALLBACK IDENTITY
+=================
+Your task ID is: {task_id}
+This is the ONLY identifier you pass to submit-plan and submit-result.
+Do NOT use the Paperclip issue ID as the task identifier.
+
+Paperclip issue (for context only): {paperclip_issue_id or "none"}
 
 PLANNING INSTRUCTIONS
 =====================
@@ -272,7 +243,7 @@ Do not begin execution until you receive an approved plan back.
         return f"""You are producing a content piece for Dara.
 
 Topic: {topic}
-Task ID: {task_id}
+Task ID: {task_id} (use this ID in ALL callbacks — never the Paperclip issue ID)
 Format: {fmt}
 Target length: {length}
 Audience: Dara (operator/founder, technically literate, no fluff)
@@ -297,7 +268,7 @@ TASK_DONE: {task_id}
         return f"""You are working on a task assigned by Dara.
 
 Task: {title}
-Task ID: {task_id}
+Task ID: {task_id} (use this ID in ALL callbacks — never the Paperclip issue ID)
 Domain: {domain}
 Risk: {risk_level}
 
@@ -318,7 +289,7 @@ Style: concise, direct, no filler. Dara's preference.
         return f"""You are working on a technical task assigned by Dara.
 
 Task: {title}
-Task ID: {task_id}
+Task ID: {task_id} (use this ID in ALL callbacks — never the Paperclip issue ID)
 Domain: {domain}
 Intent: {intent_type}
 Risk: {risk_level}
@@ -340,7 +311,7 @@ Instructions:
         return f"""You are working on a task assigned by Dara.
 
 Task: {title}
-Task ID: {task_id}
+Task ID: {task_id} (use this ID in ALL callbacks — never the Paperclip issue ID)
 Domain: {domain}
 Intent: {intent_type}
 Risk: {risk_level}
@@ -382,7 +353,10 @@ def main() -> None:
         intent_type=task.intent_type,
         risk_level=task.risk_level,
     )
-    routing, agent = dispatcher.resolve_routing(classification)
+    # Agent is stored in request_metadata at creation time; policy_decision is the routing
+    routing = task.policy_decision or "execute"
+    metadata = json.loads(task.request_metadata_json) if task.request_metadata_json else {}
+    agent = metadata.get("agent", "project_manager")
 
     # Load approved plan for plan_first tasks
     approved_plan: Optional[str] = None

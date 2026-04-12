@@ -2,14 +2,13 @@
 Decision engine — lightweight advisory layer using local Ollama phi4-mini:3.8b.
 
 Allowed uses:
-  - Ambiguous agent routing (main / manager / senior)
   - Clarification detection (is the brief too vague to execute?)
   - Retry classification (transient / permanent / needs_review)
   - Brief compression (extractive, preserves hard constraints)
 
 NOT used for:
-  - Approvals
-  - Policy decisions
+  - Approvals or policy decisions (see policy_engine.py)
+  - Agent routing (caller-supplied at task creation)
   - Final state transitions
   - Artifact acceptance
   - External-write authorisation
@@ -31,7 +30,6 @@ OLLAMA_URL = "http://localhost:11434/api/generate"
 MODEL = "phi4-mini:3.8b"
 TIMEOUT_S = 10
 
-_VALID_AGENTS = ("main", "manager", "senior")
 _VALID_RETRY_CLASSES = ("transient", "permanent", "needs_review")
 
 
@@ -64,46 +62,6 @@ def _call(prompt: str, fallback: dict[str, Any]) -> dict[str, Any]:
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
-
-def resolve_agent(
-    domain: str,
-    intent_type: str,
-    risk_level: str,
-    routing: str,
-) -> str:
-    """
-    Resolve the best agent for a task.
-
-    Deterministic fast-path handles the common cases. The model is called only
-    when the inputs are genuinely ambiguous (i.e. no deterministic rule fires).
-
-    Returns one of: "main", "manager", "senior".
-    """
-    # Deterministic rules — evaluated before any model call
-    if risk_level == "high":
-        return "senior"
-    if intent_type in ("read", "capture") and risk_level == "low":
-        return "main"
-    if domain == "technical" and intent_type in ("execute",) and risk_level == "medium":
-        return "manager"
-    if intent_type == "content" and risk_level in ("low", "medium"):
-        return "manager"
-    if routing == "auto_execute" and risk_level == "low":
-        return "main"
-    if routing == "auto_execute" and risk_level == "medium":
-        return "manager"
-
-    # Ambiguous — ask the model
-    prompt = (
-        f"Choose one agent for this task.\n"
-        f"domain={domain} intent={intent_type} risk={risk_level} routing={routing}\n"
-        f"Agents: main=simple low-risk, manager=normal tasks, senior=complex/high-risk.\n"
-        f'Reply ONLY with valid JSON: {{"agent": "main"|"manager"|"senior"}}'
-    )
-    result = _call(prompt, fallback={"agent": "manager"})
-    agent = result.get("agent", "manager")
-    return agent if agent in _VALID_AGENTS else "manager"
-
 
 def detect_clarification(brief: str) -> dict[str, Any]:
     """

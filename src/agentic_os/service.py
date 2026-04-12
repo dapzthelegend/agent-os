@@ -2,36 +2,32 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import uuid4
 
+_log = logging.getLogger(__name__)
+
 from .artifacts import ArtifactRecord, ArtifactStore
 from .adapters import execute_custom_adapter
 from .audit import AuditLog
-from .config import AppConfig, Paths, load_app_config, load_policy_rules
-from .daily_routine import (
-    DailyRoutineInput,
-    FollowUpAction,
-    YesterdayRecap,
-    build_daily_recap,
-    extract_follow_up_actions,
-    infer_domain,
-    prepare_email_payload,
-    render_html_email,
-    render_plaintext_email,
-    summarize_task_for_yesterday,
+from .config import AppConfig, Paths, load_app_config
+from . import policy_engine
+from .models import (
+    ACTION_SOURCES, ApprovalRecord, InvalidTransitionError, OperatorError,
+    RequestClassification, TaskRecord, normalize_action_source, validate_choice, validate_transition,
 )
-from .models import ACTION_SOURCES, ApprovalRecord, OperatorError, RequestClassification, TaskRecord, validate_choice
-from .notion import NotionAdapter, NotionTask
 from .storage import Database
+from .status_mapping import map_paperclip_status_to_backend
 
 _RUNTIME_FOLLOWUP_INCIDENT = "incident_remediation"
 _RUNTIME_FOLLOWUP_ACTIONABLE = "actionable_followup"
 _RUNTIME_FOLLOWUP_KINDS = frozenset(
     {_RUNTIME_FOLLOWUP_INCIDENT, _RUNTIME_FOLLOWUP_ACTIONABLE}
 )
+_GITHUB_CONTRIBUTION_KIND = "github_contribution"
 
 
 class AgenticOSService:
@@ -41,7 +37,6 @@ class AgenticOSService:
         self.db = Database(paths.db_path)
         self.audit = AuditLog(paths.audit_log_path)
         self.artifacts = ArtifactStore(paths.artifacts_dir)
-        self._notion_adapter: Optional[NotionAdapter] = None
         self._cp_cache: Any = None
         self._cp_initialized: bool = False
 
@@ -69,15 +64,28 @@ class AgenticOSService:
             try:
                 from .notification_router import _send_with_fallback
                 msg = "agentic-os startup config issues:\n" + "\n".join(f"• {i}" for i in issues)
-                _send_with_fallback(msg, channel_hint="startup_config")
-            except Exception:
-                pass
+                _send_with_fallback(msg, subject="agentic-os startup config issue")
+            except Exception as _exc:
+                _log.warning("startup config notification failed: %s", _exc)
+
+    def _transition_task(
+        self, task_id: str, to_status: str, **update_kwargs
+    ) -> TaskRecord:
+        """Validate a status transition, update the task, and return the updated record.
+
+        Raises InvalidTransitionError if the transition is not allowed by the
+        state machine defined in models.VALID_TRANSITIONS.
+        """
+        task = self.db.get_task(task_id)
+        validate_transition(task.status, to_status)
+        return self.db.update_task(task_id, status=to_status, **update_kwargs)
 
     def create_request(
         self,
         *,
         user_request: str,
         classification: RequestClassification,
+        agent_key: str,
         target: Optional[str] = None,
         request_metadata: Optional[dict[str, Any]] = None,
         external_write: bool = False,
@@ -86,14 +94,23 @@ class AgenticOSService:
         artifact_content: Optional[Any] = None,
         result_summary: Optional[str] = None,
         external_ref: Optional[str] = None,
-        action_source: str = "manual",
+        action_source: Optional[str] = None,
+        default_action_source: str = "manual",
+        labels: Optional[list[str]] = None,
         adopt_paperclip_issue_id: Optional[str] = None,
         adopt_paperclip_routine_id: Optional[str] = None,
         adopt_paperclip_routine_run_id: Optional[str] = None,
         adopt_paperclip_origin_kind: Optional[str] = None,
     ) -> dict[str, Any]:
-        validate_choice(action_source, ACTION_SOURCES, "action_source")
         effective_metadata: dict[str, Any] = dict(request_metadata) if request_metadata else {}
+        action_source = normalize_action_source(
+            action_source,
+            request_metadata=effective_metadata,
+            default=default_action_source,
+        )
+        validate_choice(action_source, ACTION_SOURCES, "action_source")
+        effective_metadata["agent"] = agent_key
+
         if operation_key is not None:
             existing_tasks = self.db.list_tasks_by_operation_key(operation_key)
             if existing_tasks:
@@ -101,43 +118,24 @@ class AgenticOSService:
                 raise ValueError(
                     f"operation_key {operation_key} is already assigned to task {existing_task.id}"
                 )
-        policy_decision = self.evaluate_policy(
-            classification=classification,
-            target=target,
-            external_write=external_write,
-            action_source=action_source,
-        )
 
-        from .plan_gate import classify_task_mode
-        task_mode = classify_task_mode(
-            classification.domain, classification.intent_type, classification.risk_level
-        )
-        # Runtime follow-up tasks can force explicit approval by bypassing plan_first.
-        if bool(effective_metadata.get("require_explicit_approval")):
-            task_mode = "direct"
-
-        # plan_first tasks bypass the approval_required operation_key requirement —
-        # the plan gate is the gating mechanism instead
-        if policy_decision == "approval_required" and not operation_key and task_mode != "plan_first":
-            raise ValueError("approval_required requests must include an operation_key")
-
-        if task_mode == "plan_first":
-            # Plan gate supersedes the policy-based status: task starts in planning
-            task_status = "planning"
-            approval_state = "not_needed"
+        # Derive origin for policy engine from action_source
+        if action_source == "paperclip_routine":
+            origin = "routine"
         else:
-            task_status, approval_state = self._task_state_for_policy(policy_decision)
+            origin = action_source  # "manual", "api", "paperclip_manual", etc.
 
-        # Ensure the intake classifier's agent selection is stored in request_metadata
-        # so that resolve_executor_key() can route codex tasks to executor_codex.
-        if "agent" not in effective_metadata:
-            try:
-                from .dispatcher import Dispatcher as _Dispatcher
-                _dispatcher = _Dispatcher()
-                _, resolved_agent = _dispatcher.resolve_routing(classification)
-                effective_metadata["agent"] = resolved_agent
-            except Exception:
-                pass
+        verdict = policy_engine.resolve(
+            origin=origin,
+            domain=classification.domain,
+            labels=labels or [],
+        )
+        policy_decision = verdict.action
+
+        task_mode = "plan_first" if verdict.needs_plan else "direct"
+        if verdict.needs_approval and not operation_key:
+            raise ValueError("approval-gated requests must include an operation_key")
+        task_status, approval_state = self._task_state_for_policy(policy_decision)
 
         task = self.db.create_task(
             classification=RequestClassification(
@@ -164,32 +162,22 @@ class AgenticOSService:
             event_type="policy_evaluated",
             payload={
                 "policy_decision": policy_decision,
-                "target": target,
-                "external_write": external_write,
-                "action_source": action_source,
+                "agent_key": agent_key,
+                "origin": origin,
+                "labels": labels or [],
             },
         )
 
-        # Persist task_mode (plan_first or direct)
-        if task_mode != "direct":
-            task = self.db.update_task(task.id, task_mode=task_mode)
-            self._append_event(
-                task_id=task.id,
-                event_type="task_mode_set",
-                payload={"task_mode": task_mode},
-            )
-
-        # Paperclip projection (phase 1) — failure must never block task creation
+        # Paperclip projection — failure must never block task creation
         cp = self._cp
         if cp is not None:
             if adopt_paperclip_issue_id:
                 # Adopt an existing Paperclip issue (task was created there manually)
                 try:
-                    assignee_key = cp.resolve_assignee_for_task(task)
                     issue = cp.adopt_issue(
                         adopt_paperclip_issue_id,
                         task,
-                        assignee_key=assignee_key,
+                        assignee_key=agent_key,
                     )
                     task = self.db.update_task(
                         task.id,
@@ -204,7 +192,7 @@ class AgenticOSService:
                     self._append_event(
                         task_id=task.id,
                         event_type="paperclip_issue_imported",
-                        payload={"issue_id": adopt_paperclip_issue_id, "assignee_key": assignee_key},
+                        payload={"issue_id": adopt_paperclip_issue_id, "agent_key": agent_key},
                     )
                 except Exception as _pc_exc:
                     self._append_event(
@@ -214,8 +202,7 @@ class AgenticOSService:
                     )
             else:
                 try:
-                    assignee_key = cp.resolve_assignee_for_task(task)
-                    issue = cp.create_issue(task, assignee_key=assignee_key)
+                    issue = cp.create_issue(task, assignee_key=agent_key)
                     if issue and issue.id:
                         task = self.db.update_task(
                             task.id,
@@ -228,19 +215,19 @@ class AgenticOSService:
                         self._append_event(
                             task_id=task.id,
                             event_type="paperclip_issue_created",
-                            payload={"issue_id": issue.id, "assignee_key": assignee_key},
+                            payload={"issue_id": issue.id, "agent_key": agent_key},
                         )
                     else:
                         self._append_event(
                             task_id=task.id,
-                            event_type="paperclip_projection_failed",
-                            payload={"error": "create_issue returned None — check server logs"},
+                            event_type="paperclip_projection_pending",
+                            payload={"error": "create_issue returned None — repair job will retry"},
                         )
                 except Exception as _pc_exc:
                     self._append_event(
                         task_id=task.id,
-                        event_type="paperclip_projection_failed",
-                        payload={"error": str(_pc_exc)},
+                        event_type="paperclip_projection_pending",
+                        payload={"error": str(_pc_exc), "phase": "create"},
                     )
 
         artifact = None
@@ -254,7 +241,7 @@ class AgenticOSService:
             task = self.db.update_task(task.id, artifact_ref=artifact.id)
 
         approval = None
-        if policy_decision == "approval_required" and task_mode != "plan_first":
+        if verdict.needs_approval:
             approval = self._create_approval_for_task(task=task, artifact=artifact)
 
         return {
@@ -270,18 +257,20 @@ class AgenticOSService:
         issue_id: str,
         title: str,
         description: str,
+        paperclip_status: str = "backlog",
         project_id: Optional[str] = None,
         routine_id: Optional[str] = None,
         routine_run_id: Optional[str] = None,
         origin_kind: Optional[str] = None,
+        assignee_agent_id: Optional[str] = None,
+        labels: Optional[list[str]] = None,
     ) -> dict[str, Any]:
         """
-        Import a manually-created Paperclip issue as an agentic-os task.
+        Import a Paperclip issue as an agentic-os task.
 
         Called by the reconciler when it detects a new issue with no matching
-        backend task.  Infers domain from project_id, classifies with
-        sensible defaults, then calls create_request() with
-        adopt_paperclip_issue_id so the existing issue is adopted rather
+        backend task.  Infers domain from project_id, then calls create_request()
+        with adopt_paperclip_issue_id so the existing issue is adopted rather
         than a new one created.
 
         Returns the same dict as create_request(): {task, policy_decision, ...}
@@ -292,28 +281,137 @@ class AgenticOSService:
             reverse_map = {v: k for k, v in self.config.paperclip.project_map.items()}
             domain = reverse_map.get(project_id, "system")
 
+        # Idempotency: if a task already exists for this operation_key (e.g. from a
+        # previous reconciler run), return it directly without re-importing.
+        operation_key = f"paperclip_import:{issue_id}"
+        existing = self.db.list_tasks_by_operation_key(operation_key)
+        if existing:
+            task = existing[0]
+            return {
+                "task": task,
+                "policy_decision": task.policy_decision,
+                "approval": None,
+                "created": False,
+            }
+
         user_request = title
         if description and description.strip() and description.strip() != title.strip():
             user_request = f"{title}\n\n{description}"
+
+        # Derive action_source from origin_kind
+        if origin_kind == "routine_execution":
+            action_source = "paperclip_routine"
+        else:
+            action_source = "paperclip_manual"
+
+        # Resolve agent: use Paperclip's assignee if set, else domain default
+        agent_key = self._resolve_agent_key_from_paperclip(
+            assignee_agent_id=assignee_agent_id, domain=domain,
+        )
 
         classification = RequestClassification(
             domain=domain,
             intent_type="execute",
             risk_level="medium",
-            status="new",
+            status=map_paperclip_status_to_backend(paperclip_status),
             approval_state="not_needed",
         )
 
-        return self.create_request(
+        payload = self.create_request(
             user_request=user_request,
             classification=classification,
-            action_source="paperclip_manual",
-            operation_key=f"paperclip_import:{issue_id}",
+            agent_key=agent_key,
+            target=None,
+            action_source=action_source,
+            operation_key=operation_key,
+            labels=labels,
             adopt_paperclip_issue_id=issue_id,
             adopt_paperclip_routine_id=routine_id,
             adopt_paperclip_routine_run_id=routine_run_id,
             adopt_paperclip_origin_kind=origin_kind,
         )
+        task = payload["task"]
+        if task.paperclip_issue_id != issue_id:
+            task = self.db.update_task(
+                task.id,
+                paperclip_issue_id=issue_id,
+                paperclip_routine_id=routine_id,
+                paperclip_routine_run_id=routine_run_id,
+                paperclip_origin_kind=origin_kind,
+            )
+            payload["task"] = task
+        return payload
+
+    def _resolve_agent_key_from_paperclip(
+        self,
+        *,
+        assignee_agent_id: Optional[str],
+        domain: str,
+    ) -> str:
+        """Reverse-lookup agent key from Paperclip agent UUID, or fall back to domain default."""
+        if assignee_agent_id and self.config.paperclip is not None:
+            reverse_agent_map = {v: k for k, v in self.config.paperclip.agent_map.items()}
+            agent_key = reverse_agent_map.get(assignee_agent_id)
+            if agent_key:
+                return agent_key
+        return policy_engine.default_agent_for_domain(domain)
+
+    def ensure_task_for_paperclip_issue(self, paperclip_issue_id: str) -> dict[str, Any]:
+        """
+        Resolve or import a backend task for the given Paperclip issue.
+        """
+        issue_id = (paperclip_issue_id or "").strip()
+        if not issue_id:
+            raise ValueError("paperclip_issue_id is required")
+
+        existing = self.db.get_task_by_paperclip_issue_id(issue_id)
+        if existing is not None:
+            return {
+                "found": True,
+                "created": False,
+                "task_id": existing.id,
+                "task": asdict(existing),
+            }
+
+        cp = self._cp
+        if cp is None:
+            raise ValueError("paperclip control plane unavailable")
+
+        issue = cp.get_issue(issue_id)
+        if issue is None:
+            raise ValueError(f"paperclip issue not found: {issue_id}")
+
+        routine_run_id = getattr(issue, "routine_run_id", None) or None
+        routine_id = getattr(issue, "routine_id", None) or None
+        issue_source = getattr(issue, "source", None) or ""
+        issue_origin_kind = getattr(issue, "origin_kind", None) or None
+        if not issue_origin_kind:
+            is_routine = (
+                issue_source.startswith("routine.")
+                or bool(routine_run_id)
+                or bool(routine_id)
+            )
+            issue_origin_kind = "routine_execution" if is_routine else "manual_issue"
+
+        payload = self.import_paperclip_issue(
+            issue_id=issue.id,
+            title=issue.title,
+            description=issue.description,
+            paperclip_status=issue.status,
+            project_id=issue.project_id,
+            routine_id=routine_id,
+            routine_run_id=routine_run_id,
+            origin_kind=issue_origin_kind,
+            assignee_agent_id=getattr(issue, "assignee_id", None),
+            labels=getattr(issue, "labels", None) or [],
+        )
+        task = payload["task"]
+        return {
+            "found": False,
+            "created": True,
+            "task_id": task.id,
+            "task": asdict(task),
+        }
 
     def record_openclaw_read(
         self,
@@ -328,11 +426,13 @@ class AgenticOSService:
         request_metadata: Optional[dict[str, Any]] = None,
         artifact_type: Optional[str] = None,
         artifact_content: Optional[Any] = None,
-        action_source: str = "openclaw_tool",
+        action_source: str = "tool",
+        agent_key: Optional[str] = None,
     ) -> dict[str, Any]:
         payload = self.create_request(
             user_request=user_request,
             classification=classification,
+            agent_key=agent_key or policy_engine.default_agent_for_domain(classification.domain),
             target=target,
             request_metadata=request_metadata,
             external_write=False,
@@ -356,7 +456,7 @@ class AgenticOSService:
             event_type="tool_result",
             payload={**operator, "tool_result": tool_result or {}},
         )
-        task = self.db.update_task(task.id, result_summary=summary, status="completed")
+        task = self.db.update_task(task.id, result_summary=summary, status="done")
         self._append_event(
             task_id=task.id,
             event_type="summary_recorded",
@@ -385,11 +485,13 @@ class AgenticOSService:
         summary: Optional[str] = None,
         target: Optional[str] = None,
         request_metadata: Optional[dict[str, Any]] = None,
-        action_source: str = "openclaw_skill",
+        action_source: str = "tool",
+        agent_key: Optional[str] = None,
     ) -> dict[str, Any]:
         payload = self.create_request(
             user_request=user_request,
             classification=classification,
+            agent_key=agent_key or policy_engine.default_agent_for_domain(classification.domain),
             target=target,
             request_metadata=request_metadata,
             artifact_type=artifact_type,
@@ -441,11 +543,13 @@ class AgenticOSService:
         tool_result: Optional[dict[str, Any]] = None,
         artifact_type: Optional[str] = None,
         artifact_content: Optional[Any] = None,
-        action_source: str = "openclaw_tool",
+        action_source: str = "tool",
+        agent_key: Optional[str] = None,
     ) -> dict[str, Any]:
         payload = self.create_request(
             user_request=user_request,
             classification=classification,
+            agent_key=agent_key or policy_engine.default_agent_for_domain(classification.domain),
             target=target,
             request_metadata=request_metadata,
             external_write=True,
@@ -567,10 +671,11 @@ class AgenticOSService:
         payload = self.create_request(
             user_request="\n".join(request_lines).strip(),
             classification=classification,
+            agent_key=assignee_key or "infrastructure_engineer",
             target="runtime_followup_task",
             request_metadata=metadata,
             operation_key=operation_key,
-            action_source="openclaw_skill",
+            action_source="automation",
         )
         payload["deduplicated"] = False
         return payload
@@ -632,7 +737,7 @@ class AgenticOSService:
     # ── Execution loop helpers ────────────────────────────────────────────────
 
     def list_ready_tasks(self, *, limit: int = 20) -> list[TaskRecord]:
-        """Tasks eligible for execution: approved, or new with read_ok policy."""
+        """Tasks eligible for execution."""
         return self.db.query_ready_tasks(limit=limit)
 
     def pickup_task(self, task_id: str, *, claimed_by: str = "task_executor_cron") -> dict:
@@ -644,20 +749,6 @@ class AgenticOSService:
                 event_type="task_picked_up",
                 payload={"task_id": task_id, "claimed_by": claimed_by},
             )
-            cp = self._cp
-            if cp is not None:
-                try:
-                    task = self.db.get_task(task_id)
-                    if task.paperclip_issue_id:
-                        # plan_first tasks move to 'executing'; direct tasks to 'in_progress'
-                        backend_status = "executing" if task.task_mode == "plan_first" else "in_progress"
-                        cp.update_issue_status(task.paperclip_issue_id, backend_status)
-                except Exception as _pc_exc:
-                    self._append_event(
-                        task_id=task_id,
-                        event_type="paperclip_sync_failed",
-                        payload={"error": str(_pc_exc), "op": "pickup"},
-                    )
         return result
 
     def mark_dispatched(self, task_id: str, *, session_key: str, agent: str) -> None:
@@ -694,15 +785,12 @@ class AgenticOSService:
 
     def requeue_task(self, task_id: str) -> TaskRecord:
         """
-        Reset a stalled task back to its pre-execution ready state.
-        Returns to 'approved' if it was explicitly approved, else 'new'.
+        Reset a task back to the ready state.
         Emits task_requeued audit event.
         """
         task = self.db.get_task(task_id)
-        if task.status not in ("stalled", "failed", "in_progress"):
-            raise ValueError(f"task {task_id} is not requeue-eligible (status={task.status})")
-        target_status = "approved" if task.approval_state == "approved" else "new"
-        self.db.update_task(task_id, status=target_status)
+        target_status = "to_do"
+        self._transition_task(task_id, target_status)
         self._append_event(
             task_id=task_id,
             event_type="task_requeued",
@@ -719,63 +807,7 @@ class AgenticOSService:
         *,
         version: Optional[int] = None,
     ) -> TaskRecord:
-        """
-        Submit a plan for an operator review.
-
-        Transitions: planning → awaiting_plan_review
-        Writes plan to local artifact store + Paperclip document.
-        Paperclip issue moves to in_review, assigned to chief_of_staff.
-        """
-        task = self.db.get_task(task_id)
-        if task.task_mode != "plan_first":
-            raise ValueError(f"task {task_id} is not in plan_first mode (mode={task.task_mode})")
-        if task.status != "planning":
-            raise ValueError(
-                f"task {task_id} must be in 'planning' status to submit a plan (status={task.status})"
-            )
-
-        plan_version = version if version is not None else (task.plan_version or 0) + 1
-
-        # Store plan as a local artifact
-        artifact = self._create_artifact(
-            task_id=task_id,
-            artifact_type="plan_document",
-            artifact_content={"plan_text": plan_text, "version": plan_version},
-            event_type="plan_submitted",
-        )
-
-        # Advance task status
-        task = self.db.update_task(
-            task_id,
-            status="awaiting_plan_review",
-            plan_version=plan_version,
-        )
-        self._append_event(
-            task_id=task_id,
-            event_type="plan_awaiting_review",
-            payload={"plan_version": plan_version, "artifact_id": artifact.id},
-        )
-
-        # Paperclip: write plan doc, move to in_review, assign to project_manager for review.
-        # The PM is the plan reviewer — not the author.  CoS is not involved at this step.
-        cp = self._cp
-        if cp is not None:
-            try:
-                if task.paperclip_issue_id:
-                    cp.write_plan_doc(task.paperclip_issue_id, plan_text, version=plan_version)
-                    cp.update_issue_status(
-                        task.paperclip_issue_id,
-                        "awaiting_plan_review",
-                        assignee_key="project_manager",
-                    )
-            except Exception as _pc_exc:
-                self._append_event(
-                    task_id=task_id,
-                    event_type="paperclip_sync_failed",
-                    payload={"error": str(_pc_exc), "op": "submit_plan"},
-                )
-
-        return task
+        raise RuntimeError("plan-first lifecycle has been removed")
 
     def approve_plan(
         self,
@@ -783,55 +815,7 @@ class AgenticOSService:
         *,
         revision_id: str,
     ) -> TaskRecord:
-        """
-        Approve a submitted plan.
-
-        Transitions: awaiting_plan_review → approved_for_execution
-        Stores approved_plan_revision_id — execution is now unblocked.
-        Paperclip: status → todo, assignee → engineer.
-        """
-        task = self.db.get_task(task_id)
-        if task.task_mode != "plan_first":
-            raise ValueError(f"task {task_id} is not in plan_first mode")
-        if task.status != "awaiting_plan_review":
-            raise ValueError(
-                f"task {task_id} must be in 'awaiting_plan_review' to approve (status={task.status})"
-            )
-
-        task = self.db.update_task(
-            task_id,
-            status="approved_for_execution",
-            approved_plan_revision_id=revision_id,
-        )
-        self._append_event(
-            task_id=task_id,
-            event_type="plan_approved",
-            payload={"revision_id": revision_id},
-        )
-
-        cp = self._cp
-        if cp is not None:
-            try:
-                if task.paperclip_issue_id:
-                    # Reassign to the execution agent who wrote the plan — they now execute it.
-                    executor_key = cp.resolve_executor_key(task)
-                    cp.update_issue_status(
-                        task.paperclip_issue_id,
-                        "approved_for_execution",
-                        assignee_key=executor_key,
-                    )
-                    cp.add_comment(
-                        task.paperclip_issue_id,
-                        f"Plan approved (revision {revision_id}). Ready for execution.",
-                    )
-            except Exception as _pc_exc:
-                self._append_event(
-                    task_id=task_id,
-                    event_type="paperclip_sync_failed",
-                    payload={"error": str(_pc_exc), "op": "approve_plan"},
-                )
-
-        return task
+        raise RuntimeError("plan-first lifecycle has been removed")
 
     def reject_plan(
         self,
@@ -839,65 +823,132 @@ class AgenticOSService:
         *,
         feedback: str,
     ) -> TaskRecord:
-        """
-        Reject a submitted plan and send it back for revision.
+        raise RuntimeError("plan-first lifecycle has been removed")
 
-        Transitions: awaiting_plan_review → planning
-        Paperclip: comment with feedback, status back to in_progress.
-        """
-        task = self.db.get_task(task_id)
-        if task.task_mode != "plan_first":
-            raise ValueError(f"task {task_id} is not in plan_first mode")
-        if task.status != "awaiting_plan_review":
-            raise ValueError(
-                f"task {task_id} must be in 'awaiting_plan_review' to reject (status={task.status})"
-            )
-
-        task = self.db.update_task(task_id, status="planning")
-        self._append_event(
-            task_id=task_id,
-            event_type="plan_rejected",
-            payload={"feedback": feedback},
-        )
-
-        cp = self._cp
-        if cp is not None:
-            try:
-                if task.paperclip_issue_id:
-                    cp.update_issue_status(task.paperclip_issue_id, "planning")
-                    cp.add_comment(
-                        task.paperclip_issue_id,
-                        f"REVISE: {feedback}",
-                    )
-            except Exception as _pc_exc:
-                self._append_event(
-                    task_id=task_id,
-                    event_type="paperclip_sync_failed",
-                    payload={"error": str(_pc_exc), "op": "reject_plan"},
-                )
-
-        return task
+    def reopen_plan_for_revision(
+        self,
+        task_id: str,
+        *,
+        reason: str = "Reopened in Paperclip",
+    ) -> TaskRecord:
+        raise RuntimeError("plan-first lifecycle has been removed")
 
     def cancel_task(self, task_id: str, *, reason: str = "Cancelled by operator") -> TaskRecord:
         """
         Cancel a task directly by task_id (no approval record required).
 
-        Used by the Paperclip reconciler when an operator sets a task to
-        'cancelled' in Paperclip.  Does NOT write back to Paperclip — the
+        Used by the Paperclip reconciler when an operator closes a task in Paperclip.
+        Does NOT write back lifecycle status to Paperclip — the
         signal originated there, so we only update backend state.
 
         No-ops if task is already in a terminal state.
         """
         task = self.db.get_task(task_id)
-        if task.status in {"cancelled", "completed", "failed"}:
+        if task.status == "done":
             return task
-        task = self.db.update_task(task_id, status="cancelled", result_summary=reason)
+        task = self._transition_task(task_id, "done", result_summary=reason)
         self._append_event(
             task_id=task_id,
             event_type="task_cancelled",
             payload={"reason": reason, "source": "paperclip_reconciler"},
         )
         return task
+
+    def operator_close_task(self, task_id: str, *, reason: str = "Closed by operator") -> TaskRecord:
+        """
+        Cancel a task at operator request and close the linked Paperclip issue first.
+
+        Unlike cancel_task() (which is used by the reconciler for Paperclip-originated
+        cancellations), this path is operator-initiated. When a task has a linked
+        Paperclip issue we require that cancellation to succeed before committing the
+        local lifecycle change, otherwise the reconciler will immediately restore the
+        backend task from the still-open Paperclip issue.
+        """
+        _not_closeable = {"done"}
+        task = self.db.get_task(task_id)
+        if task.status in _not_closeable:
+            return task
+        cp = self._cp
+        if task.paperclip_issue_id:
+            if cp is None:
+                details = {
+                    "task_id": task_id,
+                    "paperclip_issue_id": task.paperclip_issue_id,
+                    "reason": reason,
+                }
+                self._append_event(
+                    task_id=task_id,
+                    event_type="paperclip_sync_failed",
+                    payload={**details, "op": "operator_close", "error": "control plane unavailable"},
+                )
+                raise OperatorError(
+                    code="paperclip_unavailable",
+                    message="Cannot close task because the linked Paperclip issue could not be reached.",
+                    details=details,
+                )
+            closed_issue = cp.close_issue_cancelled(task.paperclip_issue_id)
+            if closed_issue is None:
+                details = {
+                    "task_id": task_id,
+                    "paperclip_issue_id": task.paperclip_issue_id,
+                    "reason": reason,
+                }
+                self._append_event(
+                    task_id=task_id,
+                    event_type="paperclip_sync_failed",
+                    payload={**details, "op": "operator_close", "error": "close_issue_cancelled returned None"},
+                )
+                raise OperatorError(
+                    code="paperclip_close_failed",
+                    message="Cannot close task because the linked Paperclip issue did not close.",
+                    details=details,
+                )
+            task = self.db.update_task(
+                task.id,
+                paperclip_assignee_agent_id=closed_issue.assignee_id or None,
+                paperclip_project_id=closed_issue.project_id or None,
+                paperclip_goal_id=closed_issue.goal_id or None,
+            )
+        task = self._transition_task(task_id, "done", result_summary=reason)
+        self._append_event(
+            task_id=task_id,
+            event_type="task_cancelled",
+            payload={
+                "reason": reason,
+                "source": "operator",
+                "paperclip_issue_id": task.paperclip_issue_id,
+            },
+        )
+        # No Paperclip comment here: the backend posts under a trusted-client
+        # identity, so any comment on an open issue with an assignee would
+        # trigger Paperclip's `issue_commented` wake path.
+        return task
+
+    def bulk_close_tasks(self, *, reason: str = "Closed by operator") -> dict:
+        """
+        Close all tasks that are in a closeable state, syncing each to Paperclip.
+
+        Returns a summary with lists of closed task IDs and any errors.
+        """
+        _not_closeable = {"done"}
+        all_tasks = self.db.query_tasks(limit=1000)
+        active_tasks = [t for t in all_tasks if t.status not in _not_closeable]
+
+        closed: list[str] = []
+        errors: list[dict] = []
+        for task in active_tasks:
+            try:
+                self.operator_close_task(task.id, reason=reason)
+                closed.append(task.id)
+            except Exception as exc:
+                errors.append({"task_id": task.id, "error": str(exc)})
+
+        return {
+            "closed": closed,
+            "errors": errors,
+            "closed_count": len(closed),
+            "error_count": len(errors),
+        }
 
     def set_task_mode(self, task_id: str, *, mode: str) -> TaskRecord:
         """
@@ -1044,7 +1095,7 @@ class AgenticOSService:
         # In-progress tasks (all time)
         in_progress_tasks = [
             task for task in self.list_tasks(limit=500, domain=domain)
-            if task.status in {"in_progress", "awaiting_input", "awaiting_approval"}
+            if task.status == "in_progress"
         ]
 
         # Overdue tasks (>48h no update, not terminal)
@@ -1090,7 +1141,7 @@ class AgenticOSService:
         # Sort by longest-pending first
         approvals.sort(key=lambda r: r["hours_pending"], reverse=True)
         return {
-            "scope": "awaiting_approval",
+            "scope": "pending_approval",
             "domain": domain,
             "count": len(approvals),
             "escalated_count": sum(1 for r in approvals if r["escalation_flag"]),
@@ -1109,10 +1160,10 @@ class AgenticOSService:
         }
 
     def recap_in_progress(self, *, domain: Optional[str] = None) -> dict[str, Any]:
-        """Return all tasks currently in a non-terminal, non-completed state."""
+        """Return all tasks currently in a non-terminal state."""
         tasks = [
             task for task in self.list_tasks(limit=500, domain=domain)
-            if task.status in {"in_progress", "awaiting_input", "awaiting_approval", "approved"}
+            if task.status in {"to_do", "in_progress"}
         ]
         return {
             "scope": "in_progress",
@@ -1121,17 +1172,17 @@ class AgenticOSService:
             "records": [self._task_snapshot(task) for task in tasks],
         }
 
-    def recap_drafts(self, *, domain: Optional[str] = None) -> dict[str, Any]:
-        tasks = self.list_tasks(limit=500, status="awaiting_input", domain=domain)
+    def recap_awaiting_input(self, *, domain: Optional[str] = None) -> dict[str, Any]:
+        tasks = self.list_tasks(limit=500, status="to_do", domain=domain)
         return {
-            "scope": "open_drafts",
+            "scope": "to_do",
             "domain": domain,
             "count": len(tasks),
             "records": [self._task_snapshot(task) for task in tasks],
         }
 
     def recap_failures(self, *, domain: Optional[str] = None, limit: int = 20) -> dict[str, Any]:
-        tasks = self.list_tasks(limit=500, status="failed", domain=domain)
+        tasks = self.list_tasks(limit=500, status="done", domain=domain)
         recent_failures = tasks[:limit]
         return {
             "scope": "recent_failures",
@@ -1164,149 +1215,10 @@ class AgenticOSService:
             "records": records[:limit],
         }
 
-    def run_daily_routine(
-        self,
-        *,
-        payload: dict[str, Any],
-        create_notion_tasks: bool = True,
-        send_email: bool = False,
-    ) -> dict[str, Any]:
-        routine_input = DailyRoutineInput.from_dict(payload)
-        classification = RequestClassification(
-            domain="system",
-            intent_type="recap",
-            risk_level="low",
-        ).validate()
-        request_payload = self.create_request(
-            user_request=f"Generate daily routine recap for {routine_input.date}",
-            classification=classification,
-            target="daily_routine",
-            request_metadata={
-                "date": routine_input.date,
-                "timezone": routine_input.timezone,
-                "recipient": routine_input.recipient,
-                "delivery_time": routine_input.delivery_time,
-            },
-            action_source="custom_adapter",
-        )
-        task = request_payload["task"]
-
-        yesterday = self._build_yesterday_recap(routine_input.date)
-        # Enrich recap with live pending approvals and overdue tasks (Phase 6 gap closed)
-        pending_approvals_raw = [
-            {"approval_id": a.id, "task_id": a.task_id, "subject_type": a.subject_type,
-             "hours_pending": self._hours_since(a.created_at)}
-            for a in self.db.list_approvals(status="pending")
-        ]
-        overdue_tasks_raw = self._find_overdue_tasks(domain=None, threshold_hours=48.0)
-        recap = build_daily_recap(
-            routine_input,
-            yesterday,
-            pending_approvals=pending_approvals_raw,
-            overdue_tasks=overdue_tasks_raw,
-        )
-        email_body = render_plaintext_email(recap)
-        email_payload = prepare_email_payload(recap, email_body)
-        artifact = self._create_artifact(
-            task_id=task.id,
-            artifact_type="daily_routine_recap",
-            artifact_content={
-                "input": payload,
-                "recap": recap.to_dict(),
-                "email_payload": email_payload,
-            },
-            event_type="daily_routine_recap_created",
-        )
-        task = self.db.update_task(
-            task.id,
-            artifact_ref=artifact.id,
-            result_summary=f"Generated daily recap for {routine_input.date}.",
-            status="completed",
-        )
-        self._append_event(
-            task_id=task.id,
-            event_type="daily_routine_email_prepared",
-            payload=email_payload,
-        )
-
-        created_followups = []
-        created_notion_tasks = []
-        skipped_followups = []
-        for action in extract_follow_up_actions(routine_input):
-            existing = self.db.get_task_by_operation_key(action.operation_key)
-            if existing is not None:
-                skipped_followups.append(
-                    {
-                        "operation_key": action.operation_key,
-                        "reason": f"existing task {existing.id}",
-                    }
-                )
-                continue
-            followup = self._create_daily_followup_task(action=action, parent_task_id=task.id)
-            created_followups.append({"task": asdict(followup), "action": self._serialize_follow_up_action(action)})
-            if create_notion_tasks and action.notion_title is not None:
-                notion_result = self._create_daily_followup_notion_task(
-                    action=action,
-                    parent_task_id=task.id,
-                    backend_task_id=followup.id,
-                )
-                if notion_result is not None:
-                    created_notion_tasks.append(notion_result)
-
-        summary = (
-            f"Generated daily recap for {routine_input.date} with "
-            f"{len(created_followups)} follow-up task(s)."
-        )
-        task = self.db.update_task(task.id, result_summary=summary, status="completed")
-        self._append_event(
-            task_id=task.id,
-            event_type="daily_routine_followups_created",
-            payload={
-                "follow_up_count": len(created_followups),
-                "notion_task_count": len(created_notion_tasks),
-                "skipped_follow_up_count": len(skipped_followups),
-            },
-        )
-        self._append_event(
-            task_id=task.id,
-            event_type="task_completed",
-            payload={"result_summary": summary},
-        )
-        email_sent = False
-        email_send_error: Optional[str] = None
-        if send_email:
-            from .gmail_sender import send_email as _send_gmail
-            html_body = render_html_email(recap)
-            ok = _send_gmail(
-                to=routine_input.recipient,
-                subject=email_payload["subject"],
-                body=email_body,
-                html_body=html_body,
-            )
-            email_sent = ok
-            if not ok:
-                email_send_error = "gmail_send_failed"
-            self._append_event(
-                task_id=task.id,
-                event_type="daily_routine_email_sent" if ok else "daily_routine_email_send_failed",
-                payload={
-                    "to": routine_input.recipient,
-                    "subject": email_payload["subject"],
-                    "html": html_body is not None,
-                },
-            )
-
-        return {
-            "task": task,
-            "recap": recap.to_dict(),
-            "email_payload": email_payload,
-            "email_body": email_body,
-            "email_sent": email_sent,
-            "email_send_error": email_send_error,
-            "created_followups": created_followups,
-            "created_notion_tasks": created_notion_tasks,
-            "skipped_followups": skipped_followups,
-        }
+    @staticmethod
+    def _is_operation_key_conflict(error: Exception) -> bool:
+        message = str(error)
+        return "operation_key" in message and "already assigned to task" in message
 
     def revise_artifact(
         self,
@@ -1344,7 +1256,7 @@ class AgenticOSService:
 
         approval = None
         pending_approval = self.db.get_pending_approval_for_task(task_id)
-        if task.policy_decision == "approval_required":
+        if task.policy_decision in ("approve", "approve_plan", "approval_required"):
             if pending_approval is not None:
                 cancelled = self.db.update_approval(
                     pending_approval.id,
@@ -1356,7 +1268,7 @@ class AgenticOSService:
                     event_type="approval_cancelled",
                     payload={"approval": asdict(cancelled)},
                 )
-            task = self.db.update_task(task.id, status="awaiting_approval", approval_state="pending")
+            task = self.db.update_task(task.id, status="to_do", approval_state="pending")
             approval = self._create_approval_for_task(task=task, artifact=artifact)
 
         return {
@@ -1388,7 +1300,13 @@ class AgenticOSService:
             "records": results,
         }
 
-    def approve(self, approval_id: str, decision_note: Optional[str] = None) -> dict[str, Any]:
+    def approve(
+        self,
+        approval_id: str,
+        decision_note: Optional[str] = None,
+        *,
+        decided_by: Optional[str] = None,
+    ) -> dict[str, Any]:
         approval = self.db.get_approval(approval_id)
         if approval.status != "pending":
             self._record_task_operation_rejection(
@@ -1400,67 +1318,32 @@ class AgenticOSService:
                 current_status=approval.status,
             )
         approval = self.db.update_approval(approval_id, status="approved", decision_note=decision_note)
-        task = self.db.update_task(approval.task_id, status="approved", approval_state="approved")
-        self._append_event(task_id=task.id, event_type="approval_granted", payload={"approval": asdict(approval)})
-        self._try_send_approved_draft(task, approval)
+        task = self.db.get_task(approval.task_id)
+        if task.status == "done":
+            task = self.db.update_task(approval.task_id, approval_state="approved")
+            payload = {
+                "approval": asdict(approval),
+                "status_unchanged": True,
+                "current_status": task.status,
+            }
+        else:
+            task = self.db.update_task(approval.task_id, status="to_do", approval_state="approved")
+            payload = {"approval": asdict(approval), "status_unchanged": False}
+        payload["decided_by"] = decided_by or "unknown"
+        self._append_event(task_id=task.id, event_type="approval_granted", payload=payload)
+        # Promote Paperclip issue from backlog → todo now that approval is granted
+        cp = self._cp
+        if cp is not None and task.paperclip_issue_id:
+            cp.update_issue_status(task.paperclip_issue_id, task.status)
         return {"task": task, "approval": approval}
 
-    def _try_send_approved_draft(self, task: TaskRecord, approval: ApprovalRecord) -> None:
-        """If the approved task is a gmail_reply_draft, send the draft email to the original sender."""
-        if task.target != "gmail_reply_draft":
-            return
-        try:
-            artifacts = self.db.list_artifacts(task.id)
-            draft_artifact = next(
-                (a for a in artifacts if a["artifact_type"] == "email_draft"), None
-            )
-            if draft_artifact is None:
-                self._append_event(
-                    task_id=task.id,
-                    event_type="draft_send_skipped",
-                    payload={"reason": "no email_draft artifact found"},
-                )
-                return
-            content_raw = self.artifacts.read_text(draft_artifact["path"])
-            # Handle both plain text and JSON {"body": "..."} format
-            try:
-                parsed = json.loads(content_raw)
-                body = parsed.get("body") or parsed.get("text") or content_raw
-            except (json.JSONDecodeError, AttributeError):
-                body = content_raw
-
-            metadata: dict[str, Any] = {}
-            if task.request_metadata_json:
-                try:
-                    metadata = json.loads(task.request_metadata_json) or {}
-                except json.JSONDecodeError:
-                    pass
-            sender = str(metadata.get("sender") or "")
-            subject = str(metadata.get("subject") or task.user_request.splitlines()[0])
-            if not sender:
-                self._append_event(
-                    task_id=task.id,
-                    event_type="draft_send_skipped",
-                    payload={"reason": "no sender in request_metadata_json"},
-                )
-                return
-            from .gmail_sender import send_email
-            ok = send_email(to=sender, subject=f"Re: {subject}", body=str(body))
-            self._append_event(
-                task_id=task.id,
-                event_type="draft_sent" if ok else "draft_send_failed",
-                payload={"to": sender, "subject": subject, "success": ok},
-            )
-        except Exception as exc:  # noqa: BLE001
-            import sys
-            print(f"[service] _try_send_approved_draft failed: {exc}", file=sys.stderr)
-            self._append_event(
-                task_id=task.id,
-                event_type="draft_send_failed",
-                payload={"error": str(exc)},
-            )
-
-    def deny(self, approval_id: str, decision_note: Optional[str] = None) -> dict[str, Any]:
+    def deny(
+        self,
+        approval_id: str,
+        decision_note: Optional[str] = None,
+        *,
+        decided_by: Optional[str] = None,
+    ) -> dict[str, Any]:
         approval = self.db.get_approval(approval_id)
         if approval.status != "pending":
             self._record_task_operation_rejection(
@@ -1474,11 +1357,15 @@ class AgenticOSService:
         approval = self.db.update_approval(approval_id, status="denied", decision_note=decision_note)
         task = self.db.update_task(
             approval.task_id,
-            status="cancelled",
+            status="done",
             approval_state="denied",
             result_summary=decision_note or "Approval denied.",
         )
-        self._append_event(task_id=task.id, event_type="approval_denied", payload={"approval": asdict(approval)})
+        self._append_event(
+            task_id=task.id,
+            event_type="approval_denied",
+            payload={"approval": asdict(approval), "decided_by": decided_by or "unknown"},
+        )
         self._append_event(
             task_id=task.id,
             event_type="task_cancelled",
@@ -1488,8 +1375,7 @@ class AgenticOSService:
         if cp is not None:
             try:
                 if task.paperclip_issue_id:
-                    cp.update_issue_status(task.paperclip_issue_id, "cancelled")
-                    cp.add_comment(task.paperclip_issue_id, f"Cancelled: {task.result_summary or 'Approval denied.'}")
+                    cp.close_issue_cancelled(task.paperclip_issue_id)
             except Exception as _pc_exc:
                 self._append_event(
                     task_id=task.id,
@@ -1498,7 +1384,13 @@ class AgenticOSService:
                 )
         return {"task": task, "approval": approval}
 
-    def cancel(self, approval_id: str, decision_note: Optional[str] = None) -> dict[str, Any]:
+    def cancel(
+        self,
+        approval_id: str,
+        decision_note: Optional[str] = None,
+        *,
+        decided_by: Optional[str] = None,
+    ) -> dict[str, Any]:
         approval = self.db.get_approval(approval_id)
         if approval.status != "pending":
             self._record_task_operation_rejection(
@@ -1512,11 +1404,15 @@ class AgenticOSService:
         approval = self.db.update_approval(approval_id, status="cancelled", decision_note=decision_note)
         task = self.db.update_task(
             approval.task_id,
-            status="cancelled",
+            status="done",
             approval_state="cancelled",
             result_summary=decision_note or "Approval cancelled.",
         )
-        self._append_event(task_id=task.id, event_type="approval_cancelled", payload={"approval": asdict(approval)})
+        self._append_event(
+            task_id=task.id,
+            event_type="approval_cancelled",
+            payload={"approval": asdict(approval), "decided_by": decided_by or "unknown"},
+        )
         self._append_event(
             task_id=task.id,
             event_type="task_cancelled",
@@ -1526,8 +1422,7 @@ class AgenticOSService:
         if cp is not None:
             try:
                 if task.paperclip_issue_id:
-                    cp.update_issue_status(task.paperclip_issue_id, "cancelled")
-                    cp.add_comment(task.paperclip_issue_id, f"Cancelled: {task.result_summary or 'Approval cancelled.'}")
+                    cp.close_issue_cancelled(task.paperclip_issue_id)
             except Exception as _pc_exc:
                 self._append_event(
                     task_id=task.id,
@@ -1552,7 +1447,7 @@ class AgenticOSService:
                 message=f"task {task_id} has no operation_key",
                 operation="task.execute",
             )
-        if task.policy_decision == "approval_required" and task.approval_state != "approved":
+        if task.policy_decision in ("approve", "approve_plan", "approval_required") and task.approval_state != "approved":
             self._record_task_operation_rejection(
                 task_id=task_id,
                 code="approval_required",
@@ -1617,10 +1512,10 @@ class AgenticOSService:
             operation_key=task.operation_key,
             task_id=task.id,
             approval_id=approval_id_for_exec,
-            status="executed",
+            status="done",
             result_summary=result_summary,
         )
-        task = self.db.update_task(task.id, status="executed", result_summary=result_summary)
+        task = self.db.update_task(task.id, status="done", result_summary=result_summary)
         operator = self._operator_payload(
             action_source=task.action_source,
             target=task.target,
@@ -1653,7 +1548,7 @@ class AgenticOSService:
                 "result_summary": result_summary,
             },
         )
-        task = self.db.update_task(task.id, status="completed", result_summary=result_summary)
+        task = self.db.update_task(task.id, status="done", result_summary=result_summary)
         self._append_event(
             task_id=task.id,
             event_type="task_completed",
@@ -1670,386 +1565,56 @@ class AgenticOSService:
     def execute_custom_adapter_action(self, *, adapter_name: str, action_name: str) -> None:
         execute_custom_adapter(adapter_name=adapter_name, action_name=action_name)
 
-    def create_notion_task(
-        self,
-        *,
-        user_request: str,
-        classification: RequestClassification,
-        title: str,
-        status: Optional[str] = None,
-        task_type: Optional[str] = None,
-        area: Optional[str] = None,
-        target: str = "notion_task",
-        request_metadata: Optional[dict[str, Any]] = None,
-        operation_key: Optional[str] = None,
-    ) -> dict[str, Any]:
-        payload = self.create_request(
-            user_request=user_request,
-            classification=classification,
-            target=target,
-            request_metadata=request_metadata,
-            external_write=True,
-            operation_key=operation_key,
-            action_source="custom_adapter",
-        )
-        task = payload["task"]
-        adapter = self._require_notion_adapter()
-        adapter_payload = {
-            "adapter_name": "notion",
-            "action_name": "create_task",
-            "database_id": self.config.notion.database_id if self.config.notion else None,
-            "title": title,
-            "status": status,
-            "task_type": task_type,
-            "area": area or classification.domain,
-            "backend_task_id": task.id,
-            "operation_key": operation_key,
-        }
-        self._append_event(task_id=task.id, event_type="adapter_called", payload=adapter_payload)
-        try:
-            notion_task = adapter.create_task(
-                title=title,
-                status=status,
-                task_type=task_type,
-                area=area or classification.domain,
-                backend_task_id=task.id,
-                operation_key=operation_key,
-                last_agent_update=f"Created by agentic-os task {task.id}",
-            )
-        except Exception as exc:
-            return self._fail_adapter_task(task, adapter_payload, exc)
-        task = self.db.update_task(
-            task.id,
-            external_ref=notion_task.page_id,
-            result_summary=f"Created Notion task {notion_task.page_id}.",
-            status="completed",
-            external_write=True,
-        )
-        self._append_event(
-            task_id=task.id,
-            event_type="adapter_result",
-            payload={**adapter_payload, "page": self._serialize_notion_task(notion_task)},
-        )
-        self._append_event(
-            task_id=task.id,
-            event_type="task_completed",
-            payload={"result_summary": task.result_summary},
-        )
-        return {"task": task, "notion_task": self._serialize_notion_task(notion_task)}
-
-    def query_notion_tasks(
-        self,
-        *,
-        user_request: str,
-        classification: RequestClassification,
-        status: Optional[str] = None,
-        updated_since: Optional[str] = None,
-        limit: int = 20,
-        target: str = "notion_task_query",
-        request_metadata: Optional[dict[str, Any]] = None,
-    ) -> dict[str, Any]:
-        payload = self.create_request(
-            user_request=user_request,
-            classification=classification,
-            target=target,
-            request_metadata=request_metadata,
-            external_write=False,
-            action_source="custom_adapter",
-        )
-        task = payload["task"]
-        adapter = self._require_notion_adapter()
-        adapter_payload = {
-            "adapter_name": "notion",
-            "action_name": "query_tasks",
-            "status": status,
-            "updated_since": updated_since,
-            "limit": limit,
-        }
-        self._append_event(task_id=task.id, event_type="adapter_called", payload=adapter_payload)
-        try:
-            notion_tasks = adapter.query_tasks(status=status, updated_since=updated_since, limit=limit)
-        except Exception as exc:
-            return self._fail_adapter_task(task, adapter_payload, exc)
-        summary = f"Queried {len(notion_tasks)} Notion task(s)."
-        task = self.db.update_task(task.id, result_summary=summary, status="completed")
-        self._append_event(
-            task_id=task.id,
-            event_type="adapter_result",
-            payload={
-                **adapter_payload,
-                "items": [self._serialize_notion_task(item) for item in notion_tasks],
-            },
-        )
-        self._append_event(task_id=task.id, event_type="task_completed", payload={"result_summary": summary})
-        return {
-            "task": task,
-            "items": [self._serialize_notion_task(item) for item in notion_tasks],
-        }
-
-    def sync_notion_tasks(
-        self,
-        *,
-        user_request: str,
-        classification: RequestClassification,
-        statuses: Optional[list[str]] = None,
-        updated_since: Optional[str] = None,
-        limit: int = 50,
-        target: str = "notion_task_sync",
-        request_metadata: Optional[dict[str, Any]] = None,
-    ) -> dict[str, Any]:
-        status_filters = self._resolve_notion_sync_statuses(statuses)
-        payload = self.create_request(
-            user_request=user_request,
-            classification=classification,
-            target=target,
-            request_metadata=request_metadata,
-            external_write=False,
-            action_source="custom_adapter",
-        )
-        task = payload["task"]
-        adapter = self._require_notion_adapter()
-        adapter_payload = {
-            "adapter_name": "notion",
-            "action_name": "sync_tasks",
-            "statuses": status_filters,
-            "updated_since": updated_since,
-            "limit_per_status": limit,
-        }
-        self._append_event(task_id=task.id, event_type="adapter_called", payload=adapter_payload)
-        try:
-            notion_by_page_id: dict[str, NotionTask] = {}
-            for status in status_filters:
-                for notion_task in adapter.query_tasks(
-                    status=status,
-                    updated_since=updated_since,
-                    limit=limit,
-                ):
-                    notion_by_page_id[notion_task.page_id] = notion_task
-        except Exception as exc:
-            return self._fail_adapter_task(task, adapter_payload, exc)
-
-        imported: list[dict[str, Any]] = []
-        existing: list[dict[str, Any]] = []
-        for notion_task in notion_by_page_id.values():
-            existing_task = self.db.get_task_by_external_ref(notion_task.page_id)
-            if existing_task is not None:
-                existing.append(
-                    {
-                        "task": asdict(existing_task),
-                        "notion_task": self._serialize_notion_task(notion_task),
-                        "match": "external_ref",
-                    }
-                )
-                continue
-
-            if notion_task.operation_key:
-                operation_key_task = self.db.get_task_by_operation_key(notion_task.operation_key)
-                if operation_key_task is not None:
-                    if operation_key_task.external_ref != notion_task.page_id:
-                        operation_key_task = self.db.update_task(
-                            operation_key_task.id,
-                            external_ref=notion_task.page_id,
-                        )
-                    existing.append(
-                        {
-                            "task": asdict(operation_key_task),
-                            "notion_task": self._serialize_notion_task(notion_task),
-                            "match": "operation_key",
-                        }
-                    )
-                    continue
-
-            synced_task = self._create_synced_notion_capture_task(
-                notion_task=notion_task,
-                parent_task_id=task.id,
-            )
-            imported.append(
-                {
-                    "task": asdict(synced_task),
-                    "notion_task": self._serialize_notion_task(notion_task),
-                }
-            )
-
-        summary = (
-            f"Synced {len(notion_by_page_id)} Notion task(s): "
-            f"{len(imported)} imported, {len(existing)} already linked."
-        )
-        task = self.db.update_task(task.id, result_summary=summary, status="completed")
-        self._append_event(
-            task_id=task.id,
-            event_type="adapter_result",
-            payload={
-                **adapter_payload,
-                "queried_count": len(notion_by_page_id),
-                "imported_count": len(imported),
-                "existing_count": len(existing),
-                "imported_task_ids": [item["task"]["id"] for item in imported],
-                "existing_task_ids": [item["task"]["id"] for item in existing],
-            },
-        )
-        self._append_event(task_id=task.id, event_type="task_completed", payload={"result_summary": summary})
-        return {
-            "task": task,
-            "statuses": status_filters,
-            "updated_since": updated_since,
-            "limit_per_status": limit,
-            "queried_count": len(notion_by_page_id),
-            "imported_count": len(imported),
-            "existing_count": len(existing),
-            "imported": imported,
-            "existing": existing,
-        }
-
-    def get_notion_task(
-        self,
-        *,
-        user_request: str,
-        classification: RequestClassification,
-        page_id: str,
-        target: str = "notion_task_detail",
-        request_metadata: Optional[dict[str, Any]] = None,
-    ) -> dict[str, Any]:
-        payload = self.create_request(
-            user_request=user_request,
-            classification=classification,
-            target=target,
-            request_metadata=request_metadata,
-            external_write=False,
-            action_source="custom_adapter",
-        )
-        task = payload["task"]
-        adapter = self._require_notion_adapter()
-        adapter_payload = {
-            "adapter_name": "notion",
-            "action_name": "get_task",
-            "page_id": page_id,
-        }
-        self._append_event(task_id=task.id, event_type="adapter_called", payload=adapter_payload)
-        try:
-            notion_task = adapter.get_task(page_id)
-        except Exception as exc:
-            return self._fail_adapter_task(task, adapter_payload, exc)
-        summary = f"Fetched Notion task {page_id}."
-        task = self.db.update_task(task.id, result_summary=summary, status="completed", external_ref=page_id)
-        self._append_event(
-            task_id=task.id,
-            event_type="adapter_result",
-            payload={**adapter_payload, "page": self._serialize_notion_task(notion_task)},
-        )
-        self._append_event(task_id=task.id, event_type="task_completed", payload={"result_summary": summary})
-        return {"task": task, "notion_task": self._serialize_notion_task(notion_task)}
-
-    def update_notion_task_status(
-        self,
-        *,
-        task_id: str,
-        notion_page_id: Optional[str] = None,
-        backend_status: str,
-        note: Optional[str] = None,
-        target: str = "notion_task_status",
-    ) -> dict[str, Any]:
-        task = self.db.get_task(task_id)
-        adapter = self._require_notion_adapter()
-        page_id = notion_page_id or task.external_ref
-        if not page_id:
-            raise ValueError(f"task {task_id} has no Notion external_ref and no page id was provided")
-        notion_status = self._map_backend_status_to_notion(backend_status)
-        adapter_payload = {
-            "adapter_name": "notion",
-            "action_name": "update_task_status",
-            "page_id": page_id,
-            "backend_status": backend_status,
-            "notion_status": notion_status,
-        }
-        self._append_event(task_id=task.id, event_type="adapter_called", payload=adapter_payload)
-        try:
-            notion_task = adapter.update_task_status(
-                page_id=page_id,
-                status=notion_status,
-                last_agent_update=note or f"Backend task {task.id} moved to {backend_status}.",
-            )
-        except Exception as exc:
-            return self._fail_adapter_task(task, adapter_payload, exc)
-        self._append_event(
-            task_id=task.id,
-            event_type="adapter_result",
-            payload={**adapter_payload, "page": self._serialize_notion_task(notion_task)},
-        )
-        return {"task": task, "notion_task": self._serialize_notion_task(notion_task)}
-
-    def append_notion_task_note(
-        self,
-        *,
-        task_id: str,
-        note: str,
-        notion_page_id: Optional[str] = None,
-        target: str = "notion_task_note",
-    ) -> dict[str, Any]:
-        task = self.db.get_task(task_id)
-        adapter = self._require_notion_adapter()
-        page_id = notion_page_id or task.external_ref
-        if not page_id:
-            raise ValueError(f"task {task_id} has no Notion external_ref and no page id was provided")
-        adapter_payload = {
-            "adapter_name": "notion",
-            "action_name": "append_note",
-            "page_id": page_id,
-            "target": target,
-        }
-        self._append_event(task_id=task.id, event_type="adapter_called", payload=adapter_payload)
-        try:
-            append_result = adapter.append_note(page_id=page_id, note=note)
-            notion_task = adapter.update_task_properties(
-                page_id=page_id,
-                last_agent_update=note[:500],
-            )
-        except Exception as exc:
-            return self._fail_adapter_task(task, adapter_payload, exc)
-        self._append_event(
-            task_id=task.id,
-            event_type="adapter_result",
-            payload={
-                **adapter_payload,
-                "append_result": append_result,
-                "page": self._serialize_notion_task(notion_task),
-            },
-        )
-        return {
-            "task": task,
-            "append_result": append_result,
-            "notion_task": self._serialize_notion_task(notion_task),
-        }
-
     def complete_task(
         self,
         task_id: str,
         result_summary: str = "",
         *,
         artifact_ref: Optional[str] = None,
-        paperclip_content: Optional[str] = None,
-        artifact_path: Optional[str] = None,
     ) -> TaskRecord:
         """
         Mark task as executed with result summary and optional artifact reference.
 
-        paperclip_content: full result text for Paperclip writeback (uses long-doc path
-            when len > LONG_RESULT_THRESHOLD). Defaults to result_summary when not provided.
-        artifact_path: filesystem path to the result artifact for Paperclip attachment upload.
+        No Paperclip writeback happens here: the runtime (the agent session
+        itself) posts canonical issue comments as its own assignee identity
+        and thus is wake-safe, while the backend cannot safely comment on
+        open issues. Lifecycle state is mirrored Paperclip → backend by the
+        reconciler, not the reverse.
         """
         task = self.db.get_task(task_id)
-        if task.status in {"completed", "cancelled"}:
-            self._record_task_operation_rejection(
-                task_id=task_id,
-                code="task_not_completable",
-                message=f"task {task_id} cannot be completed from status {task.status}",
-                operation="task.complete",
-                current_status=task.status,
-            )
-        # Use "executed" for artifact-based completion, "completed" for direct completion
-        status = "executed" if artifact_ref else "completed"
-        task = self.db.update_task(
-            task_id,
-            status=status,
+        if self._is_github_contribution_task(task):
+            metadata = self._request_metadata_dict(task)
+            contribution = metadata.get("github_contribution")
+            if not isinstance(contribution, dict) or str(contribution.get("pr_status") or "") != "merged":
+                target_status = self._contribution_backend_status(
+                    contribution if isinstance(contribution, dict) else {}
+                )
+                if task.status != target_status:
+                    task = self._transition_task(
+                        task_id,
+                        target_status,
+                        result_summary=result_summary,
+                        artifact_ref=artifact_ref,
+                    )
+                else:
+                    task = self.db.update_task(
+                        task_id,
+                        result_summary=result_summary,
+                        artifact_ref=artifact_ref,
+                    )
+                self._append_event(
+                    task_id=task_id,
+                    event_type="github_contribution_completion_blocked",
+                    payload={
+                        "result_summary": result_summary,
+                        "artifact_ref": artifact_ref,
+                        "contribution": contribution if isinstance(contribution, dict) else {},
+                    },
+                )
+                return task
+        target_status = "done"
+        task = self._transition_task(
+            task_id, target_status,
             result_summary=result_summary,
             artifact_ref=artifact_ref,
         )
@@ -2059,76 +1624,98 @@ class AgenticOSService:
             payload={"result_summary": result_summary, "artifact_ref": artifact_ref},
         )
 
-        # Paperclip writeback — status + rich result (doc/comment/artifact)
-        cp = self._cp
-        if cp is not None:
-            try:
-                if task.paperclip_issue_id:
-                    executor_key = cp.resolve_executor_key(task)
-                    cp.update_issue_status(
-                        task.paperclip_issue_id,
-                        task.status,
-                        assignee_key=executor_key,
-                    )
-                    pc_text = paperclip_content or result_summary
-                    if pc_text:
-                        from pathlib import Path as _Path
-                        cp.write_result(
-                            task.paperclip_issue_id,
-                            pc_text,
-                            task_id=task_id,
-                            artifact_path=_Path(artifact_path) if artifact_path else None,
-                        )
-            except Exception as _pc_exc:
-                self._append_event(
-                    task_id=task_id,
-                    event_type="paperclip_sync_failed",
-                    payload={"error": str(_pc_exc), "op": "complete"},
-                )
-
         # Send completion notification
         try:
             from .notifier import notify_task_completed
             word_count = len(result_summary.split()) if task.intent_type == "content" else None
             notify_task_completed(task, word_count=word_count)
-        except Exception:
-            pass
+        except Exception as _exc:
+            _log.warning("notify_task_completed failed for %s: %s", task_id, _exc)
+
+        return task
+
+    def record_github_contribution_result(
+        self,
+        task_id: str,
+        *,
+        result_summary: str,
+        artifact_ref: Optional[str],
+        contribution: dict[str, Any],
+    ) -> TaskRecord:
+        task = self.db.get_task(task_id)
+        metadata = self._request_metadata_dict(task)
+        metadata["task_kind"] = _GITHUB_CONTRIBUTION_KIND
+
+        existing = metadata.get("github_contribution")
+        merged: dict[str, Any] = dict(existing) if isinstance(existing, dict) else {}
+        for key, value in contribution.items():
+            merged[key] = value
+        if not merged.get("responsible_assignee"):
+            merged["responsible_assignee"] = metadata.get("agent")
+        if not merged.get("repo_strategy_path") and merged.get("repo_name"):
+            merged["repo_strategy_path"] = (
+                f"/Users/dara/agents/projects/technical/repo-strategy/{merged['repo_name']}.md"
+            )
+        metadata["github_contribution"] = merged
+
+        target_status = self._contribution_backend_status(merged)
+        request_metadata_json = self._dump_json_or_none(metadata)
+
+        if task.status != target_status:
+            task = self._transition_task(
+                task_id,
+                target_status,
+                result_summary=result_summary,
+                artifact_ref=artifact_ref,
+                request_metadata_json=request_metadata_json,
+            )
+        else:
+            task = self.db.update_task(
+                task_id,
+                result_summary=result_summary,
+                artifact_ref=artifact_ref,
+                request_metadata_json=request_metadata_json,
+            )
+
+        self._append_event(
+            task_id=task_id,
+            event_type="github_contribution_lifecycle_updated",
+            payload={
+                "result_summary": result_summary,
+                "artifact_ref": artifact_ref,
+                "github_contribution": merged,
+                "backend_status": target_status,
+            },
+        )
+
+        if target_status == "done":
+            self._append_event(
+                task_id=task_id,
+                event_type="task_completed",
+                payload={"result_summary": result_summary, "artifact_ref": artifact_ref},
+            )
+            try:
+                from .notifier import notify_task_completed
+                notify_task_completed(task)
+            except Exception as _exc:
+                _log.warning("notify_task_completed failed for %s: %s", task_id, _exc)
 
         return task
 
     def fail_task(self, task_id: str, reason: str) -> TaskRecord:
-        task = self.db.get_task(task_id)
-        if task.status in {"completed", "cancelled"}:
-            self._record_task_operation_rejection(
-                task_id=task_id,
-                code="task_not_failable",
-                message=f"task {task_id} cannot be failed from status {task.status}",
-                operation="task.fail",
-                current_status=task.status,
-            )
-        task = self.db.update_task(task_id, status="failed", result_summary=reason)
+        task = self._transition_task(task_id, "done", result_summary=reason)
         self._append_event(task_id=task.id, event_type="task_failed", payload={"reason": reason})
 
-        # Paperclip writeback — status + failure comment
-        cp = self._cp
-        if cp is not None:
-            try:
-                if task.paperclip_issue_id:
-                    cp.update_issue_status(task.paperclip_issue_id, "failed")
-                    cp.post_failure_comment(task.paperclip_issue_id, reason[:500])
-            except Exception as _pc_exc:
-                self._append_event(
-                    task_id=task_id,
-                    event_type="paperclip_sync_failed",
-                    payload={"error": str(_pc_exc), "op": "fail"},
-                )
+        # No Paperclip comment here: see operator_close_task / write_result
+        # for the rationale. Backend-posted comments on open issues would
+        # wake the assignee via Paperclip's `issue_commented` path.
 
         # Send Discord notification
         try:
             from .notifier import notify_task_failed
             notify_task_failed(task)
-        except Exception:
-            pass
+        except Exception as _exc:
+            _log.warning("notify_task_failed failed for %s: %s", task_id, _exc)
 
         return task
 
@@ -2141,7 +1728,7 @@ class AgenticOSService:
             # Max retries exceeded, fail the task
             task = self.db.update_task(
                 task_id,
-                status="failed",
+                status="done",
                 result_summary=f"Max retries exceeded. Last feedback: {feedback}",
                 retry_count=retry_count,
             )
@@ -2171,50 +1758,14 @@ class AgenticOSService:
     # ------------------------------------------------------------------
 
     def flag_stalled_tasks(self, threshold_hours: float = 2.0) -> dict:
-        """
-        Scan for in_progress/awaiting_input tasks silent for >threshold_hours,
-        flag them as stalled, and fire Discord DM alerts.
-
-        Called by the stall-check cron job.
-        """
-        from .recovery import scan_and_flag_stalled_tasks
-        return scan_and_flag_stalled_tasks(self, threshold_hours=threshold_hours)
+        return {"scanned": 0, "flagged": 0, "already_stalled": 0, "threshold_hours": threshold_hours}
 
     def retry_task(self, task_id: str, *, feedback: str = "operator retry") -> dict:
-        """
-        Operator-initiated retry for a stalled or failed task.
+        task = self.reset_task_for_retry(task_id, feedback=feedback)
+        return {"task_id": task.id, "new_status": task.status, "retry_count": task.retry_count}
 
-        Delegates to recovery.retry_stalled_task() which calls
-        reset_task_for_retry() (max 2 retries enforced there).
-        """
-        from .recovery import retry_stalled_task
-        return retry_stalled_task(self, task_id, feedback=feedback)
-
-    def evaluate_policy(
-        self,
-        *,
-        classification: RequestClassification,
-        target: Optional[str],
-        external_write: bool,
-        action_source: Optional[str] = None,
-    ) -> str:
-        rules = load_policy_rules(self.paths.policy_rules_path)
-        context = {
-            "domain": classification.domain,
-            "intent_type": classification.intent_type,
-            "risk_level": classification.risk_level,
-            "target": target,
-            "external_write": external_write,
-            "action_source": action_source,
-        }
-        for rule in rules:
-            match = rule.get("match", {})
-            if all(context.get(key) == value for key, value in match.items()):
-                action = rule["action"]
-                if action not in ("read_ok", "draft_required", "approval_required"):
-                    raise ValueError(f"unsupported policy action: {action}")
-                return action
-        raise ValueError(f"no policy rule matched for {context}")
+    # evaluate_policy removed — policy resolution is now handled by
+    # policy_engine.resolve() called directly in create_request().
 
     def _create_artifact(
         self,
@@ -2284,18 +1835,16 @@ class AgenticOSService:
         try:
             from .notifier import notify_approval_requested
             notify_approval_requested(task, approval)
-        except Exception:
-            pass
+        except Exception as _exc:
+            _log.warning("notify_approval_requested failed for %s: %s", task.id, _exc)
 
         return approval
 
     @staticmethod
     def _task_state_for_policy(policy_decision: str) -> tuple[str, str]:
-        if policy_decision == "approval_required":
-            return ("awaiting_approval", "pending")
-        if policy_decision == "draft_required":
-            return ("awaiting_input", "not_needed")
-        return ("in_progress", "not_needed")
+        if policy_decision in ("approve", "approve_plan"):
+            return ("to_do", "pending")
+        return ("to_do", "not_needed")
 
     @staticmethod
     def _dump_json_or_none(payload: Optional[dict[str, Any]]) -> Optional[str]:
@@ -2318,6 +1867,22 @@ class AgenticOSService:
     def _is_runtime_followup_task(self, task: TaskRecord) -> bool:
         metadata = self._request_metadata_dict(task)
         return str(metadata.get("task_kind", "")).strip() in _RUNTIME_FOLLOWUP_KINDS
+
+    def _is_github_contribution_task(self, task: TaskRecord) -> bool:
+        metadata = self._request_metadata_dict(task)
+        if str(metadata.get("task_kind", "")).strip() == _GITHUB_CONTRIBUTION_KIND:
+            return True
+        return isinstance(metadata.get("github_contribution"), dict)
+
+    @staticmethod
+    def _contribution_backend_status(contribution: dict[str, Any]) -> str:
+        pr_status = str(contribution.get("pr_status") or "").strip()
+        lifecycle_state = str(contribution.get("lifecycle_state") or "").strip()
+        if pr_status == "merged" or lifecycle_state == "merged_ready_to_close":
+            return "done"
+        if pr_status == "closed_unmerged" or lifecycle_state == "closed_unmerged":
+            return "to_do"
+        return "in_progress"
 
     @staticmethod
     def _load_json_or_none(payload: Optional[str]) -> Optional[dict[str, Any]]:
@@ -2397,209 +1962,6 @@ class AgenticOSService:
         )
         raise OperatorError(code=code, message=message, details={"task_id": task_id, "operation": operation, **details})
 
-    def _build_yesterday_recap(self, run_date: str) -> YesterdayRecap:
-        tasks = self.list_tasks(limit=500)
-        yesterday = self._date_offset(run_date, days=-1)
-        completed = [
-            summarize_task_for_yesterday(task.user_request, task.result_summary)
-            for task in tasks
-            if task.updated_at[:10] == yesterday and task.status == "completed"
-        ][:5]
-        blocked = [
-            summarize_task_for_yesterday(task.user_request, task.result_summary)
-            for task in tasks
-            if task.updated_at[:10] == yesterday and task.status in {"failed", "awaiting_input", "awaiting_approval"}
-        ][:5]
-        still_open = [
-            summarize_task_for_yesterday(task.user_request, task.result_summary)
-            for task in tasks
-            if task.status in {"new", "in_progress", "awaiting_input", "awaiting_approval", "approved", "executed"}
-            and task.created_at[:10] <= yesterday
-        ][:5]
-        return YesterdayRecap(completed=completed, blocked=blocked, still_open=still_open)
-
-    @staticmethod
-    def _date_offset(run_date: str, *, days: int) -> str:
-        return (datetime.fromisoformat(run_date).date()).fromordinal(
-            datetime.fromisoformat(run_date).date().toordinal() + days
-        ).isoformat()
-
-    def _create_daily_followup_task(self, *, action: FollowUpAction, parent_task_id: str) -> TaskRecord:
-        payload = self.create_request(
-            user_request=action.title,
-            classification=RequestClassification(
-                domain=action.domain,
-                intent_type="capture",
-                risk_level="low",
-            ).validate(),
-            target="daily_routine_followup",
-            request_metadata={
-                "source": "daily_routine",
-                "parent_task_id": parent_task_id,
-                "source_kind": action.source_kind,
-                "source_title": action.source_title,
-                "rationale": action.rationale,
-            },
-            external_write=False,
-            operation_key=action.operation_key,
-            result_summary=action.summary,
-            action_source="custom_adapter",
-        )
-        task = self.db.update_task(payload["task"].id, status="completed", result_summary=action.summary)
-        self._append_event(
-            task_id=task.id,
-            event_type="daily_routine_followup_created",
-            payload=self._serialize_follow_up_action(action),
-        )
-        self._append_event(
-            task_id=task.id,
-            event_type="task_completed",
-            payload={"result_summary": action.summary},
-        )
-        return task
-
-    def _create_daily_followup_notion_task(
-        self,
-        *,
-        action: FollowUpAction,
-        parent_task_id: str,
-        backend_task_id: str,
-    ) -> Optional[dict[str, Any]]:
-        if self.config.notion is None:
-            return None
-        notion_operation_key = f"{action.operation_key}-notion"
-        existing = self.db.get_task_by_operation_key(notion_operation_key)
-        if existing is not None:
-            return {
-                "task": asdict(existing),
-                "skipped": True,
-                "reason": "existing Notion task operation_key",
-            }
-        try:
-            result = self.create_notion_task(
-                user_request=f"Create Notion follow-up for {action.title}",
-                classification=RequestClassification(
-                    domain=infer_domain(action.source_kind, area=action.domain),
-                    intent_type="capture",
-                    risk_level="low",
-                ).validate(),
-                title=action.notion_title or action.title,
-                status="Inbox",
-                task_type="task",
-                area=action.domain,
-                target="notion_task",
-                request_metadata={
-                    "source": "daily_routine",
-                    "parent_task_id": parent_task_id,
-                    "backend_followup_task_id": backend_task_id,
-                    "source_kind": action.source_kind,
-                    "source_title": action.source_title,
-                },
-                operation_key=notion_operation_key,
-            )
-        except Exception as exc:
-            return {
-                "skipped": True,
-                "reason": str(exc),
-                "operation_key": notion_operation_key,
-            }
-        return {
-            "task": asdict(result["task"]),
-            "notion_task": result["notion_task"],
-            "skipped": False,
-        }
-
-    @staticmethod
-    def _resolve_notion_sync_statuses(statuses: Optional[list[str]]) -> list[str]:
-        if not statuses:
-            return ["Inbox"]
-        resolved: list[str] = []
-        seen: set[str] = set()
-        for status in statuses:
-            value = str(status).strip()
-            if not value:
-                continue
-            normalized = value.lower()
-            if normalized in seen:
-                continue
-            seen.add(normalized)
-            resolved.append(value)
-        return resolved or ["Inbox"]
-
-    def _create_synced_notion_capture_task(
-        self,
-        *,
-        notion_task: NotionTask,
-        parent_task_id: str,
-    ) -> TaskRecord:
-        inferred_domain = self._infer_domain_from_notion_area(notion_task.area)
-        summary = (
-            f"Imported Notion task '{notion_task.title}' "
-            f"(status={notion_task.status or 'unknown'})."
-        )
-        payload = self.create_request(
-            user_request=notion_task.title or f"Synced Notion task {notion_task.page_id}",
-            classification=RequestClassification(
-                domain=inferred_domain,
-                intent_type="capture",
-                risk_level="low",
-            ).validate(),
-            target="notion_task_sync_item",
-            request_metadata={
-                "source": "notion_sync",
-                "parent_task_id": parent_task_id,
-                "notion_page_id": notion_task.page_id,
-                "notion_status": notion_task.status,
-                "notion_url": notion_task.url,
-                "notion_last_edited_time": notion_task.last_edited_time,
-            },
-            external_ref=notion_task.page_id,
-            operation_key=notion_task.operation_key,
-            result_summary=summary,
-            action_source="custom_adapter",
-        )
-        task = self.db.update_task(
-            payload["task"].id,
-            status="completed",
-            result_summary=summary,
-            external_ref=notion_task.page_id,
-        )
-        self._append_event(
-            task_id=task.id,
-            event_type="notion_sync_imported",
-            payload={
-                "parent_task_id": parent_task_id,
-                "notion_page_id": notion_task.page_id,
-                "notion_status": notion_task.status,
-                "notion_last_edited_time": notion_task.last_edited_time,
-            },
-        )
-        self._append_event(task_id=task.id, event_type="task_completed", payload={"result_summary": summary})
-        return task
-
-    @staticmethod
-    def _infer_domain_from_notion_area(area: Optional[str]) -> str:
-        if area is None:
-            return "technical"
-        normalized = area.strip().lower()
-        for domain in ("personal", "technical", "finance", "system"):
-            if domain in normalized:
-                return domain
-        return "technical"
-
-    @staticmethod
-    def _serialize_follow_up_action(action: FollowUpAction) -> dict[str, Any]:
-        return {
-            "title": action.title,
-            "summary": action.summary,
-            "domain": action.domain,
-            "source_kind": action.source_kind,
-            "source_title": action.source_title,
-            "operation_key": action.operation_key,
-            "notion_title": action.notion_title,
-            "rationale": action.rationale,
-        }
-
     @staticmethod
     def _task_snapshot(task: TaskRecord) -> dict[str, Any]:
         return {
@@ -2634,22 +1996,13 @@ class AgenticOSService:
             group[task.status] = group.get(task.status, 0) + 1
         return groups
 
-    def _require_notion_adapter(self) -> NotionAdapter:
-        if self.config.notion is None:
-            raise ValueError(
-                f"Notion is not configured. Add {self.paths.config_path} with a notion block first."
-            )
-        if self._notion_adapter is None:
-            self._notion_adapter = NotionAdapter(self.config.notion)
-        return self._notion_adapter
-
     def _fail_adapter_task(
         self,
         task: TaskRecord,
         adapter_payload: dict[str, Any],
         exc: Exception,
     ) -> dict[str, Any]:
-        task = self.db.update_task(task.id, status="failed", result_summary=str(exc))
+        task = self.db.update_task(task.id, status="done", result_summary=str(exc))
         self._append_event(
             task_id=task.id,
             event_type="adapter_failed",
@@ -2658,33 +2011,12 @@ class AgenticOSService:
         self._append_event(task_id=task.id, event_type="task_failed", payload={"reason": str(exc)})
         raise exc
 
-    def _map_backend_status_to_notion(self, backend_status: str) -> str:
-        if backend_status not in self.config.notion.status_map:
-            raise ValueError(f"no Notion status mapping configured for backend status {backend_status}")
-        return self.config.notion.status_map[backend_status]
-
     def record_session_key(self, task_id: str, session_key: str) -> None:
         """Record the OpenClaw session key for a task's execution."""
         task = self.db.get_task(task_id)
         if not task.operation_key:
             raise ValueError(f"Task {task_id} has no operation_key")
         self.db.update_execution_session_key(operation_key=task.operation_key, session_key=session_key)
-
-    @staticmethod
-    def _serialize_notion_task(task: NotionTask) -> dict[str, Any]:
-        return {
-            "page_id": task.page_id,
-            "url": task.url,
-            "title": task.title,
-            "status": task.status,
-            "task_type": task.task_type,
-            "area": task.area,
-            "backend_task_id": task.backend_task_id,
-            "operation_key": task.operation_key,
-            "last_agent_update": task.last_agent_update,
-            "last_edited_time": task.last_edited_time,
-            "archived": task.archived,
-        }
 
     @staticmethod
     def _today_utc_date() -> str:
@@ -2708,8 +2040,8 @@ class AgenticOSService:
         domain: Optional[str] = None,
         threshold_hours: float = 48.0,
     ) -> list[dict[str, Any]]:
-        """Return snapshots of tasks with no update for >threshold_hours and not in a terminal state."""
-        terminal = {"completed", "failed", "cancelled", "executed"}
+        """Return snapshots of tasks with no update for >threshold_hours and not done."""
+        terminal = {"done"}
         all_tasks = self.list_tasks(limit=500, domain=domain)
         now_utc = datetime.now(timezone.utc)
         overdue = []

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
 import sys
 from dataclasses import asdict, is_dataclass
@@ -10,8 +11,6 @@ from typing import Any, Optional
 
 from .config import default_paths
 from .models import ACTION_SOURCES, DOMAINS, OperatorError, RequestClassification, STATUSES
-from .notion import NotionError
-from .openclaw_bridge import normalize_openclaw_daily_routine_payload
 from .service import AgenticOSService
 
 
@@ -62,7 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
     recap_subparsers = recap_parser.add_subparsers(dest="recap_command", required=True)
     create_recap_today_parser(recap_subparsers)
     create_recap_approvals_parser(recap_subparsers)
-    create_recap_drafts_parser(recap_subparsers)
+    create_recap_awaiting_input_parser(recap_subparsers)
     create_recap_failures_parser(recap_subparsers)
     create_recap_external_actions_parser(recap_subparsers)
     create_recap_overdue_parser(recap_subparsers)
@@ -77,39 +76,17 @@ def build_parser() -> argparse.ArgumentParser:
     create_openclaw_read_parser(openclaw_subparsers)
     create_openclaw_draft_parser(openclaw_subparsers)
     create_openclaw_execution_parser(openclaw_subparsers)
-    create_openclaw_daily_routine_parser(openclaw_subparsers)
 
     adapter_parser = subparsers.add_parser("adapter", help="Future custom-adapter seam")
     adapter_subparsers = adapter_parser.add_subparsers(dest="adapter_command", required=True)
     create_adapter_execute_parser(adapter_subparsers)
-
-    notion_parser = subparsers.add_parser("notion", help="Thin Notion adapter operations")
-    notion_subparsers = notion_parser.add_subparsers(dest="notion_command", required=True)
-    create_notion_create_parser(notion_subparsers)
-    create_notion_query_parser(notion_subparsers)
-    create_notion_sync_parser(notion_subparsers)
-    create_notion_get_parser(notion_subparsers)
-    create_notion_update_status_parser(notion_subparsers)
-    create_notion_append_note_parser(notion_subparsers)
-
-    daily_routine_parser = subparsers.add_parser("daily-routine", help="Phase 1 daily routine support flow")
-    daily_routine_subparsers = daily_routine_parser.add_subparsers(dest="daily_routine_command", required=True)
-    create_daily_routine_run_parser(daily_routine_subparsers)
-
-    calendar_parser = subparsers.add_parser("calendar", help="Google Calendar operations (agent inbox)")
-    calendar_subparsers = calendar_parser.add_subparsers(dest="calendar_command", required=True)
-    create_calendar_list_parser(calendar_subparsers)
-    create_calendar_create_parser(calendar_subparsers)
-    create_calendar_block_parser(calendar_subparsers)
-    create_calendar_update_parser(calendar_subparsers)
-    create_calendar_delete_parser(calendar_subparsers)
-    create_calendar_remind_parser(calendar_subparsers)
 
     retry_parser = subparsers.add_parser("retry", help="Retry a stalled or failed task")
     retry_parser.add_argument("task_id")
     retry_parser.add_argument("--feedback", default="operator retry")
 
     subparsers.add_parser("health", help="Print system health snapshot")
+    subparsers.add_parser("config-url", help="Print the configured agentic-os base URL")
     paperclip_parser = subparsers.add_parser("paperclip", help="Paperclip diagnostics")
     paperclip_subparsers = paperclip_parser.add_subparsers(dest="paperclip_command", required=True)
     create_paperclip_diagnostics_parser(paperclip_subparsers)
@@ -125,6 +102,7 @@ def create_request_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument("--domain", required=True)
     parser.add_argument("--intent", required=True, dest="intent_type")
     parser.add_argument("--risk", required=True, dest="risk_level")
+    parser.add_argument("--agent-key", required=True, dest="agent_key")
     parser.add_argument("--request", required=True, dest="user_request")
     parser.add_argument("--target")
     parser.add_argument("--metadata-json")
@@ -135,6 +113,7 @@ def create_request_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument("--artifact-type")
     parser.add_argument("--artifact-text")
     parser.add_argument("--artifact-json")
+    parser.add_argument("--labels", nargs="*", default=[])
 
 
 def create_task_list_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -298,7 +277,7 @@ def create_openclaw_read_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument("--artifact-type")
     parser.add_argument("--artifact-text")
     parser.add_argument("--artifact-json")
-    parser.add_argument("--action-source", default="openclaw_tool")
+    parser.add_argument("--action-source", default="tool")
 
 
 def create_openclaw_draft_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -314,7 +293,7 @@ def create_openclaw_draft_parser(subparsers: argparse._SubParsersAction) -> None
     parser.add_argument("--summary")
     parser.add_argument("--target")
     parser.add_argument("--metadata-json")
-    parser.add_argument("--action-source", default="openclaw_skill")
+    parser.add_argument("--action-source", default="tool")
 
 
 def create_openclaw_execution_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -335,193 +314,13 @@ def create_openclaw_execution_parser(subparsers: argparse._SubParsersAction) -> 
     parser.add_argument("--artifact-type")
     parser.add_argument("--artifact-text")
     parser.add_argument("--artifact-json")
-    parser.add_argument("--action-source", default="openclaw_tool")
-
-
-def create_openclaw_daily_routine_parser(subparsers: argparse._SubParsersAction) -> None:
-    parser = subparsers.add_parser(
-        "daily-routine",
-        help="Normalize OpenClaw summary payloads and run the daily routine flow",
-    )
-    parser.add_argument("--input-file")
-    parser.add_argument("--input-json")
-    parser.add_argument("--date")
-    parser.add_argument("--timezone")
-    parser.add_argument("--recipient")
-    parser.add_argument("--delivery-time")
-    parser.add_argument("--no-notion", action="store_true")
-    parser.add_argument("--print-normalized", action="store_true")
-    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--action-source", default="tool")
 
 
 def create_adapter_execute_parser(subparsers: argparse._SubParsersAction) -> None:
     parser = subparsers.add_parser("execute", help="Call the future custom-adapter seam")
     parser.add_argument("--adapter-name", required=True)
     parser.add_argument("--action-name", required=True)
-
-
-def create_notion_create_parser(subparsers: argparse._SubParsersAction) -> None:
-    parser = subparsers.add_parser("create-task", help="Create a Notion task and persist the backend external_ref")
-    parser.add_argument("--domain", required=True)
-    parser.add_argument("--risk", required=True, dest="risk_level")
-    parser.add_argument("--request", required=True, dest="user_request")
-    parser.add_argument("--title", required=True)
-    parser.add_argument("--status")
-    parser.add_argument("--task-type")
-    parser.add_argument("--area")
-    parser.add_argument("--target", default="notion_task")
-    parser.add_argument("--metadata-json")
-    parser.add_argument("--operation-key")
-
-
-def create_notion_query_parser(subparsers: argparse._SubParsersAction) -> None:
-    parser = subparsers.add_parser("query-tasks", help="Query Notion tasks by status and/or updated timestamp")
-    parser.add_argument("--request", default="Query Notion tasks")
-    parser.add_argument("--status")
-    parser.add_argument("--updated-since")
-    parser.add_argument("--limit", type=int, default=20)
-    parser.add_argument("--domain", default="technical")
-    parser.add_argument("--risk", default="low", dest="risk_level")
-    parser.add_argument("--metadata-json")
-
-
-def create_notion_sync_parser(subparsers: argparse._SubParsersAction) -> None:
-    parser = subparsers.add_parser(
-        "sync-tasks",
-        help="Import Notion tasks into backend durable state for heartbeat/cron intake",
-    )
-    parser.add_argument("--request", default="Sync Notion tasks into backend durable state")
-    parser.add_argument(
-        "--status",
-        action="append",
-        default=[],
-        help="Notion status filter to sync (repeatable, default: Inbox)",
-    )
-    parser.add_argument("--updated-since")
-    parser.add_argument("--limit", type=int, default=50)
-    parser.add_argument("--domain", default="system")
-    parser.add_argument("--risk", default="low", dest="risk_level")
-    parser.add_argument("--target", default="notion_task_sync")
-    parser.add_argument("--metadata-json")
-
-
-def create_notion_get_parser(subparsers: argparse._SubParsersAction) -> None:
-    parser = subparsers.add_parser("get-task", help="Fetch a single Notion task by page id")
-    parser.add_argument("page_id")
-    parser.add_argument("--request", default="Fetch Notion task detail")
-    parser.add_argument("--domain", default="technical")
-    parser.add_argument("--risk", default="low", dest="risk_level")
-    parser.add_argument("--metadata-json")
-
-
-def create_notion_update_status_parser(subparsers: argparse._SubParsersAction) -> None:
-    parser = subparsers.add_parser("update-status", help="Push a backend task status to its linked Notion page")
-    parser.add_argument("task_id")
-    parser.add_argument("--backend-status", required=True, choices=STATUSES)
-    parser.add_argument("--page-id")
-    parser.add_argument("--note")
-
-
-def create_notion_append_note_parser(subparsers: argparse._SubParsersAction) -> None:
-    parser = subparsers.add_parser("append-note", help="Append a short agent note to a linked Notion page")
-    parser.add_argument("task_id")
-    parser.add_argument("--page-id")
-    parser.add_argument("--note", required=True)
-
-
-def create_calendar_list_parser(subparsers: argparse._SubParsersAction) -> None:
-    parser = subparsers.add_parser("list", help="List today's events from all calendars")
-    parser.add_argument("--date", help="ISO date to poll (default: today)")
-    parser.add_argument("--account", choices=["agent", "dapz", "sola", "all"], default="all")
-
-
-def create_calendar_create_parser(subparsers: argparse._SubParsersAction) -> None:
-    parser = subparsers.add_parser("create", help="Create a calendar event (agent inbox only)")
-    parser.add_argument("--title", required=True)
-    parser.add_argument("--start", required=True, help="ISO 8601 datetime, e.g. 2026-03-24T10:00:00")
-    parser.add_argument("--end", required=True, help="ISO 8601 datetime, e.g. 2026-03-24T11:00:00")
-    parser.add_argument("--description")
-    parser.add_argument("--location")
-    parser.add_argument("--attendees", nargs="*", help="Space-separated attendee emails")
-    parser.add_argument(
-        "--reminders",
-        nargs="*",
-        type=int,
-        metavar="MINUTES",
-        help="Popup reminder times in minutes before event, e.g. --reminders 10 30",
-    )
-    parser.add_argument("--timezone", default="Europe/London")
-
-
-def create_calendar_block_parser(subparsers: argparse._SubParsersAction) -> None:
-    parser = subparsers.add_parser("block", help="Block time on the agent calendar")
-    parser.add_argument("--title", required=True)
-    parser.add_argument("--start", required=True, help="ISO 8601 datetime")
-    parser.add_argument("--end", required=True, help="ISO 8601 datetime")
-    parser.add_argument("--description")
-    parser.add_argument("--timezone", default="Europe/London")
-
-
-def create_calendar_update_parser(subparsers: argparse._SubParsersAction) -> None:
-    parser = subparsers.add_parser("update", help="Update an existing calendar event")
-    parser.add_argument("event_id")
-    parser.add_argument("--title")
-    parser.add_argument("--start")
-    parser.add_argument("--end")
-    parser.add_argument("--description")
-    parser.add_argument("--location")
-    parser.add_argument(
-        "--reminders",
-        nargs="*",
-        type=int,
-        metavar="MINUTES",
-    )
-    parser.add_argument("--timezone", default="Europe/London")
-
-
-def create_calendar_delete_parser(subparsers: argparse._SubParsersAction) -> None:
-    parser = subparsers.add_parser("delete", help="Delete a calendar event")
-    parser.add_argument("event_id")
-
-
-def create_calendar_remind_parser(subparsers: argparse._SubParsersAction) -> None:
-    parser = subparsers.add_parser("remind", help="Add a popup reminder to an existing event")
-    parser.add_argument("event_id")
-    parser.add_argument("--minutes", type=int, required=True, help="Minutes before event")
-
-
-def create_daily_routine_run_parser(subparsers: argparse._SubParsersAction) -> None:
-    parser = subparsers.add_parser("run", help="Build and persist a daily recap from structured inputs")
-    parser.add_argument("--input-file")
-    parser.add_argument("--input-json")
-    parser.add_argument("--date")
-    parser.add_argument("--timezone")
-    parser.add_argument("--recipient")
-    parser.add_argument("--delivery-time")
-    parser.add_argument("--calendar-file")
-    parser.add_argument("--calendar-json")
-    parser.add_argument("--personal-inbox-file")
-    parser.add_argument("--personal-inbox-json")
-    parser.add_argument("--agent-inbox-file")
-    parser.add_argument("--agent-inbox-json")
-    parser.add_argument("--notion-file")
-    parser.add_argument("--notion-json")
-    parser.add_argument("--no-notion", action="store_true")
-    parser.add_argument(
-        "--poll-inbox",
-        action="store_true",
-        help="Fetch agent and personal inboxes from Gmail API (overrides --*-inbox-* flags)",
-    )
-    parser.add_argument(
-        "--poll-calendar",
-        action="store_true",
-        help="Fetch today's events from Google Calendar API (overrides --calendar-* flags)",
-    )
-    parser.add_argument(
-        "--send-email",
-        action="store_true",
-        help="Send the recap email via Gmail API after building it",
-    )
 
 
 def create_execution_show_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -556,8 +355,8 @@ def create_recap_approvals_parser(subparsers: argparse._SubParsersAction) -> Non
     parser.add_argument("--domain", choices=DOMAINS)
 
 
-def create_recap_drafts_parser(subparsers: argparse._SubParsersAction) -> None:
-    parser = subparsers.add_parser("drafts", help="Summarize open drafts")
+def create_recap_awaiting_input_parser(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser("awaiting-input", help="Summarize tasks awaiting input")
     parser.add_argument("--domain", choices=DOMAINS)
 
 
@@ -629,83 +428,6 @@ def load_json_object(
     if not isinstance(value, dict):
         raise SystemExit(f"{flag_name} must decode to a JSON object")
     return value
-
-
-def build_daily_routine_payload(args: argparse.Namespace) -> dict[str, Any]:
-    if args.input_file and args.input_json:
-        raise SystemExit("provide either --input-file or --input-json, not both")
-    base_payload = load_json_object(
-        raw_value=args.input_json,
-        file_path=args.input_file,
-        flag_name="--input-file/--input-json",
-    ) or {}
-    for key, value in (
-        ("date", args.date),
-        ("timezone", args.timezone),
-        ("recipient", args.recipient),
-        ("delivery_time", args.delivery_time),
-    ):
-        if value is not None:
-            base_payload[key] = value
-
-    # Gmail API polling (overrides manual --*-inbox-* flags when set)
-    if getattr(args, "poll_inbox", False):
-        from .gmail_poller import poll_all_inboxes
-        polled = poll_all_inboxes()
-        base_payload.setdefault("agent_inbox", polled["agent_inbox"])
-        base_payload.setdefault("personal_inbox", polled["personal_inbox"])
-
-    # Google Calendar API polling (overrides --calendar-* flags when set)
-    if getattr(args, "poll_calendar", False):
-        from .calendar_poller import poll_calendar
-        base_payload.setdefault("calendar", poll_calendar())
-
-    section_inputs = {
-        "calendar": load_json_object(
-            raw_value=args.calendar_json,
-            file_path=args.calendar_file,
-            flag_name="calendar",
-        ),
-        "personal_inbox": load_json_object(
-            raw_value=args.personal_inbox_json,
-            file_path=args.personal_inbox_file,
-            flag_name="personal inbox",
-        ),
-        "agent_inbox": load_json_object(
-            raw_value=args.agent_inbox_json,
-            file_path=args.agent_inbox_file,
-            flag_name="agent inbox",
-        ),
-        "notion": load_json_object(
-            raw_value=args.notion_json,
-            file_path=args.notion_file,
-            flag_name="notion",
-        ),
-    }
-    for key, value in section_inputs.items():
-        if value is not None:
-            base_payload[key] = value
-    return base_payload
-
-
-def build_openclaw_daily_routine_payload(args: argparse.Namespace) -> dict[str, Any]:
-    raw_payload = load_json_object(
-        raw_value=args.input_json,
-        file_path=args.input_file,
-        flag_name="--input-file/--input-json",
-    )
-    if raw_payload is None:
-        raise SystemExit("provide --input-file or --input-json")
-    payload = normalize_openclaw_daily_routine_payload(raw_payload)
-    for key, value in (
-        ("date", args.date),
-        ("timezone", args.timezone),
-        ("recipient", args.recipient),
-        ("delivery_time", args.delivery_time),
-    ):
-        if value is not None:
-            payload[key] = value
-    return payload
 
 
 def to_jsonable(value: Any) -> Any:
@@ -821,13 +543,9 @@ def main(argv: Optional[list[str]] = None) -> int:
                     "db_path": str(service.paths.db_path),
                     "audit_log_path": str(service.paths.audit_log_path),
                     "artifacts_dir": str(service.paths.artifacts_dir),
-                    "policy_rules_path": str(service.paths.policy_rules_path),
+                    "policy_engine": "policy_engine.py (deterministic, label-driven)",
                 }
             )
-            return 0
-
-        if args.command == "openclaw" and args.openclaw_command == "daily-routine" and args.dry_run:
-            print_json({"normalized_payload": build_openclaw_daily_routine_payload(args)})
             return 0
 
         service.initialize()
@@ -842,6 +560,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             payload = service.create_request(
                 user_request=args.user_request,
                 classification=classification,
+                agent_key=args.agent_key,
                 target=args.target,
                 request_metadata=parse_metadata_json(args.metadata_json),
                 external_write=args.external_write,
@@ -851,6 +570,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 result_summary=args.result_summary,
                 external_ref=args.external_ref,
                 action_source="manual",
+                labels=args.labels,
             )
             print_json(payload)
             return 0
@@ -922,21 +642,6 @@ def main(argv: Optional[list[str]] = None) -> int:
                 action_source=args.action_source,
             )
             print_json(payload)
-            return 0
-
-        if args.command == "openclaw" and args.openclaw_command == "daily-routine":
-            normalized_payload = build_openclaw_daily_routine_payload(args)
-            if args.dry_run:
-                print_json({"normalized_payload": normalized_payload})
-                return 0
-            result = service.run_daily_routine(
-                payload=normalized_payload,
-                create_notion_tasks=not args.no_notion,
-            )
-            if args.print_normalized:
-                print_json({"normalized_payload": normalized_payload, **result})
-            else:
-                print_json(result)
             return 0
 
         if args.command == "task" and args.task_command == "list":
@@ -1106,15 +811,66 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 0
 
         if args.command == "approval" and args.approval_command == "approve":
-            print_json(service.approve(args.approval_id, decision_note=args.note))
+            if not _cli_approval_mutations_allowed():
+                print_json(
+                    {
+                        "status": "error",
+                        "error": (
+                            "CLI approval mutations are disabled by default. "
+                            "Set AGENTIC_OS_ALLOW_CLI_APPROVAL_MUTATIONS=1 for an explicit operator override."
+                        ),
+                    }
+                )
+                return 1
+            print_json(
+                service.approve(
+                    args.approval_id,
+                    decision_note=args.note,
+                    decided_by=_approval_actor(),
+                )
+            )
             return 0
 
         if args.command == "approval" and args.approval_command == "deny":
-            print_json(service.deny(args.approval_id, decision_note=args.note))
+            if not _cli_approval_mutations_allowed():
+                print_json(
+                    {
+                        "status": "error",
+                        "error": (
+                            "CLI approval mutations are disabled by default. "
+                            "Set AGENTIC_OS_ALLOW_CLI_APPROVAL_MUTATIONS=1 for an explicit operator override."
+                        ),
+                    }
+                )
+                return 1
+            print_json(
+                service.deny(
+                    args.approval_id,
+                    decision_note=args.note,
+                    decided_by=_approval_actor(),
+                )
+            )
             return 0
 
         if args.command == "approval" and args.approval_command == "cancel":
-            print_json(service.cancel(args.approval_id, decision_note=args.note))
+            if not _cli_approval_mutations_allowed():
+                print_json(
+                    {
+                        "status": "error",
+                        "error": (
+                            "CLI approval mutations are disabled by default. "
+                            "Set AGENTIC_OS_ALLOW_CLI_APPROVAL_MUTATIONS=1 for an explicit operator override."
+                        ),
+                    }
+                )
+                return 1
+            print_json(
+                service.cancel(
+                    args.approval_id,
+                    decision_note=args.note,
+                    decided_by=_approval_actor(),
+                )
+            )
             return 0
 
         if args.command == "approval" and args.approval_command == "remind-pending":
@@ -1156,8 +912,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             print_json(service.recap_approvals(domain=args.domain))
             return 0
 
-        if args.command == "recap" and args.recap_command == "drafts":
-            print_json(service.recap_drafts(domain=args.domain))
+        if args.command == "recap" and args.recap_command == "awaiting-input":
+            print_json(service.recap_awaiting_input(domain=args.domain))
             return 0
 
         if args.command == "recap" and args.recap_command == "failures":
@@ -1184,183 +940,14 @@ def main(argv: Optional[list[str]] = None) -> int:
             print_json({"status": "ok"})
             return 0
 
-        if args.command == "notion" and args.notion_command == "create-task":
-            classification = RequestClassification(
-                domain=args.domain,
-                intent_type="capture",
-                risk_level=args.risk_level,
-            ).validate()
-            print_json(
-                service.create_notion_task(
-                    user_request=args.user_request,
-                    classification=classification,
-                    title=args.title,
-                    status=args.status,
-                    task_type=args.task_type,
-                    area=args.area,
-                    target=args.target,
-                    request_metadata=parse_metadata_json(args.metadata_json),
-                    operation_key=args.operation_key,
-                )
-            )
-            return 0
-
-        if args.command == "notion" and args.notion_command == "query-tasks":
-            classification = RequestClassification(
-                domain=args.domain,
-                intent_type="read",
-                risk_level=args.risk_level,
-            ).validate()
-            print_json(
-                service.query_notion_tasks(
-                    user_request=args.request,
-                    classification=classification,
-                    status=args.status,
-                    updated_since=args.updated_since,
-                    limit=args.limit,
-                    request_metadata=parse_metadata_json(args.metadata_json),
-                )
-            )
-            return 0
-
-        if args.command == "notion" and args.notion_command == "sync-tasks":
-            classification = RequestClassification(
-                domain=args.domain,
-                intent_type="read",
-                risk_level=args.risk_level,
-            ).validate()
-            print_json(
-                service.sync_notion_tasks(
-                    user_request=args.request,
-                    classification=classification,
-                    statuses=args.status,
-                    updated_since=args.updated_since,
-                    limit=args.limit,
-                    target=args.target,
-                    request_metadata=parse_metadata_json(args.metadata_json),
-                )
-            )
-            return 0
-
-        if args.command == "notion" and args.notion_command == "get-task":
-            classification = RequestClassification(
-                domain=args.domain,
-                intent_type="read",
-                risk_level=args.risk_level,
-            ).validate()
-            print_json(
-                service.get_notion_task(
-                    user_request=args.request,
-                    classification=classification,
-                    page_id=args.page_id,
-                    request_metadata=parse_metadata_json(args.metadata_json),
-                )
-            )
-            return 0
-
-        if args.command == "notion" and args.notion_command == "update-status":
-            print_json(
-                service.update_notion_task_status(
-                    task_id=args.task_id,
-                    notion_page_id=args.page_id,
-                    backend_status=args.backend_status,
-                    note=args.note,
-                )
-            )
-            return 0
-
-        if args.command == "notion" and args.notion_command == "append-note":
-            print_json(
-                service.append_notion_task_note(
-                    task_id=args.task_id,
-                    notion_page_id=args.page_id,
-                    note=args.note,
-                )
-            )
-            return 0
-
-        if args.command == "daily-routine" and args.daily_routine_command == "run":
-            result = service.run_daily_routine(
-                payload=build_daily_routine_payload(args),
-                create_notion_tasks=not args.no_notion,
-                send_email=getattr(args, "send_email", False),
-            )
-            print_json(result)
-            if result.get("email_sent"):
-                print(
-                    f"DAILY_ROUTINE_COMPLETE\n"
-                    f"email_sent_to: {result['recap']['recipient']}\n"
-                    f"follow_up_tasks_created: {len(result['created_followups'])}\n"
-                    f"recap_date: {result['recap']['run_date']}",
-                    file=sys.stderr,
-                )
-            return 0
-
-        if args.command == "calendar":
-            from .calendar_poller import poll_calendar
-            from .calendar_writer import (
-                add_reminder,
-                block_time,
-                create_event,
-                delete_event,
-                update_event,
-            )
-
-            if args.calendar_command == "list":
-                print_json(poll_calendar())
-                return 0
-
-            if args.calendar_command == "create":
-                result = create_event(
-                    title=args.title,
-                    start=args.start,
-                    end=args.end,
-                    description=args.description,
-                    location=args.location,
-                    attendees=args.attendees,
-                    reminders_minutes=args.reminders,
-                    timezone=args.timezone,
-                )
-                print_json(result)
-                return 0
-
-            if args.calendar_command == "block":
-                result = block_time(
-                    title=args.title,
-                    start=args.start,
-                    end=args.end,
-                    description=args.description,
-                    timezone=args.timezone,
-                )
-                print_json(result)
-                return 0
-
-            if args.calendar_command == "update":
-                result = update_event(
-                    args.event_id,
-                    title=args.title,
-                    start=args.start,
-                    end=args.end,
-                    description=args.description,
-                    location=args.location,
-                    reminders_minutes=args.reminders,
-                    timezone=args.timezone,
-                )
-                print_json(result)
-                return 0
-
-            if args.calendar_command == "delete":
-                ok = delete_event(args.event_id)
-                print_json({"deleted": ok, "event_id": args.event_id})
-                return 0 if ok else 2
-
-            if args.calendar_command == "remind":
-                result = add_reminder(args.event_id, args.minutes)
-                print_json(result)
-                return 0
-
         if args.command == "retry":
             print_json(service.retry_task(args.task_id, feedback=args.feedback))
+            return 0
+
+        if args.command == "config-url":
+            from .config import load_app_config
+            config = load_app_config(default_paths())
+            print(config.base_url)
             return 0
 
         if args.command == "health":
@@ -1389,7 +976,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         sqlite3.IntegrityError,
         sqlite3.OperationalError,
         NotImplementedError,
-        NotionError,
     ) as exc:
         print_json({"error": str(exc), "error_type": type(exc).__name__})
         return 2
@@ -1403,6 +989,18 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     parser.print_help()
     return 1
+
+
+def _cli_approval_mutations_allowed() -> bool:
+    flag = os.environ.get("AGENTIC_OS_ALLOW_CLI_APPROVAL_MUTATIONS", "").strip().lower()
+    return flag in {"1", "true", "yes", "on"}
+
+
+def _approval_actor() -> str:
+    actor = os.environ.get("AGENTIC_OS_APPROVAL_ACTOR", "").strip()
+    if actor:
+        return actor
+    return "cli:unknown"
 
 
 if __name__ == "__main__":

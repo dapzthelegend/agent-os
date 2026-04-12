@@ -10,6 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from .api_routes import router as api_router
+from .discord_webhook import router as discord_router
 from .web_routes import router as web_router
 from .web_support import STATIC_DIR, TEMPLATES_DIR
 
@@ -47,6 +48,7 @@ def create_app() -> FastAPI:
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
     app.include_router(web_router)
     app.include_router(api_router)
+    app.include_router(discord_router)
 
     @app.exception_handler(FastAPIHTTPException)
     async def http_error(request: Request, exc: FastAPIHTTPException):
@@ -81,13 +83,9 @@ def create_app() -> FastAPI:
 
 def _status_tone(value: Optional[str]) -> str:
     tones = {
-        "completed": "success",
-        "approved": "success",
-        "awaiting_approval": "warning",
-        "awaiting_input": "info",
-        "failed": "danger",
-        "cancelled": "muted",
-        "executed": "accent",
+        "to_do": "warning",
+        "in_progress": "info",
+        "done": "success",
         "pending": "warning",
         "denied": "danger",
     }

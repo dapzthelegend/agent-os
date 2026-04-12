@@ -5,6 +5,10 @@
   <div class="section-header">
     <h1>Tasks</h1>
     <p>Filter durable tasks by status, domain, target, and provenance.</p>
+    <form method="post" action="/tasks/close-all" onsubmit="return confirm('Close all active tasks? This will cancel them in both agentic-os and Paperclip.')">
+      <input type="hidden" name="reason" value="Closed by operator (bulk)">
+      <button type="submit" class="danger btn-sm" style="width:auto">Close all active tasks</button>
+    </form>
   </div>
 
   <form class="card filters" method="get">
@@ -64,6 +68,7 @@
           <th>Action source</th>
           <th>Created</th>
           <th>Updated</th>
+          <th>Actions</th>
         </tr>
       </thead>
       <tbody>
@@ -78,10 +83,20 @@
           <td><span class="badge accent">{{ task.action_source }}</span></td>
           <td>{{ task.created_at }}</td>
           <td>{{ task.updated_at }}</td>
+          <td>
+            {% if task.status != "done" %}
+            <form method="post" action="/tasks/{{ task.id }}/cancel" style="margin:0" onsubmit="return confirm('Close task {{ task.id }}?')">
+              <input type="hidden" name="reason" value="Closed by operator">
+              <button type="submit" class="danger btn-sm">Close</button>
+            </form>
+            {% else %}
+            <span class="muted">—</span>
+            {% endif %}
+          </td>
         </tr>
         {% else %}
         <tr>
-          <td colspan="9" class="muted">No tasks matched the current filters.</td>
+          <td colspan="10" class="muted">No tasks matched the current filters.</td>
         </tr>
         {% endfor %}
       </tbody>

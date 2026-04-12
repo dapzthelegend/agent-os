@@ -45,6 +45,11 @@ class IssueRef:
     project_id: Optional[str] = None
     goal_id: Optional[str] = None
     assignee_id: Optional[str] = None
+    description: Optional[str] = None
+    source: Optional[str] = None
+    routine_id: Optional[str] = None
+    routine_run_id: Optional[str] = None
+    origin_kind: Optional[str] = None
 
 
 @dataclass
@@ -93,7 +98,7 @@ class PaperclipClient:
         project_id: str,
         goal_id: str,
         assignee_id: Optional[str] = None,
-        status: str = "todo",
+        status: str = "backlog",
     ) -> IssueRef:
         body: dict[str, Any] = {
             "title": title,
@@ -113,13 +118,16 @@ class PaperclipClient:
         *,
         status: Optional[str] = None,
         assignee_id: Optional[str] = None,
+        clear_assignee: bool = False,
         title: Optional[str] = None,
         description: Optional[str] = None,
     ) -> IssueRef:
         body: dict[str, Any] = {}
         if status is not None:
             body["status"] = status
-        if assignee_id is not None:
+        if clear_assignee:
+            body["assigneeAgentId"] = None
+        elif assignee_id is not None:
             body["assigneeAgentId"] = assignee_id
         if title is not None:
             body["title"] = title
@@ -131,6 +139,28 @@ class PaperclipClient:
     def get_issue(self, issue_id: str) -> IssueRef:
         data = self._request("GET", f"/issues/{issue_id}")
         return _parse_issue(data)
+
+    def wake_agent(
+        self,
+        agent_id: str,
+        *,
+        source: str = "assignment",
+        trigger_detail: str = "system",
+        reason: Optional[str] = None,
+        payload: Optional[dict[str, Any]] = None,
+        force_fresh_session: bool = False,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "source": source,
+            "triggerDetail": trigger_detail,
+            "forceFreshSession": bool(force_fresh_session),
+        }
+        if reason is not None:
+            body["reason"] = reason
+        if payload is not None:
+            body["payload"] = payload
+        data = self._request("POST", f"/agents/{agent_id}/wakeup", body=body)
+        return data if isinstance(data, dict) else {}
 
     # ------------------------------------------------------------------
     # Comments
@@ -343,6 +373,11 @@ def _parse_issue(data: dict[str, Any]) -> IssueRef:
         project_id=data.get("projectId") or data.get("project_id"),
         goal_id=data.get("goalId") or data.get("goal_id"),
         assignee_id=data.get("assigneeAgentId") or data.get("assigneeId") or data.get("assignee_id"),
+        description=data.get("description"),
+        source=data.get("source"),
+        routine_id=data.get("routineId") or data.get("routine_id"),
+        routine_run_id=data.get("routineRunId") or data.get("routine_run_id"),
+        origin_kind=data.get("originKind") or data.get("origin_kind"),
     )
 
 

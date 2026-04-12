@@ -59,8 +59,8 @@
     <!-- Config -->
     <article class="card">
       <h2>Config</h2>
-      <p>Notion token: <span class="badge {% if health.config.notion_token_set %}success{% else %}warning{% endif %}">
-        {% if health.config.notion_token_set %}set{% else %}not set{% endif %}
+      <p>Paperclip: <span class="badge {% if health.config.paperclip_configured %}success{% else %}warning{% endif %}">
+        {% if health.config.paperclip_configured %}configured{% else %}not configured{% endif %}
       </span></p>
       {% if health.config.issues %}
       <ul class="issue-list">
