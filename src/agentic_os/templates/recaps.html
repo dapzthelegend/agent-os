@@ -52,13 +52,13 @@
 
   <div class="grid two-up">
     <article class="card">
-      <h2>Drafts</h2>
-      <p>{{ recap_drafts.count }} open drafts</p>
+      <h2>Awaiting Input</h2>
+      <p>{{ recap_awaiting_input.count }} tasks awaiting input</p>
       <ul class="list">
-        {% for item in recap_drafts.records[:8] %}
+        {% for item in recap_awaiting_input.records[:8] %}
         <li><a href="/tasks/{{ item.task_id }}">{{ item.task_id }}</a> <span>{{ item.user_request }}</span></li>
         {% else %}
-        <li class="muted">No open drafts.</li>
+        <li class="muted">No tasks awaiting input.</li>
         {% endfor %}
       </ul>
     </article>

@@ -3,15 +3,24 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 from dataclasses import dataclass
 from typing import Optional
 
 from .artifacts import ArtifactStore
 from .config import Paths, default_paths, load_app_config
-from .email_draft_handler import EMAIL_DRAFT_ARTIFACT_TYPE
+from .github_contribution import parse_github_contribution_result
 from .models import TaskRecord
 from .service import AgenticOSService
+
+
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
+
+
+def _looks_like_uuid(s: str) -> bool:
+    """Check if a string looks like a UUID (prevents emergency import on garbage inputs)."""
+    return bool(s and _UUID_RE.match(s.strip()))
 
 
 class ExecutionParseError(Exception):
@@ -73,6 +82,7 @@ def _import_task_from_paperclip_issue(
             issue_id=issue.id,
             title=issue.title or issue.id,
             description="",
+            paperclip_status=issue.status or "backlog",
             project_id=issue.project_id,
             routine_run_id=run_id,
             origin_kind=origin_kind,
@@ -89,7 +99,7 @@ def _artifact_type_for_domain(domain: str, intent_type: str) -> str:
     if intent_type == "content":
         return "content_markdown"
     elif domain == "personal" and intent_type == "draft":
-        return EMAIL_DRAFT_ARTIFACT_TYPE
+        return "draft"
     elif domain == "technical" and intent_type == "execute":
         return "code"
     elif domain == "technical" and intent_type == "read":
@@ -106,7 +116,7 @@ def receive_execution_result(
     paths: Paths,
 ) -> ExecutionResult:
     """
-    Parse ACP agent output, store artifact, update backend + Notion.
+    Parse ACP agent output, store artifact, update backend + Paperclip.
     
     Args:
         raw_output: Full output from ACP agent
@@ -133,38 +143,43 @@ def receive_execution_result(
         if f"TASK_DONE: {task_id}" not in raw_output:
             raise ExecutionParseError(f"Missing or mismatched TASK_DONE marker for {task_id}")
 
-        # Step 2: Load backend task — with robust fallback resolution
+        # Step 2: Load backend task — structured resolution
         config = load_app_config(paths)
         service = AgenticOSService(paths, config)
 
         task = None
         resolved_task_id = task_id
-        if task_id:
+
+        # Primary: backend task_id format (task_XXXXXX)
+        if task_id and task_id.startswith("task_"):
             try:
                 task = service.db.get_task(task_id)
             except KeyError:
                 pass
+            # If a task_ prefixed ID wasn't found in DB, try session key fallback
+            if task is None and session_key:
+                task = service.db.get_task_by_dispatch_session_key(session_key)
+                if task is not None:
+                    resolved_task_id = task.id
 
-        if task is None:
-            # Fallback 1: caller passed a Paperclip issue ID instead of backend task ID.
+        # Secondary: caller passed a Paperclip ID or other non-task_ identifier
+        if task is None and task_id and not task_id.startswith("task_"):
             task = service.db.get_task_by_paperclip_issue_id(task_id)
             if task is not None:
                 resolved_task_id = task.id
 
-        if task is None:
-            # Fallback 2: caller passed a Paperclip routine run ID.
+        if task is None and task_id and not task_id.startswith("task_"):
             task = service.db.get_task_by_paperclip_routine_run_id(task_id)
             if task is not None:
                 resolved_task_id = task.id
 
-        if task is None:
-            # Fallback 3: look up by dispatch_session_key.
+        if task is None and session_key:
             task = service.db.get_task_by_dispatch_session_key(session_key)
             if task is not None:
                 resolved_task_id = task.id
 
-        if task is None:
-            # Fallback 4: callback arrived before Paperclip issue import completed.
+        # Emergency import — only for UUID-format IDs (prevents firing on garbage)
+        if task is None and _looks_like_uuid(task_id):
             imported_task = _import_task_from_paperclip_issue(
                 service=service,
                 issue_id=task_id,
@@ -185,20 +200,14 @@ def receive_execution_result(
 
         task_id = resolved_task_id
 
-        # Step 2b: Terminal status check — do not re-process terminal tasks.
-        #
-        # completed/executed: task was already successfully handled by the execution
-        # receiver (duplicate callback) — return idempotent so the caller can safely
-        # ignore the response.
-        # failed/cancelled: task reached a non-success terminal state; block re-processing
-        # and surface the terminal status explicitly.
-        if task.status in {"completed", "executed"}:
+        # Step 2b: Terminal status check — do not re-process done tasks.
+        if task.status == "done":
             service._append_event(
                 task_id=task_id,
                 event_type="action_execution_rejected",
                 payload={
                     "operation_key": task.operation_key,
-                    "reason": "already_executed_for_task",
+                    "reason": "already_done_for_task",
                     "task_status": task.status,
                 },
             )
@@ -207,14 +216,6 @@ def receive_execution_result(
                 artifact_id=task.artifact_ref or "",
                 success=True,
                 idempotent=True,
-            )
-        if task.status in {"failed", "cancelled"}:
-            return ExecutionResult(
-                task_id=task_id,
-                artifact_id=task.artifact_ref or "",
-                success=True,
-                already_terminal=True,
-                terminal_status=task.status,
             )
         
         # Step 3: Determine artifact type
@@ -240,15 +241,25 @@ def receive_execution_result(
             created_at=artifact_record.created_at,
         )
 
-        # Step 5: Update backend task + Paperclip writeback
-        result_summary = content[:200] if content else "Execution completed"
-        service.complete_task(
-            task_id,
-            result_summary=result_summary,
-            artifact_ref=artifact_id,
-            paperclip_content=content,
-            artifact_path=artifact_record.path,
-        )
+        # Step 5: Update backend task (no Paperclip writeback — the runtime
+        # posts canonical comments; the backend cannot safely comment on
+        # open issues, see TaskControlPlane comment block).
+        parsed_contribution = parse_github_contribution_result(content)
+        summary_source = parsed_contribution.content_without_block if parsed_contribution else content
+        result_summary = summary_source[:200] if summary_source else "Execution completed"
+        if parsed_contribution is not None:
+            service.record_github_contribution_result(
+                task_id,
+                result_summary=result_summary,
+                artifact_ref=artifact_id,
+                contribution=parsed_contribution.payload,
+            )
+        else:
+            service.complete_task(
+                task_id,
+                result_summary=result_summary,
+                artifact_ref=artifact_id,
+            )
 
         # Step 5b: Emit callback audit event with full correlation IDs
         reloaded_task = service.db.get_task(task_id)
@@ -289,7 +300,7 @@ def receive_execution_failure(
     paths: Paths,
 ) -> None:
     """
-    Handle execution failure: update backend and Notion.
+    Handle execution failure by updating backend state and audit.
     
     Args:
         error: Error message from agent
@@ -301,7 +312,7 @@ def receive_execution_failure(
         service = AgenticOSService(paths, config)
         task = service.db.get_task(task_id)
 
-        # Update backend (Paperclip writeback handled inside fail_task)
+        # Update backend
         service.fail_task(task_id, reason=error)
 
         # Trigger self-healing incident follow-up task for runtime failures.

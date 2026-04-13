@@ -1,31 +1,28 @@
 {
-  "notion": {
-    "apiTokenEnv": "NOTION_API_KEY",
-    "databaseId": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-    "dataSourceId": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
-    "properties": {
-      "title": "Title",
-      "status": "Status",
-      "type": "Type",
-      "area": "Area",
-      "backendTaskId": "OpenClaw Task ID",
-      "operationKey": "Operation Key",
-      "lastAgentUpdate": "Last Agent Update"
+  "paperclipResultWritebackEnabled": false,
+  "paperclip": {
+    "base_url": "http://localhost:3100/api",
+    "auth_mode": "trusted",
+    "company_id": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+    "goal_id": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+    "project_map": {
+      "personal": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+      "technical": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+      "finance": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+      "system": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
     },
-    "propertyKinds": {
-      "type": "select",
-      "area": "select"
+    "agent_map": {
+      "chief_of_staff": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+      "project_manager": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+      "engineering_manager": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+      "engineer": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+      "infrastructure_engineer": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+      "executor_codex": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+      "content_writer": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+      "accountant": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+      "executive_assistant": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
     },
-    "statusMap": {
-      "new": "Inbox",
-      "in_progress": "In Progress",
-      "awaiting_input": "Waiting",
-      "awaiting_approval": "Review",
-      "approved": "In Progress",
-      "executed": "In Progress",
-      "completed": "Done",
-      "failed": "Blocked",
-      "cancelled": "Cancelled"
-    }
+    "reconcile_poll_interval_seconds": 120,
+    "reconcile_activity_lookback_seconds": 300
   }
 }

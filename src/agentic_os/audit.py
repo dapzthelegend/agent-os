@@ -21,12 +21,6 @@ EVENT_TYPES = (
     "draft_created",
     "draft_generated",
     "artifact_updated",
-    "daily_routine_recap_created",
-    "daily_routine_email_prepared",
-    "daily_routine_followup_created",
-    "daily_routine_followups_created",
-    "notion_sync_imported",
-    "notion_update_failed",
     "summary_recorded",
     "approval_requested",
     "approval_granted",
@@ -43,6 +37,8 @@ EVENT_TYPES = (
     "task_retry_reset",
     "task_stalled",
     "task_stall_cleared",
+    "github_contribution_lifecycle_updated",
+    "github_contribution_completion_blocked",
     # Execution loop (Phase 1/2)
     "task_picked_up",
     "task_dispatched",
@@ -52,6 +48,8 @@ EVENT_TYPES = (
     "paperclip_issue_created",
     "paperclip_issue_imported",
     "paperclip_projection_failed",
+    "paperclip_projection_pending",
+    "paperclip_projection_repair_failed",
     "paperclip_sync_failed",
     # Plan gate (Phase 2)
     "task_mode_set",
@@ -59,10 +57,12 @@ EVENT_TYPES = (
     "plan_awaiting_review",
     "plan_approved",
     "plan_rejected",
+    "plan_reopened",
     # Paperclip reconciler (Phase 4)
     "reconciler_ran",
     "reconciler_action_taken",
     "reconciler_comment_ignored",
+    "paperclip_status_mirrored",
 )
 
 

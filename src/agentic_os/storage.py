@@ -4,7 +4,12 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Optional
 
-from .models import ApprovalRecord, ExecutionRecord, RequestClassification, TaskRecord
+from .models import (
+    ApprovalRecord,
+    ExecutionRecord,
+    RequestClassification,
+    TaskRecord,
+)
 
 
 def utc_now_sql() -> str:
@@ -12,8 +17,6 @@ def utc_now_sql() -> str:
 
 
 # Canonical schema — no incremental migrations.
-# If the DB has an old schema (missing routine-aware Paperclip columns),
-# run scripts/reset_db.py.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
     id TEXT PRIMARY KEY,
@@ -25,7 +28,6 @@ CREATE TABLE IF NOT EXISTS tasks (
     domain TEXT NOT NULL,
     status TEXT NOT NULL,
     task_mode TEXT NOT NULL DEFAULT 'direct',
-    -- legacy fields retained for live-path compat
     intent_type TEXT NOT NULL,
     risk_level TEXT NOT NULL,
     approval_state TEXT NOT NULL,
@@ -123,10 +125,6 @@ CREATE INDEX IF NOT EXISTS idx_approvals_task_id ON approvals(task_id, created_a
 CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status, created_at);
 """
 
-# Sentinel column used to detect an incompatible schema.
-_REQUIRED_COLUMN = "paperclip_routine_run_id"
-
-
 class Database:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -140,20 +138,15 @@ class Database:
 
     def initialize(self) -> None:
         with self.connect() as connection:
-            self._check_schema_compatibility(connection)
             connection.executescript(SCHEMA)
-
-    @staticmethod
-    def _check_schema_compatibility(connection: sqlite3.Connection) -> None:
-        """Fail fast if an incompatible old schema is detected."""
-        rows = connection.execute("PRAGMA table_info(tasks)").fetchall()
-        if not rows:
-            return  # table doesn't exist yet — fresh DB, OK
-        existing = {row["name"] for row in rows}
-        if _REQUIRED_COLUMN not in existing:
-            raise RuntimeError(
-                "Incompatible task schema detected (pre-phase-0). "
-                "Run scripts/reset_db.py to recreate the database."
+            # Normalize legacy source labels to backend-generic sources.
+            connection.execute(
+                "UPDATE tasks SET action_source = ? WHERE action_source = ?",
+                ("tool", "openclaw_tool"),
+            )
+            connection.execute(
+                "UPDATE tasks SET action_source = ? WHERE action_source IN (?, ?)",
+                ("automation", "openclaw_skill", "openclaw_kill"),
             )
 
     @staticmethod
@@ -181,6 +174,15 @@ class Database:
         classification.validate()
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            if operation_key is not None:
+                existing = connection.execute(
+                    "SELECT id FROM tasks WHERE operation_key = ? ORDER BY created_at ASC, id ASC LIMIT 1",
+                    (operation_key,),
+                ).fetchone()
+                if existing is not None:
+                    raise ValueError(
+                        f"operation_key {operation_key} is already assigned to task {existing['id']}"
+                    )
             task_id = self._next_task_id(connection)
             connection.execute(
                 """
@@ -377,21 +379,22 @@ class Database:
     def query_ready_tasks(self, *, limit: int = 20) -> list[TaskRecord]:
         """
         Return tasks eligible for execution (FIFO):
-          - status = 'approved'
-          - status = 'new' AND policy_decision = 'read_ok'
-          - plan_first: status = 'approved_for_execution' AND approved_plan_revision_id IS NOT NULL
+          - in_progress tasks
+          - to_do tasks that are either non-approval or explicitly approved
         """
         with self.connect() as connection:
             rows = connection.execute(
                 """
                 SELECT * FROM tasks
-                WHERE status = 'approved'
-                   OR (status = 'new' AND policy_decision = 'read_ok')
+                WHERE status = 'in_progress'
                    OR (
-                      task_mode = 'plan_first'
-                      AND status = 'approved_for_execution'
-                      AND approved_plan_revision_id IS NOT NULL
-                   )
+                        status = 'to_do'
+                    AND (
+                        policy_decision IS NULL
+                        OR policy_decision NOT IN ('approve', 'approve_plan', 'approval_required')
+                        OR approval_state = 'approved'
+                    )
+                )
                 ORDER BY created_at ASC, id ASC
                 LIMIT ?
                 """,
@@ -401,10 +404,8 @@ class Database:
 
     def pickup_task(self, task_id: str, *, claimed_by: str = "task_executor_cron") -> dict:
         """
-        Atomically transition an eligible task to 'in_progress' (direct) or 'executing' (plan_first).
+        Atomically transition an eligible task to 'in_progress'.
         Uses BEGIN IMMEDIATE to prevent concurrent cron double-dispatch.
-
-        plan_first tasks must be in 'approved_for_execution' with approved_plan_revision_id set.
 
         Returns:
             {"success": True, "task_id": task_id}
@@ -417,25 +418,23 @@ class Database:
                 raise KeyError(f"unknown task_id: {task_id}")
             task = self._row_to_task(row)
 
-            if task.task_mode == "plan_first":
-                eligible = (
-                    task.status == "approved_for_execution"
-                    and bool(task.approved_plan_revision_id)
-                )
-                new_status = "executing"
-            else:
-                eligible = (
-                    task.status == "approved"
-                    or (task.status == "new" and task.policy_decision == "read_ok")
-                )
-                new_status = "in_progress"
+            approval_ready = (
+                task.policy_decision not in ("approve", "approve_plan", "approval_required")
+                or task.approval_state == "approved"
+            )
+            eligible = task.status == "to_do" and approval_ready
+            new_status = "in_progress"
 
             if not eligible:
-                already_running = task.status in ("in_progress", "executing")
+                already_running = task.status == "in_progress"
                 return {
                     "success": False,
                     "task_id": task_id,
-                    "reason": "already_claimed" if already_running else "not_eligible",
+                    "reason": (
+                        "already_claimed"
+                        if already_running
+                        else ("approval_pending" if task.status == "to_do" and not approval_ready else "not_eligible")
+                    ),
                     "current_status": task.status,
                 }
             connection.execute(
@@ -507,6 +506,34 @@ class Database:
         if row is None:
             return None
         return self._row_to_task(row)
+
+    def list_tasks_missing_projection(self, *, max_age_hours: int = 24) -> list[TaskRecord]:
+        """Return non-terminal tasks with no paperclip_issue_id created in the last *max_age_hours*."""
+        from datetime import datetime, timezone, timedelta
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=max_age_hours)).isoformat()
+        terminal = ("done",)
+        placeholders = ",".join("?" * len(terminal))
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM tasks WHERE paperclip_issue_id IS NULL "
+                f"AND status NOT IN ({placeholders}) "
+                f"AND created_at > ? ORDER BY created_at ASC",
+                (*terminal, cutoff),
+            ).fetchall()
+        return [self._row_to_task(row) for row in rows]
+
+    def list_tasks_with_projection(self, *, sample_limit: int = 50) -> list[TaskRecord]:
+        """Return recent non-terminal tasks that have a paperclip_issue_id (for drift detection)."""
+        terminal = ("done",)
+        placeholders = ",".join("?" * len(terminal))
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM tasks WHERE paperclip_issue_id IS NOT NULL "
+                f"AND status NOT IN ({placeholders}) "
+                f"ORDER BY updated_at DESC LIMIT ?",
+                (*terminal, sample_limit),
+            ).fetchall()
+        return [self._row_to_task(row) for row in rows]
 
     def list_tasks_by_operation_key(self, operation_key: str) -> list[TaskRecord]:
         with self.connect() as connection:
@@ -589,7 +616,13 @@ class Database:
                 """,
                 (*values, limit),
             ).fetchall()
-        return [dict(row) for row in rows]
+        return [
+            {
+                **dict(row),
+                "action_source": str(row["action_source"]),
+            }
+            for row in rows
+        ]
 
     def list_artifacts(self, task_id: str) -> list[dict[str, Any]]:
         with self.connect() as connection:

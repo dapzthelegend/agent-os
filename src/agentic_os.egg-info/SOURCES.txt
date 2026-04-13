@@ -8,11 +8,7 @@ src/agentic_os/artifacts.py
 src/agentic_os/audit.py
 src/agentic_os/cli.py
 src/agentic_os/config.py
-src/agentic_os/daily_routine.py
 src/agentic_os/models.py
-src/agentic_os/notion.py
-src/agentic_os/notion_sync.py
-src/agentic_os/openclaw_bridge.py
 src/agentic_os/service.py
 src/agentic_os/storage.py
 src/agentic_os/web.py
@@ -34,5 +30,3 @@ src/agentic_os/templates/overview.html
 src/agentic_os/templates/recaps.html
 src/agentic_os/templates/task_detail.html
 src/agentic_os/templates/tasks.html
-tests/test_notion_sync_bridge.py
-tests/test_openclaw_bridge.py

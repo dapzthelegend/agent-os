@@ -17,6 +17,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
+from . import policy_engine
 from .config import PaperclipConfig
 from .models import TaskRecord
 from .paperclip_client import (
@@ -69,24 +70,12 @@ _STATUS_MAP: dict[str, str] = {
 }
 
 # ------------------------------------------------------------------
-# Default routing: domain/context → agent key
+# Agent key constants (used for metadata-driven overrides only)
 # ------------------------------------------------------------------
 
-_DOMAIN_AGENT_MAP: dict[str, str] = {
-    "personal": "executive_assistant",
-    "technical": "engineer",
-    "finance": "accountant",
-    "system": "project_manager",
-}
-
 _COORDINATION_AGENT = "project_manager"
-_ESCALATION_AGENT = "chief_of_staff"
-_ENGINEER_AGENT = "engineer"
-_CODEX_AGENT = "executor_codex"
-_WRITING_AGENT = "content_writer"
-_FINANCE_AGENT = "accountant"
-_ADMIN_AGENT = "executive_assistant"
 _INFRA_ENGINEER_AGENT = "infrastructure_engineer"
+_ENGINEER_AGENT = "engineer"
 
 
 class TaskControlPlane:
@@ -108,7 +97,12 @@ class TaskControlPlane:
         try:
             project_id = self._resolve_project(task.domain)
             assignee_id = self._resolve_agent(assignee_key or _COORDINATION_AGENT)
-            paperclip_status = _STATUS_MAP.get(task.status, "todo")
+            # Approval-pending tasks start as backlog so they are not
+            # dispatch-eligible until an operator explicitly approves.
+            if getattr(task, "approval_state", None) == "pending":
+                paperclip_status = "backlog"
+            else:
+                paperclip_status = _STATUS_MAP.get(task.status, "todo")
             title = task.title or task.user_request[:120]
             description = task.description or task.user_request
             return self._client.create_issue(
@@ -152,19 +146,20 @@ class TaskControlPlane:
     # ------------------------------------------------------------------
     # Comments
     # ------------------------------------------------------------------
-
-    def add_comment(self, issue_id: str, body: str) -> Optional[CommentRef]:
-        try:
-            return self._client.add_comment(issue_id, body)
-        except Exception as exc:  # noqa: BLE001
-            log.error("control_plane.add_comment failed for issue %s: %s", issue_id, exc)
-            return None
-
-    def post_result_comment(self, issue_id: str, result_summary: str) -> Optional[CommentRef]:
-        return self.add_comment(issue_id, f"**Result:** {result_summary}")
-
-    def post_failure_comment(self, issue_id: str, reason: str) -> Optional[CommentRef]:
-        return self.add_comment(issue_id, f"**Failed:** {reason}")
+    #
+    # NOTE: The control plane intentionally does NOT expose an `add_comment`
+    # method. Every backend comment would be posted under the trusted-client
+    # identity (not an agent identity), so on any OPEN Paperclip issue with an
+    # assignee Paperclip's `issue_commented` wake path would fire the assignee
+    # agent — a side-effect wake the backend never intends. Backend cannot
+    # simultaneously close-then-comment either, because pushing lifecycle
+    # status to Paperclip violates the "no lifecycle status writebacks"
+    # contract (see test_no_lifecycle_status_writebacks_to_paperclip).
+    #
+    # Canonical issue comments are posted by the runtime (the agent session
+    # itself), which comments as its own assignee identity and therefore hits
+    # Paperclip's self-comment skipWake path. The backend sticks to documents
+    # and attachments, which have no comment-wake semantics.
 
     def list_comments(self, issue_id: str) -> list[CommentRef]:
         try:
@@ -248,9 +243,6 @@ class TaskControlPlane:
     # Execution result writeback (Phase 3)
     # ------------------------------------------------------------------
 
-    # Results shorter than this are written as a comment; longer ones get a document.
-    LONG_RESULT_THRESHOLD = 500
-
     def write_result(
         self,
         issue_id: str,
@@ -260,43 +252,34 @@ class TaskControlPlane:
         artifact_path: Optional[Path] = None,
     ) -> None:
         """
-        Full Paperclip writeback for an execution result.
+        Paperclip writeback for an execution result.
 
-        - Uploads artifact attachment if artifact_path is provided and exists.
-        - Short result (≤LONG_RESULT_THRESHOLD chars): posts a comment.
-        - Long result (>LONG_RESULT_THRESHOLD chars): writes a result document
-          and posts a short comment with a preview.
+        Uses documents and attachments only — never comments. The backend
+        cannot safely post comments on open issues (see the comments block
+        above), so the result is always written as a 'result' document and
+        any artifact is uploaded as an attachment. Both are wake-free in
+        Paperclip.
 
-        All sub-operations are independently fault-tolerant.
+        Sub-operations are independently fault-tolerant.
         """
-        # 1. Upload artifact attachment
         if artifact_path is not None:
             try:
                 p = Path(artifact_path) if not isinstance(artifact_path, Path) else artifact_path
                 if p.exists():
                     mime = _mime_for_path(p)
                     self.upload_artifact(issue_id, p, mime_type=mime)
-                    self.add_comment(issue_id, f"Artifact attached: `{p.name}` (task {task_id})")
             except Exception as exc:  # noqa: BLE001
                 log.error("control_plane.write_result artifact upload failed for %s: %s", issue_id, exc)
 
-        # 2. Write result text
-        if len(result_text) > self.LONG_RESULT_THRESHOLD:
-            try:
-                self._client.write_document(
-                    issue_id,
-                    title="Result",
-                    content=result_text,
-                    doc_type="result",
-                )
-                preview = result_text[:200].rstrip() + "…"
-                self.add_comment(issue_id, f"**Result** (full text in document):\n{preview}")
-            except Exception as exc:  # noqa: BLE001
-                log.error("control_plane.write_result doc write failed for %s: %s", issue_id, exc)
-                # Fallback: post full text as comment (truncated to Paperclip limit)
-                self.add_comment(issue_id, f"**Result:** {result_text[:1000]}")
-        else:
-            self.post_result_comment(issue_id, result_text)
+        try:
+            self._client.write_document(
+                issue_id,
+                title="Result",
+                content=result_text,
+                doc_type="result",
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.error("control_plane.write_result doc write failed for %s: %s", issue_id, exc)
 
     # ------------------------------------------------------------------
     # Paperclip-originated task adoption
@@ -320,7 +303,10 @@ class TaskControlPlane:
         Returns the updated IssueRef, or None on failure.
         """
         try:
-            paperclip_status = _STATUS_MAP.get(task.status, "todo")
+            if getattr(task, "approval_state", None) == "pending":
+                paperclip_status = "backlog"
+            else:
+                paperclip_status = _STATUS_MAP.get(task.status, "todo")
             resolved_key = assignee_key or self.resolve_assignee_for_task(task)
             agent_id = self._resolve_agent(resolved_key)
             updated = self._client.update_issue(
@@ -334,6 +320,37 @@ class TaskControlPlane:
             log.error("control_plane.adopt_issue failed for issue %s: %s", issue_id, exc)
             return None
 
+    def promote_issue_to_todo(self, issue_id: str, task: "TaskRecord") -> Optional[IssueRef]:
+        """
+        Promote a backlog issue to todo.
+        """
+        try:
+            # Keep assignee stable if already set; otherwise resolve default for task.
+            previous = self._client.get_issue(issue_id)
+            resolved_key = self.resolve_assignee_for_task(task)
+            assignee_id = previous.assignee_id or self._resolve_agent(resolved_key)
+            return self._client.update_issue(issue_id, status="todo", assignee_id=assignee_id)
+        except Exception as exc:  # noqa: BLE001
+            log.error("control_plane.promote_issue_to_todo failed for issue %s: %s", issue_id, exc)
+            return None
+
+    def close_issue_cancelled(self, issue_id: str) -> Optional[IssueRef]:
+        """
+        Close an issue as cancelled without triggering assignee wakeups.
+
+        Paperclip can wake on backlog->non-backlog transitions when an assignee
+        remains set. Clearing assignee in the same mutation avoids that path.
+        """
+        try:
+            return self._client.update_issue(
+                issue_id,
+                status="cancelled",
+                clear_assignee=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.error("control_plane.close_issue_cancelled failed for issue %s: %s", issue_id, exc)
+            return None
+
     def _write_import_brief(self, issue_id: str, task: "TaskRecord") -> None:
         """Write the agentic-os callback instructions to a Paperclip-originated issue."""
         try:
@@ -342,7 +359,7 @@ class TaskControlPlane:
                 f"`RESULT_START` / `RESULT_END` / `TASK_DONE: {task.id}` markers, then run:\n\n"
                 f"`/Users/dara/agents/bin/submit-result {task.id}`"
             )
-            if task.task_mode == "plan_first" and task.status in ("new", "planning"):
+            if task.task_mode == "plan_first" and task.status == "to_do":
                 callback_instructions = (
                     f"Write your plan to `/tmp/task_plan_{task.id}.txt`, then run:\n\n"
                     f"`/Users/dara/agents/bin/submit-plan {task.id}`\n\n"
@@ -413,47 +430,25 @@ class TaskControlPlane:
     def resolve_assignee_for_task(self, task: TaskRecord) -> str:
         """Return the agent key to assign at task creation time.
 
-        For plan_first tasks the execution agent is assigned immediately — they
-        write the plan first, then execute after PM approval.  The PM is brought
-        in only at the review step (submit_plan) and is never the plan author.
-        """
-        return self.resolve_executor_key(task)
-
-    def resolve_executor_key(self, task: TaskRecord) -> str:
-        """
-        Return the executor agent key for a completing task.
-
-        Assignment policy:
-          content intent          → content_writer
-          finance domain          → accountant
-          admin/scheduling intent → executive_assistant
-          classifier agent=codex  → executor_codex
-          everything else         → engineer
+        Checks task metadata first (caller-supplied agent_key or assignee_key),
+        then falls back to the canonical policy_engine domain default.
         """
         metadata = self._task_metadata(task)
 
-        preferred_assignee = str(metadata.get("assignee_key", "")).strip()
-        if preferred_assignee and preferred_assignee in self._config.agent_map:
-            return preferred_assignee
+        # Explicit assignee from metadata (set at create_request or import)
+        preferred = str(metadata.get("assignee_key") or metadata.get("agent") or "").strip()
+        if preferred and preferred in self._config.agent_map:
+            return preferred
 
+        # Incident remediation always goes to infra engineer
         task_kind = str(metadata.get("task_kind", "")).strip()
         if task_kind == "incident_remediation":
             if _INFRA_ENGINEER_AGENT in self._config.agent_map:
                 return _INFRA_ENGINEER_AGENT
             return _ENGINEER_AGENT
 
-        if task.intent_type == "content":
-            return _WRITING_AGENT
-        if task.domain == "finance":
-            return _FINANCE_AGENT
-        if task.intent_type in ("capture", "recap") and task.domain == "system":
-            return _ADMIN_AGENT
-        # Route to Codex if the intake classifier selected it
-        classifier_agent = ""
-        classifier_agent = str(metadata.get("agent", "")).strip()
-        if classifier_agent == "codex":
-            return _CODEX_AGENT
-        return _ENGINEER_AGENT
+        # Canonical domain default from policy_engine (single source of truth)
+        return policy_engine.default_agent_for_domain(task.domain)
 
     @staticmethod
     def _task_metadata(task: TaskRecord) -> dict:

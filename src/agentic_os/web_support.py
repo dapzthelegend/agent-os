@@ -69,7 +69,7 @@ def build_overview(service: AgenticOSService) -> dict[str, Any]:
         status_counts[task.status] = status_counts.get(task.status, 0) + 1
 
     pending_approvals = service.recap_approvals()
-    drafts = service.recap_drafts()
+    awaiting_input = service.recap_awaiting_input()
     failures = service.recap_failures(limit=5)
     external_actions = service.recap_external_actions(limit=5)
 
@@ -77,7 +77,7 @@ def build_overview(service: AgenticOSService) -> dict[str, Any]:
         "task_count": len(tasks),
         "status_counts": status_counts,
         "pending_approvals_count": pending_approvals["count"],
-        "open_drafts_count": drafts["count"],
+        "awaiting_input_count": awaiting_input["count"],
         "recent_failures_count": failures["count"],
         "recent_external_actions_count": external_actions["count"],
         "recent_tasks": [serialize_task(task) for task in tasks[:10]],

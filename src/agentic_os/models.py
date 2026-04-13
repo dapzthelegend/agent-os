@@ -7,30 +7,24 @@ from typing import Any, Optional
 DOMAINS = ("personal", "technical", "finance", "system")
 INTENT_TYPES = ("read", "draft", "execute", "capture", "recap", "content")
 RISK_LEVELS = ("low", "medium", "high")
-ACTION_SOURCES = ("openclaw_tool", "openclaw_skill", "custom_adapter", "manual", "api", "paperclip_manual")
-STATUSES = (
-    # legacy live-path statuses (phase 0 compat)
-    "new",
-    "in_progress",
-    "awaiting_input",
-    "awaiting_approval",
-    "approved",
-    "executed",
-    # new statuses (phase 1+)
-    "planning",
-    "awaiting_plan_review",
-    "approved_for_execution",
-    "executing",
-    # terminal
-    "completed",
-    "failed",
-    "cancelled",
-    "stalled",
-)
+ACTION_SOURCES = ("tool", "automation", "custom_adapter", "manual", "api", "paperclip_manual", "paperclip_routine")
+ACTION_SOURCE_ALIASES = {
+    "openclaw_tool": "tool",
+    "openclaw_skill": "automation",
+    "openclaw_kill": "automation",
+}
+STATUSES = ("to_do", "in_progress", "done")
 
 TASK_MODES = ("direct", "plan_first")
 APPROVAL_STATES = ("not_needed", "pending", "approved", "denied", "cancelled")
-POLICY_DECISIONS = ("read_ok", "draft_required", "approval_required")
+POLICY_DECISIONS = ("execute", "plan", "approve", "approve_plan")
+# Legacy aliases for backward-compatible DB reads
+_LEGACY_POLICY_MAP = {
+    "read_ok": "execute",
+    "draft_required": "execute",
+    "approval_required": "approve",
+    "plan_first": "approve_plan",
+}
 APPROVAL_RECORD_STATES = ("pending", "approved", "denied", "cancelled")
 APPROVAL_SUBJECT_TYPES = ("artifact", "action")
 EXECUTION_STATES = ("executed", "duplicate_rejected")
@@ -43,12 +37,38 @@ def validate_choice(value: str, allowed: tuple[str, ...], field_name: str) -> st
     return value
 
 
+def normalize_action_source(
+    action_source: Optional[str],
+    *,
+    request_metadata: Optional[dict[str, Any]] = None,
+    default: str = "manual",
+) -> str:
+    def _canon(value: Optional[str]) -> Optional[str]:
+        if not value:
+            return None
+        normalized = str(value).strip().lower().replace("-", "_")
+        return ACTION_SOURCE_ALIASES.get(normalized, normalized)
+
+    direct = _canon(action_source)
+    if direct and direct in ACTION_SOURCES:
+        return direct
+
+    if request_metadata:
+        for key in ("action_source", "origin", "source"):
+            from_metadata = _canon(request_metadata.get(key))
+            if from_metadata and from_metadata in ACTION_SOURCES:
+                return from_metadata
+
+    fallback = _canon(default) or "manual"
+    return fallback if fallback in ACTION_SOURCES else "manual"
+
+
 @dataclass(frozen=True)
 class RequestClassification:
     domain: str
     intent_type: str
     risk_level: str
-    status: str = "new"
+    status: str = "to_do"
     approval_state: str = "not_needed"
 
     def validate(self) -> "RequestClassification":
@@ -148,3 +168,40 @@ class OperatorError(Exception):
 
     def __str__(self) -> str:
         return self.message
+
+
+# ---------------------------------------------------------------------------
+# Task lifecycle — strict three-state backend mirror
+# ---------------------------------------------------------------------------
+
+TERMINAL_STATUSES = frozenset({"done"})
+
+VALID_TRANSITIONS: dict[str, frozenset[str]] = {
+    "to_do": frozenset({"in_progress", "done"}),
+    "in_progress": frozenset({"to_do", "done"}),
+    "done": frozenset(),
+}
+
+
+class InvalidTransitionError(OperatorError):
+    """Raised when a status transition violates the task lifecycle state machine."""
+    pass
+
+
+def validate_transition(from_status: str, to_status: str) -> None:
+    """Raise InvalidTransitionError if the transition is not allowed."""
+    if from_status == to_status:
+        return  # no-op transitions are always allowed
+    allowed = VALID_TRANSITIONS.get(from_status)
+    if allowed is None:
+        raise InvalidTransitionError(
+            code="invalid_transition",
+            message=f"unknown source status: {from_status!r}",
+            details={"from": from_status, "to": to_status},
+        )
+    if to_status not in allowed:
+        raise InvalidTransitionError(
+            code="invalid_transition",
+            message=f"transition {from_status!r} \u2192 {to_status!r} is not allowed",
+            details={"from": from_status, "to": to_status, "allowed": sorted(allowed)},
+        )
