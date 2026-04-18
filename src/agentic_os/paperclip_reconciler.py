@@ -5,14 +5,15 @@ from typing import Any
 
 from .config import AppConfig, Paths
 from .service import AgenticOSService
-from .status_mapping import map_paperclip_status_to_backend
 from .task_control_plane import TaskControlPlane
 
 log = logging.getLogger(__name__)
 
 
 class PaperclipReconciler:
-    """One-way lifecycle mirror: Paperclip issue status -> backend task status."""
+    """Import-only reconciler: discovers new Paperclip issues and promotes
+    approved backlog items.  Does NOT mirror Paperclip lifecycle status into
+    the backend — Paperclip is the sole source of truth for task state."""
 
     def __init__(self, paths: Paths, config: AppConfig) -> None:
         self._paths = paths
@@ -27,16 +28,13 @@ class PaperclipReconciler:
             return {
                 "issues_scanned": 0,
                 "imported": 0,
-                "mirrored": 0,
-                "unchanged": 0,
+                "promoted": 0,
                 "errors": 0,
                 "note": "paperclip not configured",
             }
 
         imported = 0
-        mirrored = 0
         promoted = 0
-        unchanged = 0
         errors = 0
 
         try:
@@ -46,9 +44,7 @@ class PaperclipReconciler:
             return {
                 "issues_scanned": 0,
                 "imported": 0,
-                "mirrored": 0,
                 "promoted": 0,
-                "unchanged": 0,
                 "errors": 1,
             }
 
@@ -72,27 +68,12 @@ class PaperclipReconciler:
                     task = created["task"]
                     imported += 1
 
-                target_status = map_paperclip_status_to_backend(issue.status)
-                if task.status == target_status:
-                    unchanged += 1
-                else:
-                    self._service.db.update_task(task.id, status=target_status)
-                    self._service._append_event(
-                        task_id=task.id,
-                        event_type="paperclip_status_mirrored",
-                        payload={
-                            "paperclip_issue_id": issue.id,
-                            "paperclip_status": issue.status,
-                            "backend_status": target_status,
-                        },
-                    )
-                    mirrored += 1
-
                 if issue.status == "backlog" and self._is_ready_for_paperclip_todo(task):
                     updated_issue = self._cp.promote_issue_to_todo(issue.id, task)
                     if updated_issue is not None:
                         self._service.db.update_task(
                             task.id,
+                            paperclip_status="todo",
                             paperclip_assignee_agent_id=updated_issue.assignee_id or None,
                             paperclip_project_id=updated_issue.project_id or None,
                         )
@@ -109,14 +90,12 @@ class PaperclipReconciler:
                         promoted += 1
             except Exception as exc:  # noqa: BLE001
                 errors += 1
-                log.error("reconciler: issue mirror failed for %s: %s", issue.id, exc)
+                log.error("reconciler: issue import failed for %s: %s", issue.id, exc)
 
         return {
             "issues_scanned": len(issues),
             "imported": imported,
-            "mirrored": mirrored,
             "promoted": promoted,
-            "unchanged": unchanged,
             "errors": errors,
         }
 

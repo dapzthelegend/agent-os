@@ -31,6 +31,8 @@ from typing import Any, Iterable, Optional
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
+from .approval_capability import mint_approval_token
+
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -216,7 +218,10 @@ def _handle_component(interaction: dict, *, service) -> dict:
     # Approve button → run approval, update message in place
     if action == "approve" and arg:
         try:
-            service.approve(arg)
+            service.approve(
+                arg,
+                approval_token=mint_approval_token(action="approve", approval_id=arg),
+            )
             return _render_resolved(
                 title=f"✅ Approved `{arg}`",
                 color=COLOR_SUCCESS,
@@ -233,7 +238,11 @@ def _handle_component(interaction: dict, *, service) -> dict:
     # Cancel button → cancel the approval altogether
     if action == "cancel_approval" and arg:
         try:
-            service.cancel(arg, decision_note="cancelled from Discord")
+            service.cancel(
+                arg,
+                decision_note="cancelled from Discord",
+                approval_token=mint_approval_token(action="cancel", approval_id=arg),
+            )
             return _render_resolved(
                 title=f"🚫 Cancelled `{arg}`",
                 color=COLOR_MUTED,
@@ -289,7 +298,11 @@ def _handle_modal(interaction: dict, *, service) -> dict:
     if action == "deny_confirm" and arg:
         reason = _extract_modal_text(data, input_id="reason") or None
         try:
-            service.deny(arg, decision_note=reason)
+            service.deny(
+                arg,
+                decision_note=reason,
+                approval_token=mint_approval_token(action="deny", approval_id=arg),
+            )
             title = f"❌ Denied `{arg}`"
             if reason:
                 title += f" — {reason[:120]}"

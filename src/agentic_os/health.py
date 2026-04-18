@@ -243,6 +243,27 @@ def get_paperclip_diagnostics(
     return out
 
 
+def get_watchdog_status(service: "AgenticOSService") -> dict[str, Any]:
+    """Return a lightweight liveness payload for the external supervisor."""
+    checked_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    db_section = _check_db(service)
+    scheduler_state = "unknown"
+    try:
+        scheduler = getattr(service, "scheduler", None)
+        if scheduler is not None:
+            scheduler_state = "running"
+    except Exception:
+        scheduler_state = "error"
+
+    healthy = bool(db_section.get("reachable"))
+    return {
+        "status": "ok" if healthy else "error",
+        "checked_at": checked_at,
+        "db_reachable": bool(db_section.get("reachable")),
+        "scheduler": scheduler_state,
+    }
+
+
 def validate_startup_config(paths: "Paths", config: "AppConfig") -> list[str]:
     """
     Validate essential config at startup.  Returns a list of issue strings

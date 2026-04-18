@@ -51,6 +51,7 @@ EVENT_TYPES = (
     "paperclip_projection_pending",
     "paperclip_projection_repair_failed",
     "paperclip_sync_failed",
+    "paperclip_result_orphaned",
     # Plan gate (Phase 2)
     "task_mode_set",
     "plan_submitted",

@@ -10,6 +10,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from .api_routes import router as api_router
+from .backend_auth import install_backend_auth
+from .config import default_paths, load_app_config
 from .discord_webhook import router as discord_router
 from .web_routes import router as web_router
 from .web_support import STATIC_DIR, TEMPLATES_DIR
@@ -19,14 +21,13 @@ from .web_support import STATIC_DIR, TEMPLATES_DIR
 async def _lifespan(app: FastAPI):
     """Start the background scheduler on startup; stop it on shutdown."""
     import logging
-    from .config import default_paths, load_app_config
     from .scheduler import BackgroundScheduler
     from .jobs import register_all_jobs
 
     scheduler = BackgroundScheduler()
     try:
-        paths = default_paths()
-        config = load_app_config(paths)
+        paths = app.state.paths
+        config = app.state.app_config
         register_all_jobs(scheduler, paths, config)
         scheduler.start()
         app.state.scheduler = scheduler
@@ -41,10 +42,13 @@ async def _lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     app = FastAPI(title="agentic-os dashboard", lifespan=_lifespan)
+    app.state.paths = default_paths()
+    app.state.app_config = load_app_config(app.state.paths)
     app.state.templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
     app.state.templates.env.filters["status_tone"] = _status_tone
     app.state.templates.env.filters["risk_tone"] = _risk_tone
     app.state.templates.env.filters["event_tone"] = _event_tone
+    install_backend_auth(app, app.state.app_config.backend_auth)
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
     app.include_router(web_router)
     app.include_router(api_router)

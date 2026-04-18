@@ -8,6 +8,7 @@ from fastapi import APIRouter, Form, HTTPException, Request
 from fastapi.responses import RedirectResponse
 from fastapi.templating import Jinja2Templates
 
+from .approval_capability import mint_approval_token
 from .models import OperatorError
 from .health import get_system_health
 from .web_support import (
@@ -63,12 +64,18 @@ def _redirect(url: str, *, message: Optional[str] = None, error: Optional[str] =
 
 def _apply_approval(
     action: Callable[..., dict],
+    action_name: str,
     approval_id: str,
     note: Optional[str],
     redirect_to: str,
+    approval_token: Optional[str],
 ) -> RedirectResponse:
     try:
-        action(approval_id, decision_note=note or None)
+        action(
+            approval_id,
+            decision_note=note or None,
+            approval_token=approval_token,
+        )
     except Exception as exc:
         return _redirect(redirect_to, error=str(exc))
     return _redirect(redirect_to, message=f"Approval {approval_id} updated.")
@@ -150,6 +157,13 @@ def approvals_page(request: Request):
     service = get_service()
     groups = approval_groups(service)
     details = [enrich_approval_detail(service, approval["id"]) for approval in groups["pending"]]
+    for item in details:
+        approval_id = item["approval"]["id"]
+        item["approval_tokens"] = {
+            "approve": mint_approval_token(action="approve", approval_id=approval_id),
+            "deny": mint_approval_token(action="deny", approval_id=approval_id),
+            "cancel": mint_approval_token(action="cancel", approval_id=approval_id),
+        }
     return _render(
         request,
         "approvals.html",
@@ -167,22 +181,42 @@ def approval_detail(request: Request, approval_id: str):
     except Exception as exc:
         raise _handle_page_error(exc) from exc
     detail["approval_payload_pretty"] = format_json(detail["approval_payload"])
+    detail["approval_tokens"] = {
+        "approve": mint_approval_token(action="approve", approval_id=approval_id),
+        "deny": mint_approval_token(action="deny", approval_id=approval_id),
+        "cancel": mint_approval_token(action="cancel", approval_id=approval_id),
+    }
     return _render(request, "approval_detail.html", detail)
 
 
 @router.post("/approvals/{approval_id}/approve")
-def approve_approval(approval_id: str, note: str = Form(default=""), redirect_to: str = Form(default="/approvals")):
-    return _apply_approval(get_service().approve, approval_id, note, redirect_to)
+def approve_approval(
+    approval_id: str,
+    note: str = Form(default=""),
+    redirect_to: str = Form(default="/approvals"),
+    approval_token: str = Form(default=""),
+):
+    return _apply_approval(get_service().approve, "approve", approval_id, note, redirect_to, approval_token)
 
 
 @router.post("/approvals/{approval_id}/deny")
-def deny_approval(approval_id: str, note: str = Form(default=""), redirect_to: str = Form(default="/approvals")):
-    return _apply_approval(get_service().deny, approval_id, note, redirect_to)
+def deny_approval(
+    approval_id: str,
+    note: str = Form(default=""),
+    redirect_to: str = Form(default="/approvals"),
+    approval_token: str = Form(default=""),
+):
+    return _apply_approval(get_service().deny, "deny", approval_id, note, redirect_to, approval_token)
 
 
 @router.post("/approvals/{approval_id}/cancel")
-def cancel_approval(approval_id: str, note: str = Form(default=""), redirect_to: str = Form(default="/approvals")):
-    return _apply_approval(get_service().cancel, approval_id, note, redirect_to)
+def cancel_approval(
+    approval_id: str,
+    note: str = Form(default=""),
+    redirect_to: str = Form(default="/approvals"),
+    approval_token: str = Form(default=""),
+):
+    return _apply_approval(get_service().cancel, "cancel", approval_id, note, redirect_to, approval_token)
 
 
 @router.get("/executions/{operation_key}")

@@ -86,10 +86,18 @@ class PaperclipConfig:
 
 
 @dataclass(frozen=True)
+class BackendAuthConfig:
+    username: str
+    password: str
+    realm: str = "agentic-os"
+
+
+@dataclass(frozen=True)
 class AppConfig:
     notion: Optional[NotionConfig] = None
     notion_databases: dict[str, NotionConfig] = field(default_factory=dict)
     paperclip: Optional[PaperclipConfig] = None
+    backend_auth: Optional[BackendAuthConfig] = None
     agent_override: Optional[str] = None   # primary model for all cron-dispatched tasks
     agent_fallback: Optional[str] = None   # fallback if primary model is unavailable
     stall_thresholds: dict[str, float] = field(default_factory=dict)  # per-domain stall hours
@@ -150,7 +158,7 @@ def default_paths() -> Paths:
 def load_app_config(paths: Paths) -> AppConfig:
     config_path = Path(os.environ.get("AGENTIC_OS_CONFIG_PATH", str(paths.config_path)))
     if not config_path.exists():
-        return AppConfig()
+        return AppConfig(backend_auth=_parse_backend_auth_config(None))
     payload = json.loads(config_path.read_text(encoding="utf-8"))
     
     # Load the legacy top-level 'notion' config
@@ -182,11 +190,14 @@ def load_app_config(paths: Paths) -> AppConfig:
     paperclip_config: Optional[PaperclipConfig] = None
     if paperclip_payload is not None:
         paperclip_config = _parse_paperclip_config(paperclip_payload)
+    backend_auth_payload = payload.get("backendAuth")
+    backend_auth_config = _parse_backend_auth_config(backend_auth_payload)
 
     return AppConfig(
         notion=main_notion_config,
         notion_databases=notion_databases,
         paperclip=paperclip_config,
+        backend_auth=backend_auth_config,
         agent_override=payload.get("agentOverride") or None,
         agent_fallback=payload.get("agentFallback") or None,
         stall_thresholds=stall_thresholds,
@@ -287,6 +298,39 @@ def _parse_paperclip_config(payload: dict[str, Any]) -> PaperclipConfig:
         reconcile_poll_interval_seconds=int(payload.get("reconcile_poll_interval_seconds", 120)),
         reconcile_activity_lookback_seconds=int(payload.get("reconcile_activity_lookback_seconds", 300)),
     )
+
+
+def _parse_backend_auth_config(payload: Any) -> Optional[BackendAuthConfig]:
+    env_username = os.environ.get("AGENTIC_OS_BACKEND_AUTH_USERNAME", "").strip()
+    env_password = os.environ.get("AGENTIC_OS_BACKEND_AUTH_PASSWORD", "")
+    if payload is None:
+        if env_username and env_password:
+            return BackendAuthConfig(username=env_username, password=env_password)
+        return None
+    if not isinstance(payload, dict):
+        raise ConfigurationError("backendAuth must be an object if provided")
+
+    enabled = bool(payload.get("enabled", True))
+    if not enabled:
+        return None
+
+    username = str(payload.get("username", env_username)).strip()
+    password_env = str(payload.get("passwordEnv", "AGENTIC_OS_BACKEND_AUTH_PASSWORD")).strip()
+    password = os.environ.get(password_env, "")
+    realm = str(payload.get("realm", "agentic-os")).strip() or "agentic-os"
+
+    missing: list[str] = []
+    if not username:
+        missing.append("username")
+    if not password_env:
+        missing.append("passwordEnv")
+    if not password:
+        missing.append(f"env:{password_env}")
+    if missing:
+        raise ConfigurationError(
+            f"Backend auth is enabled but missing required fields: {', '.join(missing)}"
+        )
+    return BackendAuthConfig(username=username, password=password, realm=realm)
 
 
 def load_policy_rules(path: Path) -> list[dict[str, Any]]:

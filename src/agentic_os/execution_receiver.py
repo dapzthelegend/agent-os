@@ -261,6 +261,45 @@ def receive_execution_result(
                 artifact_ref=artifact_id,
             )
 
+        reloaded_task = service.db.get_task(task_id)
+        cp = service._cp
+        if cp is not None and reloaded_task.paperclip_issue_id:
+            writeback = cp.write_result(
+                reloaded_task.paperclip_issue_id,
+                content,
+                task_id=task_id,
+                artifact_path=artifact_record.path,
+            )
+            if writeback.orphaned:
+                metadata = service._request_metadata_dict(reloaded_task)
+                metadata["result_orphaned"] = True
+                metadata["result_orphaned_issue_id"] = reloaded_task.paperclip_issue_id
+                metadata["result_orphaned_dead_letter_dir"] = writeback.dead_letter_dir
+                metadata["result_orphaned_session_key"] = session_key
+                service.db.update_task(
+                    task_id,
+                    request_metadata_json=service._dump_json_or_none(metadata),
+                )
+                service._append_event(
+                    task_id=task_id,
+                    event_type="paperclip_result_orphaned",
+                    payload={
+                        "issue_id": reloaded_task.paperclip_issue_id,
+                        "dead_letter_dir": writeback.dead_letter_dir,
+                        "errors": writeback.errors,
+                    },
+                )
+            elif writeback.errors:
+                service._append_event(
+                    task_id=task_id,
+                    event_type="paperclip_sync_failed",
+                    payload={
+                        "op": "write_result",
+                        "issue_id": reloaded_task.paperclip_issue_id,
+                        "errors": writeback.errors,
+                    },
+                )
+
         # Step 5b: Emit callback audit event with full correlation IDs
         reloaded_task = service.db.get_task(task_id)
         execution_record = service.db.get_execution(reloaded_task.operation_key) if reloaded_task.operation_key else None

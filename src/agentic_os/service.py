@@ -15,12 +15,12 @@ from .adapters import execute_custom_adapter
 from .audit import AuditLog
 from .config import AppConfig, Paths, load_app_config
 from . import policy_engine
+from .approval_capability import verify_approval_token
 from .models import (
     ACTION_SOURCES, ApprovalRecord, InvalidTransitionError, OperatorError,
     RequestClassification, TaskRecord, normalize_action_source, validate_choice, validate_transition,
 )
 from .storage import Database
-from .status_mapping import map_paperclip_status_to_backend
 
 _RUNTIME_FOLLOWUP_INCIDENT = "incident_remediation"
 _RUNTIME_FOLLOWUP_ACTIONABLE = "actionable_followup"
@@ -46,7 +46,10 @@ class AgenticOSService:
         if not self._cp_initialized:
             if self.config.paperclip is not None:
                 from .task_control_plane import TaskControlPlane
-                self._cp_cache = TaskControlPlane(self.config.paperclip)
+                self._cp_cache = TaskControlPlane(
+                    self.config.paperclip,
+                    orphaned_results_dir=self.paths.data_dir / "orphaned_results",
+                )
             self._cp_initialized = True
         return self._cp_cache
 
@@ -309,11 +312,13 @@ class AgenticOSService:
             assignee_agent_id=assignee_agent_id, domain=domain,
         )
 
+        initial_status = self._triage_paperclip_status(paperclip_status)
+
         classification = RequestClassification(
             domain=domain,
             intent_type="execute",
             risk_level="medium",
-            status=map_paperclip_status_to_backend(paperclip_status),
+            status=initial_status,
             approval_state="not_needed",
         )
 
@@ -331,16 +336,30 @@ class AgenticOSService:
             adopt_paperclip_origin_kind=origin_kind,
         )
         task = payload["task"]
+        update_kwargs: dict[str, Any] = {"paperclip_status": paperclip_status}
         if task.paperclip_issue_id != issue_id:
-            task = self.db.update_task(
-                task.id,
+            update_kwargs.update(
                 paperclip_issue_id=issue_id,
                 paperclip_routine_id=routine_id,
                 paperclip_routine_run_id=routine_run_id,
                 paperclip_origin_kind=origin_kind,
             )
-            payload["task"] = task
+        task = self.db.update_task(task.id, **update_kwargs)
+        payload["task"] = task
         return payload
+
+    @staticmethod
+    def _triage_paperclip_status(paperclip_status: str) -> str:
+        """Determine the initial backend pipeline phase from the Paperclip
+        status at import time.  This is a one-time triage, not a continuous
+        mirror — after import the backend manages its own status independently.
+        """
+        ps = (paperclip_status or "").strip().lower()
+        if ps in ("done", "cancelled"):
+            return "done"
+        if ps == "in_progress":
+            return "in_progress"
+        return "to_do"
 
     def _resolve_agent_key_from_paperclip(
         self,
@@ -359,6 +378,9 @@ class AgenticOSService:
     def ensure_task_for_paperclip_issue(self, paperclip_issue_id: str) -> dict[str, Any]:
         """
         Resolve or import a backend task for the given Paperclip issue.
+
+        Returns the task record plus deterministic callback instructions so the
+        agent runtime never depends on a separate brief document existing.
         """
         issue_id = (paperclip_issue_id or "").strip()
         if not issue_id:
@@ -371,6 +393,7 @@ class AgenticOSService:
                 "created": False,
                 "task_id": existing.id,
                 "task": asdict(existing),
+                "callback": self._build_callback_instructions(existing),
             }
 
         cp = self._cp
@@ -411,6 +434,24 @@ class AgenticOSService:
             "created": True,
             "task_id": task.id,
             "task": asdict(task),
+            "callback": self._build_callback_instructions(task),
+        }
+
+    @staticmethod
+    def _build_callback_instructions(task: "TaskRecord") -> dict[str, str]:
+        """Deterministic callback instructions derived from the task record.
+
+        Returned inline with the resolve response so agents never depend on a
+        separate brief document existing in Paperclip.
+        """
+        return {
+            "task_id": task.id,
+            "domain": task.domain,
+            "mode": task.task_mode,
+            "submit_result_cmd": f"/Users/dara/agents/bin/submit-result {task.id}",
+            "submit_plan_cmd": f"/Users/dara/agents/bin/submit-plan {task.id}",
+            "result_file": f"/tmp/task_result_{task.id}.md",
+            "plan_file": f"/tmp/task_plan_{task.id}.md",
         }
 
     def record_openclaw_read(
@@ -752,7 +793,22 @@ class AgenticOSService:
         return result
 
     def mark_dispatched(self, task_id: str, *, session_key: str, agent: str) -> None:
-        """Record that a child session was spawned. Emits task_dispatched audit event."""
+        """Record that a child session was spawned. Emits task_dispatched audit event.
+
+        The brief document is written best-effort for operator visibility.
+        Agents receive callback instructions inline from resolve-by-paperclip-issue
+        and do not depend on the brief existing.
+        """
+        task = self.db.get_task(task_id)
+        cp = self._cp
+        if cp is not None and task.paperclip_issue_id:
+            brief_ok = cp.ensure_task_brief(task.paperclip_issue_id, task)
+            if not brief_ok:
+                _log.warning(
+                    "brief write failed for issue %s (task %s); dispatch continues — "
+                    "agent has callback instructions from resolve response",
+                    task.paperclip_issue_id, task_id,
+                )
         self.db.update_dispatch_session_key(task_id, session_key)
         self._append_event(
             task_id=task_id,
@@ -905,6 +961,7 @@ class AgenticOSService:
                 )
             task = self.db.update_task(
                 task.id,
+                paperclip_status="cancelled",
                 paperclip_assignee_agent_id=closed_issue.assignee_id or None,
                 paperclip_project_id=closed_issue.project_id or None,
                 paperclip_goal_id=closed_issue.goal_id or None,
@@ -1280,6 +1337,22 @@ class AgenticOSService:
     def send_approval_reminders(self, threshold_hours: float = 1.0) -> dict[str, Any]:
         """Send reminders for all pending approvals older than threshold_hours."""
         from .notification_router import route_approval_reminder
+        from .notification_router import DISCORD_APPROVAL_REMINDER_PUSH_ENABLED_ENV
+        import os
+
+        if os.environ.get(DISCORD_APPROVAL_REMINDER_PUSH_ENABLED_ENV, "false").strip().lower() not in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            return {
+                "reminded": 0,
+                "threshold_hours": threshold_hours,
+                "push_enabled": False,
+                "records": [],
+            }
+
         now_utc = datetime.now(timezone.utc)
         results = []
         for approval in self.db.list_approvals_by_status("pending"):
@@ -1297,6 +1370,7 @@ class AgenticOSService:
         return {
             "reminded": len(results),
             "threshold_hours": threshold_hours,
+            "push_enabled": True,
             "records": results,
         }
 
@@ -1306,7 +1380,9 @@ class AgenticOSService:
         decision_note: Optional[str] = None,
         *,
         decided_by: Optional[str] = None,
+        approval_token: Optional[str] = None,
     ) -> dict[str, Any]:
+        self._require_approval_capability("approve", approval_id, approval_token)
         approval = self.db.get_approval(approval_id)
         if approval.status != "pending":
             self._record_task_operation_rejection(
@@ -1331,10 +1407,10 @@ class AgenticOSService:
             payload = {"approval": asdict(approval), "status_unchanged": False}
         payload["decided_by"] = decided_by or "unknown"
         self._append_event(task_id=task.id, event_type="approval_granted", payload=payload)
-        # Promote Paperclip issue from backlog → todo now that approval is granted
         cp = self._cp
         if cp is not None and task.paperclip_issue_id:
             cp.update_issue_status(task.paperclip_issue_id, task.status)
+            self.db.update_task(task.id, paperclip_status="todo")
         return {"task": task, "approval": approval}
 
     def deny(
@@ -1343,7 +1419,9 @@ class AgenticOSService:
         decision_note: Optional[str] = None,
         *,
         decided_by: Optional[str] = None,
+        approval_token: Optional[str] = None,
     ) -> dict[str, Any]:
+        self._require_approval_capability("deny", approval_id, approval_token)
         approval = self.db.get_approval(approval_id)
         if approval.status != "pending":
             self._record_task_operation_rejection(
@@ -1376,6 +1454,7 @@ class AgenticOSService:
             try:
                 if task.paperclip_issue_id:
                     cp.close_issue_cancelled(task.paperclip_issue_id)
+                    self.db.update_task(task.id, paperclip_status="cancelled")
             except Exception as _pc_exc:
                 self._append_event(
                     task_id=task.id,
@@ -1390,7 +1469,9 @@ class AgenticOSService:
         decision_note: Optional[str] = None,
         *,
         decided_by: Optional[str] = None,
+        approval_token: Optional[str] = None,
     ) -> dict[str, Any]:
+        self._require_approval_capability("cancel", approval_id, approval_token)
         approval = self.db.get_approval(approval_id)
         if approval.status != "pending":
             self._record_task_operation_rejection(
@@ -1423,6 +1504,7 @@ class AgenticOSService:
             try:
                 if task.paperclip_issue_id:
                     cp.close_issue_cancelled(task.paperclip_issue_id)
+                    self.db.update_task(task.id, paperclip_status="cancelled")
             except Exception as _pc_exc:
                 self._append_event(
                     task_id=task.id,
@@ -1873,6 +1955,18 @@ class AgenticOSService:
         if str(metadata.get("task_kind", "")).strip() == _GITHUB_CONTRIBUTION_KIND:
             return True
         return isinstance(metadata.get("github_contribution"), dict)
+
+    @staticmethod
+    def _require_approval_capability(action: str, approval_id: str, token: Optional[str]) -> None:
+        if verify_approval_token(action=action, approval_id=approval_id, token=token):
+            return
+        raise OperatorError(
+            code="approval_surface_restricted",
+            message=(
+                "Approval mutations are restricted to the dashboard and Discord surfaces."
+            ),
+            details={"action": action, "approval_id": approval_id},
+        )
 
     @staticmethod
     def _contribution_backend_status(contribution: dict[str, Any]) -> str:

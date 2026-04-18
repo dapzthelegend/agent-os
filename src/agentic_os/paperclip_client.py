@@ -12,6 +12,9 @@ Phase 0 scope: no checkout/release logic.
 from __future__ import annotations
 
 import logging
+import random
+import re
+import socket
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -26,7 +29,10 @@ log = logging.getLogger(__name__)
 
 _TRANSIENT_STATUS_CODES = {500, 502, 503, 504}
 _MAX_RETRIES = 3
-_RETRY_DELAY_SECONDS = 1.0
+_REQUEST_TIMEOUT_SECONDS = 10
+_INITIAL_RETRY_DELAY_SECONDS = 1.0
+_MAX_RETRY_DELAY_SECONDS = 8.0
+_JITTER_FACTOR = 0.2
 
 
 class PaperclipError(Exception):
@@ -65,6 +71,7 @@ class DocumentRef:
     issue_id: str
     title: str
     content: str
+    doc_type: Optional[str] = None
 
 
 @dataclass
@@ -193,22 +200,100 @@ class PaperclipClient:
     def write_document(
         self, issue_id: str, *, title: str, content: str, doc_type: str = "plan"
     ) -> DocumentRef:
-        body = {"title": title, "content": content, "type": doc_type}
-        data = self._request("POST", f"/issues/{issue_id}/documents", body=body)
-        return DocumentRef(
-            id=str(data.get("id", "")),
+        key = self._to_document_key(doc_type=doc_type, title=title)
+        upsert_body = {
+            "title": title,
+            "format": "markdown",
+            "body": content,
+        }
+        try:
+            data = self._request("PUT", f"/issues/{issue_id}/documents/{key}", body=upsert_body)
+            return self._parse_document_payload(
+                data,
+                issue_id=issue_id,
+                fallback_id=key,
+                fallback_title=title,
+                fallback_content=content,
+                fallback_doc_type=doc_type,
+            )
+        except PaperclipError as exc:
+            # Backward compatibility for older Paperclip versions.
+            if exc.status_code not in {404, 405}:
+                raise
+
+        legacy_body = {"title": title, "content": content, "type": doc_type}
+        data = self._request("POST", f"/issues/{issue_id}/documents", body=legacy_body)
+        return self._parse_document_payload(
+            data,
             issue_id=issue_id,
-            title=str(data.get("title", title)),
-            content=str(data.get("content", content)),
+            fallback_id="",
+            fallback_title=title,
+            fallback_content=content,
+            fallback_doc_type=doc_type,
         )
+
+    def list_documents(self, issue_id: str) -> list[DocumentRef]:
+        data = self._request("GET", f"/issues/{issue_id}/documents")
+        items = data if isinstance(data, list) else data.get("items", [])
+        documents: list[DocumentRef] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("key", ""))
+            documents.append(
+                self._parse_document_payload(
+                    item,
+                    issue_id=issue_id,
+                    fallback_id=key,
+                    fallback_title="",
+                    fallback_content="",
+                    fallback_doc_type=None,
+                )
+            )
+        return documents
 
     def get_document(self, issue_id: str, doc_id: str) -> DocumentRef:
         data = self._request("GET", f"/issues/{issue_id}/documents/{doc_id}")
-        return DocumentRef(
-            id=str(data.get("id", doc_id)),
+        return self._parse_document_payload(
+            data,
             issue_id=issue_id,
-            title=str(data.get("title", "")),
-            content=str(data.get("content", "")),
+            fallback_id=doc_id,
+            fallback_title="",
+            fallback_content="",
+            fallback_doc_type=None,
+        )
+
+    def _to_document_key(self, *, doc_type: str, title: str) -> str:
+        raw = (doc_type or "").strip().lower() or (title or "").strip().lower()
+        key = re.sub(r"[^a-z0-9_-]+", "-", raw).strip("-_")
+        if not key:
+            key = "document"
+        if not key[0].isalnum():
+            key = f"d{key}"
+        return key[:64]
+
+    def _parse_document_payload(
+        self,
+        data: dict[str, Any],
+        *,
+        issue_id: str,
+        fallback_id: str,
+        fallback_title: str,
+        fallback_content: str,
+        fallback_doc_type: Optional[str],
+    ) -> DocumentRef:
+        payload_type = data.get("type")
+        if payload_type is None and data.get("key") is not None:
+            payload_type = data.get("key")
+        payload_content = data.get("content")
+        if payload_content is None and data.get("body") is not None:
+            payload_content = data.get("body")
+        return DocumentRef(
+            id=str(data.get("id", fallback_id)),
+            issue_id=issue_id,
+            title=str(data.get("title", fallback_title)),
+            content=str(payload_content if payload_content is not None else fallback_content),
+            doc_type=str(payload_type) if payload_type is not None else fallback_doc_type,
         )
 
     # ------------------------------------------------------------------
@@ -328,7 +413,7 @@ class PaperclipClient:
         for attempt in range(_MAX_RETRIES):
             try:
                 req = Request(url, data=encoded_body, headers=headers, method=method)
-                with urlopen(req, timeout=10) as resp:
+                with urlopen(req, timeout=_REQUEST_TIMEOUT_SECONDS) as resp:
                     raw = resp.read()
                     if not raw:
                         return {}
@@ -339,17 +424,30 @@ class PaperclipClient:
                     raise PaperclipError(str(exc), status_code=exc.code) from exc
                 last_exc = exc
                 log.warning("paperclip transient error (attempt %d/%d): %s", attempt + 1, _MAX_RETRIES, exc)
-                time.sleep(_RETRY_DELAY_SECONDS * (attempt + 1))
+                self._sleep_before_retry(attempt)
             except URLError as exc:
                 last_exc = exc
                 log.warning("paperclip transient error (attempt %d/%d): %s", attempt + 1, _MAX_RETRIES, exc)
-                time.sleep(_RETRY_DELAY_SECONDS * (attempt + 1))
+                self._sleep_before_retry(attempt)
+            except socket.timeout as exc:
+                last_exc = exc
+                log.warning("paperclip transient error (attempt %d/%d): %s", attempt + 1, _MAX_RETRIES, exc)
+                self._sleep_before_retry(attempt)
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
                 log.warning("paperclip transient error (attempt %d/%d): %s", attempt + 1, _MAX_RETRIES, exc)
-                time.sleep(_RETRY_DELAY_SECONDS * (attempt + 1))
+                self._sleep_before_retry(attempt)
 
         raise PaperclipError(f"Paperclip request failed after {_MAX_RETRIES} attempts: {last_exc}")
+
+    @staticmethod
+    def _sleep_before_retry(attempt: int) -> None:
+        base_delay = min(
+            _INITIAL_RETRY_DELAY_SECONDS * (2 ** attempt),
+            _MAX_RETRY_DELAY_SECONDS,
+        )
+        jitter = base_delay * _JITTER_FACTOR * random.uniform(-1.0, 1.0)
+        time.sleep(max(0.0, base_delay + jitter))
 
     def _auth_headers(self) -> dict[str, str]:
         if self._config.auth_mode == "trusted":

@@ -111,7 +111,7 @@ class Dispatcher:
 After outputting TASK_DONE: {task_id}, you MUST record the result:
 
 1. Write your complete output to a temp file:
-   OUTPUT_FILE="/tmp/task_result_{task_id}.txt"
+   OUTPUT_FILE="/tmp/task_result_{task_id}.md"
 
 2. Run the callback helper:
    /Users/dara/agents/bin/submit-result {task_id}
@@ -203,7 +203,7 @@ Do not begin execution until you receive an approved plan back.
 2. Post the plan as a document on the Paperclip issue (issue ID: {paperclip_issue_id}).
 
 3. Submit the plan to the backend for PM review:
-   - Write your plan to /tmp/task_plan_{task_id}.txt
+   - Write your plan to /tmp/task_plan_{task_id}.md
    - Run: /Users/dara/agents/bin/submit-plan {task_id} --doc-id <paperclip_document_id>
 
 4. Stop here. The Project Manager will review and respond via Paperclip comment.

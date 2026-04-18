@@ -811,67 +811,31 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 0
 
         if args.command == "approval" and args.approval_command == "approve":
-            if not _cli_approval_mutations_allowed():
-                print_json(
-                    {
-                        "status": "error",
-                        "error": (
-                            "CLI approval mutations are disabled by default. "
-                            "Set AGENTIC_OS_ALLOW_CLI_APPROVAL_MUTATIONS=1 for an explicit operator override."
-                        ),
-                    }
-                )
-                return 1
             print_json(
-                service.approve(
-                    args.approval_id,
-                    decision_note=args.note,
-                    decided_by=_approval_actor(),
-                )
+                {
+                    "status": "error",
+                    "error": "Approval mutations are only available via the dashboard and Discord surfaces.",
+                }
             )
-            return 0
+            return 1
 
         if args.command == "approval" and args.approval_command == "deny":
-            if not _cli_approval_mutations_allowed():
-                print_json(
-                    {
-                        "status": "error",
-                        "error": (
-                            "CLI approval mutations are disabled by default. "
-                            "Set AGENTIC_OS_ALLOW_CLI_APPROVAL_MUTATIONS=1 for an explicit operator override."
-                        ),
-                    }
-                )
-                return 1
             print_json(
-                service.deny(
-                    args.approval_id,
-                    decision_note=args.note,
-                    decided_by=_approval_actor(),
-                )
+                {
+                    "status": "error",
+                    "error": "Approval mutations are only available via the dashboard and Discord surfaces.",
+                }
             )
-            return 0
+            return 1
 
         if args.command == "approval" and args.approval_command == "cancel":
-            if not _cli_approval_mutations_allowed():
-                print_json(
-                    {
-                        "status": "error",
-                        "error": (
-                            "CLI approval mutations are disabled by default. "
-                            "Set AGENTIC_OS_ALLOW_CLI_APPROVAL_MUTATIONS=1 for an explicit operator override."
-                        ),
-                    }
-                )
-                return 1
             print_json(
-                service.cancel(
-                    args.approval_id,
-                    decision_note=args.note,
-                    decided_by=_approval_actor(),
-                )
+                {
+                    "status": "error",
+                    "error": "Approval mutations are only available via the dashboard and Discord surfaces.",
+                }
             )
-            return 0
+            return 1
 
         if args.command == "approval" and args.approval_command == "remind-pending":
             print_json(service.send_approval_reminders(threshold_hours=args.threshold_hours))

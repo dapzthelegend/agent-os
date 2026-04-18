@@ -53,6 +53,23 @@ Follow these steps every wake:
      PYTHONPATH=src python3 -m agentic_os.cli task list-ready --limit 1
      ```
 
+   The resolve response includes a `callback` object with all submission instructions:
+   ```json
+   {
+     "task_id": "task_000042",
+     "callback": {
+       "task_id": "task_000042",
+       "domain": "technical",
+       "mode": "direct",
+       "submit_result_cmd": "/Users/dara/agents/bin/submit-result task_000042",
+       "submit_plan_cmd": "/Users/dara/agents/bin/submit-plan task_000042",
+       "result_file": "/tmp/task_result_task_000042.md",
+       "plan_file": "/tmp/task_plan_task_000042.md"
+     }
+   }
+   ```
+   **Save the `callback` object** — it is the source of truth for submission, not the brief document.
+
 5. **Claim.** Run pickup once for the resolved `task_id`:
    ```bash
    cd /Users/dara/agents/agentic-os
@@ -67,18 +84,16 @@ Follow these steps every wake:
    PYTHONPATH=src python3 -m agentic_os.cli task mark-dispatched --task-id <task_id> --session-key <session_key> --agent <agent_name>
    ```
 
-7. **Read brief.** Read the `agentic-os brief` document on the Paperclip issue. Step 4's resolution triggers import and brief generation for both backend-first and Paperclip-first issues — the brief is always present by this step.
-   - Extract `task_id`, domain, mode, and writeback instructions from the brief.
-   - If the brief is unexpectedly absent, the import in Step 4 failed — comment that the brief is pending and exit.
-
-8. **Resolve mode from the brief:**
-   - `PLANNING INSTRUCTIONS` → `plan`
-   - `== APPROVED EXECUTION PLAN ==` → execute approved plan
+7. **Resolve mode from the callback:**
+   - `callback.mode == "plan_first"` → `plan`
    - Otherwise → `execute` (direct)
+   - If an approved plan document exists on the issue (`== APPROVED EXECUTION PLAN ==`), execute the approved plan.
 
-9. **Do the work.** Execute the assigned scope for your role.
+8. **Do the work.** Execute the assigned scope for your role.
 
-10. **Submit results.** Follow the writeback instructions in the brief — it specifies the exact submission mechanism and file format for the backend callback.
+9. **Submit results.** Use the submission commands from the `callback` object (step 4):
+    - **Direct mode:** Write result to `callback.result_file` with `RESULT_START` / `RESULT_END` / `TASK_DONE: <task_id>` markers, then run `callback.submit_result_cmd`.
+    - **Plan mode:** Write plan to `callback.plan_file`, then run `callback.submit_plan_cmd`. Stop and wait for PM review.
     - **Structured output** (reasoning, sections, >150 words, needs versioning): use the **brief-system skill** to produce the document with proper frontmatter, versioned filename, and doc-type routing before submission.
     - **Inline comment** (≤3 bullets, status update, confirmation): post directly as a Paperclip comment — no document or submission needed.
 
@@ -122,7 +137,9 @@ Audit, approval, triage, and health commands → **agentic-os-bridge skill**.
 
 ## 5. Callback Identity
 
-Use backend `task_id` (from the brief or resolved in Step 4) as the callback identifier for all submissions. Paperclip issue ID is contextual metadata only — never pass it to `submit-result`.
+Use `callback.task_id` from the Step 4 resolve response as the identifier for all submissions. The `callback` object is the source of truth for submission paths — not the brief document. Paperclip issue ID is contextual metadata only — never pass it to `submit-result`.
+
+The brief document on the Paperclip issue is written best-effort for operator visibility. If it is absent, execution is not blocked — the `callback` object has everything needed.
 
 Successful responses: `RESULT_SUBMITTED`, `ALREADY_SUBMITTED`, `PLAN_SUBMITTED`.
 Recovery: `WRITEBACK_FAILED: <task_id> <reason>` → trigger incident remediation.
@@ -139,7 +156,6 @@ Recovery: `WRITEBACK_FAILED: <task_id> <reason>` → trigger incident remediatio
 - **Never cancel cross-team tasks.** Reassign to manager with a comment.
 - **Budget**: auto-paused at 100%. Above 80%, critical tasks only.
 - **Escalate** via `chainOfCommand` when stuck.
-- **Commit co-author**: `Co-Authored-By: Paperclip <noreply@paperclip.ing>` on all git commits.
 - **Comment style**: concise markdown, ticket references as links (`[PAP-224](/PAP/issues/PAP-224)`), company-prefixed URLs required.
 
 ## 7. Agent Homes
@@ -171,7 +187,7 @@ Technical contribution routing is:
    - comments on the same Paperclip issue to wake the current assignee for PR follow-up
    - escalates to `engineering_manager`
 
-When selecting an open-source issue (repos: `paperclipai/paperclip`, `openclaw/openclaw`, `go-playground/validator`, `ktorio/ktor`), consult the contribution-priority scoreboard first.
+When selecting an open-source issue (repos: `paperclipai/paperclip`, `openclaw/openclaw`, `go-playground/validator`, `ktorio/ktor`, etc), consult the contribution-priority scoreboard first.
 
 - Latest JSON: `/Users/dara/agents/projects/system/scoreboard/scoreboard.json`
 - Latest Markdown: `/Users/dara/agents/projects/system/scoreboard/scoreboard.md`

@@ -7,7 +7,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from .config import default_paths, load_app_config
-from .health import get_system_health
+from .health import get_system_health, get_watchdog_status
 from .execution_receiver import ExecutionParseError, receive_execution_result
 from .models import InvalidTransitionError, OperatorError
 from .web_support import (
@@ -103,6 +103,11 @@ def api_health() -> dict:
     return get_system_health(get_service())
 
 
+@router.get("/watchdog")
+def api_watchdog() -> dict:
+    return get_watchdog_status(get_service())
+
+
 @router.get("/overview")
 def api_overview() -> dict:
     return build_overview(get_service())
@@ -159,6 +164,7 @@ def api_create_task(payload: CreateTaskPayload) -> dict:
     return {
         "task_id": task.id,
         "status": task.status,
+        "approval_state": task.approval_state,
         "task_mode": task.task_mode,
         "policy_decision": result["policy_decision"],
         "paperclip_issue_id": task.paperclip_issue_id,
@@ -320,38 +326,26 @@ def _handle_operator_error(exc: Exception) -> HTTPException:
 
 @router.post("/approvals/{approval_id}/approve")
 def api_approve(approval_id: str, payload: ApprovalDecisionPayload) -> dict:
-    try:
-        return get_service().approve(
-            approval_id,
-            decision_note=payload.note,
-            decided_by=payload.decided_by or "api",
-        )
-    except Exception as exc:
-        raise _handle_operator_error(exc) from exc
+    raise HTTPException(
+        status_code=403,
+        detail="Approval mutations are only available via the dashboard and Discord surfaces.",
+    )
 
 
 @router.post("/approvals/{approval_id}/deny")
 def api_deny(approval_id: str, payload: ApprovalDecisionPayload) -> dict:
-    try:
-        return get_service().deny(
-            approval_id,
-            decision_note=payload.note,
-            decided_by=payload.decided_by or "api",
-        )
-    except Exception as exc:
-        raise _handle_operator_error(exc) from exc
+    raise HTTPException(
+        status_code=403,
+        detail="Approval mutations are only available via the dashboard and Discord surfaces.",
+    )
 
 
 @router.post("/approvals/{approval_id}/cancel")
 def api_cancel(approval_id: str, payload: ApprovalDecisionPayload) -> dict:
-    try:
-        return get_service().cancel(
-            approval_id,
-            decision_note=payload.note,
-            decided_by=payload.decided_by or "api",
-        )
-    except Exception as exc:
-        raise _handle_operator_error(exc) from exc
+    raise HTTPException(
+        status_code=403,
+        detail="Approval mutations are only available via the dashboard and Discord surfaces.",
+    )
 
 
 @router.post("/executions/callback")

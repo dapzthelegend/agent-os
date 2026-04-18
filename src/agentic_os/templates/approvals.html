@@ -25,6 +25,7 @@
         </p>
         <form method="post" action="/approvals/{{ item.approval.id }}/approve" class="stack compact">
           <input type="hidden" name="redirect_to" value="/approvals">
+          <input type="hidden" name="approval_token" value="{{ item.approval_tokens.approve }}">
           <textarea name="note" rows="2" placeholder="Optional decision note"></textarea>
           <div class="action-row">
             <button type="submit">Approve</button>
@@ -32,10 +33,18 @@
         </form>
         <form method="post" action="/approvals/{{ item.approval.id }}/deny" class="stack compact">
           <input type="hidden" name="redirect_to" value="/approvals">
+          <input type="hidden" name="approval_token" value="{{ item.approval_tokens.deny }}">
           <textarea name="note" rows="2" placeholder="Reason for denial"></textarea>
           <div class="action-row">
             <button class="danger" type="submit">Deny</button>
-            <button class="muted-btn" formaction="/approvals/{{ item.approval.id }}/cancel" type="submit">Cancel</button>
+          </div>
+        </form>
+        <form method="post" action="/approvals/{{ item.approval.id }}/cancel" class="stack compact">
+          <input type="hidden" name="redirect_to" value="/approvals">
+          <input type="hidden" name="approval_token" value="{{ item.approval_tokens.cancel }}">
+          <textarea name="note" rows="2" placeholder="Optional cancellation note"></textarea>
+          <div class="action-row">
+            <button class="muted-btn" type="submit">Cancel</button>
           </div>
         </form>
       </section>

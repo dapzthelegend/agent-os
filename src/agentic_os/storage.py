@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     dispatch_attempts INTEGER NOT NULL DEFAULT 0,
     -- paperclip
     paperclip_issue_id TEXT,
+    paperclip_status TEXT,
     paperclip_routine_id TEXT,
     paperclip_routine_run_id TEXT,
     paperclip_origin_kind TEXT,
@@ -148,6 +149,10 @@ class Database:
                 "UPDATE tasks SET action_source = ? WHERE action_source IN (?, ?)",
                 ("automation", "openclaw_skill", "openclaw_kill"),
             )
+            try:
+                connection.execute("ALTER TABLE tasks ADD COLUMN paperclip_status TEXT")
+            except sqlite3.OperationalError:
+                pass
 
     @staticmethod
     def _next_task_id(connection: sqlite3.Connection) -> str:
@@ -236,6 +241,7 @@ class Database:
         retry_count: Optional[int] = None,
         # Paperclip fields
         paperclip_issue_id: Optional[str] = None,
+        paperclip_status: Optional[str] = None,
         paperclip_routine_id: Optional[str] = None,
         paperclip_routine_run_id: Optional[str] = None,
         paperclip_origin_kind: Optional[str] = None,
@@ -266,6 +272,7 @@ class Database:
             ("policy_decision", policy_decision),
             ("action_source", action_source),
             ("paperclip_issue_id", paperclip_issue_id),
+            ("paperclip_status", paperclip_status),
             ("paperclip_routine_id", paperclip_routine_id),
             ("paperclip_routine_run_id", paperclip_routine_run_id),
             ("paperclip_origin_kind", paperclip_origin_kind),
@@ -829,6 +836,7 @@ class Database:
             delivery_thread_id=row["delivery_thread_id"] if "delivery_thread_id" in keys else None,
             artifact_path=row["artifact_path"] if "artifact_path" in keys else None,
             paperclip_issue_id=row["paperclip_issue_id"] if "paperclip_issue_id" in keys else None,
+            paperclip_status=row["paperclip_status"] if "paperclip_status" in keys else None,
             paperclip_routine_id=row["paperclip_routine_id"] if "paperclip_routine_id" in keys else None,
             paperclip_routine_run_id=row["paperclip_routine_run_id"] if "paperclip_routine_run_id" in keys else None,
             paperclip_origin_kind=row["paperclip_origin_kind"] if "paperclip_origin_kind" in keys else None,

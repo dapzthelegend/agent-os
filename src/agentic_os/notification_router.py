@@ -33,6 +33,7 @@ DISCORD_API_BASE = "https://discord.com/api/v10"
 # All requests must identify as a Discord bot per the API docs.
 DISCORD_USER_AGENT = "DiscordBot (https://github.com/agentic-os, 1.0)"
 DISCORD_OVERDUE_PUSH_ENABLED_ENV = "DISCORD_OVERDUE_PUSH_ENABLED"
+DISCORD_APPROVAL_REMINDER_PUSH_ENABLED_ENV = "DISCORD_APPROVAL_REMINDER_PUSH_ENABLED"
 
 APPROVAL_REMINDER_THRESHOLD_HOURS = 1.0
 OVERDUE_THRESHOLD_HOURS = 48.0
@@ -130,12 +131,7 @@ def route_overdue_task(
     hours_overdue: float,
 ) -> NotificationResult:
     """Send overdue task alert via Discord DM only (no email)."""
-    if os.environ.get(DISCORD_OVERDUE_PUSH_ENABLED_ENV, "false").strip().lower() not in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }:
+    if not _is_env_truthy(DISCORD_OVERDUE_PUSH_ENABLED_ENV):
         return NotificationResult(
             channel="disabled",
             success=False,
@@ -161,6 +157,13 @@ def route_approval_reminder(
     Send approval reminder via Discord DM only (no email).
     Only sends if actually overdue; caller is responsible for checking threshold.
     """
+    if not _is_env_truthy(DISCORD_APPROVAL_REMINDER_PUSH_ENABLED_ENV):
+        return NotificationResult(
+            channel="disabled",
+            success=False,
+            message="approval reminder push notifications disabled",
+        )
+
     title = _task_title(task)
     message = (
         f"🔔 **Approval reminder** ({hours_pending:.0f}h pending): {title}\n"
@@ -185,6 +188,10 @@ def _send_discord_only(message: str) -> NotificationResult:
         print(f"[notification_router] Discord DM failed: {err}", file=sys.stderr)
     print(f"[notification_router] {message}", file=sys.stderr)
     return NotificationResult(channel="stderr", success=False, message=message, error="discord_failed")
+
+
+def _is_env_truthy(name: str, *, default: str = "false") -> bool:
+    return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _send_with_fallback(message: str, *, subject: str = "") -> NotificationResult:

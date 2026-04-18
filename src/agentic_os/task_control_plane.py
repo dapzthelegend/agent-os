@@ -14,6 +14,9 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -78,10 +81,22 @@ _INFRA_ENGINEER_AGENT = "infrastructure_engineer"
 _ENGINEER_AGENT = "engineer"
 
 
+@dataclass
+class ResultWritebackOutcome:
+    issue_id: str
+    task_id: str
+    orphaned: bool = False
+    dead_letter_dir: Optional[str] = None
+    uploaded_artifact: bool = False
+    wrote_document: bool = False
+    errors: list[str] = field(default_factory=list)
+
+
 class TaskControlPlane:
-    def __init__(self, config: PaperclipConfig) -> None:
+    def __init__(self, config: PaperclipConfig, *, orphaned_results_dir: Optional[Path] = None) -> None:
         self._config = config
         self._client = PaperclipClient(config)
+        self._orphaned_results_dir = orphaned_results_dir
 
     # ------------------------------------------------------------------
     # Issue projection
@@ -105,7 +120,7 @@ class TaskControlPlane:
                 paperclip_status = _STATUS_MAP.get(task.status, "todo")
             title = task.title or task.user_request[:120]
             description = task.description or task.user_request
-            return self._client.create_issue(
+            issue = self._client.create_issue(
                 title=title,
                 description=description,
                 project_id=project_id,
@@ -113,6 +128,9 @@ class TaskControlPlane:
                 assignee_id=assignee_id,
                 status=paperclip_status,
             )
+            if not self.ensure_task_brief(issue.id, task):
+                raise PaperclipError(f"brief_not_present_for_issue:{issue.id}")
+            return issue
         except Exception as exc:  # noqa: BLE001
             log.error("control_plane.create_issue failed for task %s: %s", task.id, exc)
             return None
@@ -186,6 +204,19 @@ class TaskControlPlane:
             log.error("control_plane.write_plan_doc failed for issue %s: %s", issue_id, exc)
             return None
 
+    def ensure_task_brief(self, issue_id: str, task: "TaskRecord") -> bool:
+        """Ensure an issue has the required agentic-os brief for runtime execution."""
+        try:
+            documents = self._client.list_documents(issue_id)
+            if self._has_agentic_os_brief(documents):
+                return True
+            self._write_task_brief(issue_id, task)
+            documents_after = self._client.list_documents(issue_id)
+            return self._has_agentic_os_brief(documents_after)
+        except Exception as exc:  # noqa: BLE001
+            log.error("control_plane.ensure_task_brief failed for issue %s: %s", issue_id, exc)
+            return False
+
     def get_document(self, issue_id: str, doc_id: str) -> Optional[DocumentRef]:
         try:
             return self._client.get_document(issue_id, doc_id)
@@ -250,26 +281,48 @@ class TaskControlPlane:
         *,
         task_id: str,
         artifact_path: Optional[Path] = None,
-    ) -> None:
+    ) -> ResultWritebackOutcome:
         """
         Paperclip writeback for an execution result.
 
-        Uses documents and attachments only — never comments. The backend
+        Uses documents only — never comments. The backend
         cannot safely post comments on open issues (see the comments block
-        above), so the result is always written as a 'result' document and
-        any artifact is uploaded as an attachment. Both are wake-free in
-        Paperclip.
+        above), so the result is always written as Paperclip documents.
 
         Sub-operations are independently fault-tolerant.
         """
+        outcome = ResultWritebackOutcome(issue_id=issue_id, task_id=task_id)
+
         if artifact_path is not None:
             try:
                 p = Path(artifact_path) if not isinstance(artifact_path, Path) else artifact_path
                 if p.exists():
-                    mime = _mime_for_path(p)
-                    self.upload_artifact(issue_id, p, mime_type=mime)
+                    content = p.read_text(encoding="utf-8", errors="replace")
+                    self._client.write_document(
+                        issue_id,
+                        title=f"Execution Artifact: {p.name}",
+                        content=content,
+                        doc_type="result_artifact",
+                    )
+                    outcome.uploaded_artifact = True
+            except PaperclipError as exc:
+                if exc.status_code == 404:
+                    log.warning("control_plane.write_result orphaned issue %s during artifact document write", issue_id)
+                    outcome.orphaned = True
+                    outcome.errors.append(str(exc))
+                    outcome.dead_letter_dir = self._dead_letter_result(
+                        issue_id=issue_id,
+                        task_id=task_id,
+                        result_text=result_text,
+                        artifact_path=artifact_path,
+                        reason=str(exc),
+                    )
+                    return outcome
+                outcome.errors.append(str(exc))
+                log.error("control_plane.write_result artifact document write failed for %s: %s", issue_id, exc)
             except Exception as exc:  # noqa: BLE001
-                log.error("control_plane.write_result artifact upload failed for %s: %s", issue_id, exc)
+                outcome.errors.append(str(exc))
+                log.error("control_plane.write_result artifact document write failed for %s: %s", issue_id, exc)
 
         try:
             self._client.write_document(
@@ -278,8 +331,26 @@ class TaskControlPlane:
                 content=result_text,
                 doc_type="result",
             )
-        except Exception as exc:  # noqa: BLE001
+            outcome.wrote_document = True
+        except PaperclipError as exc:
+            if exc.status_code == 404:
+                log.warning("control_plane.write_result orphaned issue %s during doc write", issue_id)
+                outcome.orphaned = True
+                outcome.errors.append(str(exc))
+                outcome.dead_letter_dir = self._dead_letter_result(
+                    issue_id=issue_id,
+                    task_id=task_id,
+                    result_text=result_text,
+                    artifact_path=artifact_path,
+                    reason=str(exc),
+                )
+                return outcome
+            outcome.errors.append(str(exc))
             log.error("control_plane.write_result doc write failed for %s: %s", issue_id, exc)
+        except Exception as exc:  # noqa: BLE001
+            outcome.errors.append(str(exc))
+            log.error("control_plane.write_result doc write failed for %s: %s", issue_id, exc)
+        return outcome
 
     # ------------------------------------------------------------------
     # Paperclip-originated task adoption
@@ -314,7 +385,8 @@ class TaskControlPlane:
                 status=paperclip_status,
                 assignee_id=agent_id,
             )
-            self._write_import_brief(issue_id, task)
+            if not self.ensure_task_brief(issue_id, task):
+                raise PaperclipError(f"brief_not_present_for_issue:{issue_id}")
             return updated
         except Exception as exc:  # noqa: BLE001
             log.error("control_plane.adopt_issue failed for issue %s: %s", issue_id, exc)
@@ -351,39 +423,46 @@ class TaskControlPlane:
             log.error("control_plane.close_issue_cancelled failed for issue %s: %s", issue_id, exc)
             return None
 
-    def _write_import_brief(self, issue_id: str, task: "TaskRecord") -> None:
-        """Write the agentic-os callback instructions to a Paperclip-originated issue."""
-        try:
-            callback_instructions = (
-                f"Write your result to `/tmp/task_result_{task.id}.txt` with "
-                f"`RESULT_START` / `RESULT_END` / `TASK_DONE: {task.id}` markers, then run:\n\n"
-                f"`/Users/dara/agents/bin/submit-result {task.id}`"
-            )
-            if task.task_mode == "plan_first" and task.status == "to_do":
-                callback_instructions = (
-                    f"Write your plan to `/tmp/task_plan_{task.id}.txt`, then run:\n\n"
-                    f"`/Users/dara/agents/bin/submit-plan {task.id}`\n\n"
-                    f"Stop after submission and wait for PM review."
-                )
+    @staticmethod
+    def _has_agentic_os_brief(documents: list[DocumentRef]) -> bool:
+        for doc in documents:
+            title = (doc.title or "").strip().lower()
+            doc_type = (doc.doc_type or "").strip().lower()
+            if title == "agentic-os brief" or doc_type == "brief":
+                return True
+        return False
 
-            brief = (
-                f"# agentic-os task registered\n\n"
-                f"**Task ID:** `{task.id}`  \n"
-                f"**Domain:** {task.domain}  \n"
-                f"**Mode:** {task.task_mode}  \n\n"
-                f"## Instructions\n\n"
-                f"{callback_instructions}\n\n"
-                f"Session key fallback for callbacks is automatic: "
-                f"`OPENCLAW_SESSION_ID` → `PAPERCLIP_RUN_ID`."
+    def _build_task_brief(self, task: "TaskRecord") -> str:
+        callback_instructions = (
+            f"Write your result to `/tmp/task_result_{task.id}.md` with "
+            f"`RESULT_START` / `RESULT_END` / `TASK_DONE: {task.id}` markers, then run:\n\n"
+            f"`/Users/dara/agents/bin/submit-result {task.id}`"
+        )
+        if task.task_mode == "plan_first" and task.status == "to_do":
+            callback_instructions = (
+                f"Write your plan to `/tmp/task_plan_{task.id}.md`, then run:\n\n"
+                f"`/Users/dara/agents/bin/submit-plan {task.id}`\n\n"
+                f"Stop after submission and wait for PM review."
             )
-            self._client.write_document(
-                issue_id,
-                title="agentic-os brief",
-                content=brief,
-                doc_type="brief",
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.warning("control_plane._write_import_brief failed for issue %s: %s", issue_id, exc)
+        return (
+            f"# agentic-os task registered\n\n"
+            f"**Task ID:** `{task.id}`  \n"
+            f"**Domain:** {task.domain}  \n"
+            f"**Mode:** {task.task_mode}  \n\n"
+            f"## Instructions\n\n"
+            f"{callback_instructions}\n\n"
+            f"Session key fallback for callbacks is automatic: "
+            f"`OPENCLAW_SESSION_ID` → `PAPERCLIP_RUN_ID`."
+        )
+
+    def _write_task_brief(self, issue_id: str, task: "TaskRecord") -> None:
+        brief = self._build_task_brief(task)
+        self._client.write_document(
+            issue_id,
+            title="agentic-os brief",
+            content=brief,
+            doc_type="brief",
+        )
 
     def list_all_issues(
         self,
@@ -477,3 +556,43 @@ class TaskControlPlane:
         if not agent_id:
             raise PaperclipError(f"No agent_map entry for key: {agent_key!r}")
         return agent_id
+
+    def _dead_letter_result(
+        self,
+        *,
+        issue_id: str,
+        task_id: str,
+        result_text: str,
+        artifact_path: Optional[Path],
+        reason: str,
+    ) -> Optional[str]:
+        if self._orphaned_results_dir is None:
+            return None
+
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        dead_letter_dir = self._orphaned_results_dir / f"{stamp}_{task_id}_{issue_id}"
+        dead_letter_dir.mkdir(parents=True, exist_ok=True)
+
+        (dead_letter_dir / "result.md").write_text(result_text, encoding="utf-8")
+
+        artifact_copy: Optional[str] = None
+        if artifact_path is not None:
+            path = Path(artifact_path)
+            if path.exists():
+                copied_name = f"artifact{path.suffix}"
+                shutil.copy2(path, dead_letter_dir / copied_name)
+                artifact_copy = copied_name
+
+        payload = {
+            "issue_id": issue_id,
+            "task_id": task_id,
+            "reason": reason,
+            "created_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+            "artifact_source_path": str(artifact_path) if artifact_path is not None else None,
+            "artifact_copy": artifact_copy,
+        }
+        (dead_letter_dir / "metadata.json").write_text(
+            json.dumps(payload, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return str(dead_letter_dir)

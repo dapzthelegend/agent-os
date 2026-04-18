@@ -10,6 +10,7 @@ inside `register_all_jobs()`.
 """
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone, timedelta
 from typing import TYPE_CHECKING
 
@@ -17,6 +18,8 @@ from .scheduler import BackgroundScheduler, ScheduledJob
 
 if TYPE_CHECKING:
     from .config import AppConfig, Paths
+
+DISCORD_APPROVAL_REMINDER_PUSH_ENABLED_ENV = "DISCORD_APPROVAL_REMINDER_PUSH_ENABLED"
 
 # ---------------------------------------------------------------------------
 # Helpers — next-run-at factories
@@ -125,7 +128,13 @@ def _make_discord_approval_poll_job(paths: "Paths", config: "AppConfig") -> Sche
 def register_all_jobs(scheduler: BackgroundScheduler, paths: "Paths", config: "AppConfig") -> None:
     """Register all agentic-os background jobs with the given scheduler."""
     scheduler.register(_make_reconcile_job(paths, config))
-    scheduler.register(_make_approval_reminder_job(paths, config))
+    if os.environ.get(DISCORD_APPROVAL_REMINDER_PUSH_ENABLED_ENV, "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        scheduler.register(_make_approval_reminder_job(paths, config))
     scheduler.register(_make_health_check_job(paths, config))
     scheduler.register(_make_backup_job(paths, config))
     scheduler.register(_make_discord_approval_poll_job(paths, config))

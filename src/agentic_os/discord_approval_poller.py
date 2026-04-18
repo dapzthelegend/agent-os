@@ -28,6 +28,8 @@ from typing import Optional
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
+from .approval_capability import mint_approval_token
+
 log = logging.getLogger(__name__)
 
 DISCORD_API_BASE = "https://discord.com/api/v10"
@@ -152,7 +154,10 @@ def _do_approve(
     bot_token: str,
 ) -> str:
     try:
-        service.approve(approval_id)
+        service.approve(
+            approval_id,
+            approval_token=mint_approval_token(action="approve", approval_id=approval_id),
+        )
         log.info("discord_approval_poller: approved %s", approval_id)
         _send_reply(f"✅ Approved `{approval_id}`.", channel_id=channel_id, bot_token=bot_token)
         return "processed"
@@ -175,7 +180,11 @@ def _do_deny(
     bot_token: str,
 ) -> str:
     try:
-        service.deny(approval_id, decision_note=reason)
+        service.deny(
+            approval_id,
+            decision_note=reason,
+            approval_token=mint_approval_token(action="deny", approval_id=approval_id),
+        )
         log.info("discord_approval_poller: denied %s (reason=%r)", approval_id, reason)
         note = f" — {reason}" if reason else ""
         _send_reply(f"❌ Denied `{approval_id}`{note}.", channel_id=channel_id, bot_token=bot_token)

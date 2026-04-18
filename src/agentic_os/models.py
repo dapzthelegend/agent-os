@@ -113,6 +113,7 @@ class TaskRecord:
     delivery_thread_id: Optional[str] = None
     artifact_path: Optional[str] = None
     paperclip_issue_id: Optional[str] = None
+    paperclip_status: Optional[str] = None
     paperclip_routine_id: Optional[str] = None
     paperclip_routine_run_id: Optional[str] = None
     paperclip_origin_kind: Optional[str] = None
@@ -171,7 +172,15 @@ class OperatorError(Exception):
 
 
 # ---------------------------------------------------------------------------
-# Task lifecycle — strict three-state backend mirror
+# Task lifecycle — backend pipeline phases (not a Paperclip mirror)
+#
+# These states track where the task is in the backend's own pipeline:
+#   to_do       = imported, policy resolved, ready for dispatch
+#   in_progress = dispatched to an agent
+#   done        = completed, cancelled, denied, or failed
+#
+# Paperclip owns the full lifecycle state machine (backlog, todo, blocked,
+# in_review, in_progress, done, cancelled). The backend does not mirror it.
 # ---------------------------------------------------------------------------
 
 TERMINAL_STATUSES = frozenset({"done"})
