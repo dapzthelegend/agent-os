@@ -8,7 +8,11 @@ from pydantic import BaseModel
 
 from .config import default_paths, load_app_config
 from .health import get_system_health, get_watchdog_status
-from .execution_receiver import ExecutionParseError, receive_execution_result
+from .execution_receiver import (
+    ExecutionParseError,
+    receive_execution_result,
+    receive_execution_result_v2,
+)
 from .models import InvalidTransitionError, OperatorError
 from .web_support import (
     annotate_audit_events,
@@ -55,9 +59,30 @@ class ArtifactRevisionPayload(BaseModel):
 
 
 class ExecutionCallbackPayload(BaseModel):
+    """Dual-shape callback payload.
+
+    v1 (legacy, still in use by bin/submit-result and existing agents):
+      required: task_id, output (with RESULT_START/RESULT_END + TASK_DONE markers)
+      optional: session_key
+
+    v2 (new, emitted by agents that consume resolve-by-paperclip-issue's
+    `writeback` block):
+      required: task_id, execution_id, status
+      required-when-succeeded: result (markdown)
+      optional: session_key, metrics, output (not used)
+
+    Shape is detected by presence of `execution_id`. Receiver logs
+    `callback_shape_version` on every request for deprecation telemetry.
+    """
     task_id: str
     session_key: str = "unknown"
-    output: str
+    # v1
+    output: Optional[str] = None
+    # v2
+    execution_id: Optional[str] = None
+    status: Optional[str] = None  # succeeded | failed | blocked
+    result: Optional[str] = None  # markdown, required when status=succeeded
+    metrics: Optional[dict] = None
 
 
 class ApprovePlanPayload(BaseModel):
@@ -255,6 +280,77 @@ def api_execution_detail(operation_key: str) -> dict:
     return detail
 
 
+@router.get("/tasks/{task_id}/executions")
+def api_task_executions(task_id: str) -> dict:
+    """List all task_executions for a task, oldest ordinal first."""
+    service = get_service()
+    try:
+        service.db.get_task(task_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    records = service.db.list_task_executions(task_id)
+    return {
+        "task_id": task_id,
+        "executions": [asdict(r) for r in records],
+    }
+
+
+@router.get("/tasks/{task_id}/executions/{execution_id}")
+def api_task_execution_detail(task_id: str, execution_id: str) -> dict:
+    """Fetch a single task_execution. 404s if the execution's task_id doesn't
+    match the path (prevents cross-task probing via execution_id)."""
+    service = get_service()
+    rec = service.db.get_task_execution(execution_id)
+    if rec is None:
+        raise HTTPException(status_code=404, detail=f"unknown execution_id: {execution_id}")
+    if rec.task_id != task_id:
+        raise HTTPException(
+            status_code=404,
+            detail=f"execution {execution_id} does not belong to task {task_id}",
+        )
+    return {"execution": asdict(rec)}
+
+
+class AuxiliaryArtifactPayload(BaseModel):
+    label: str
+    content_type: str
+    content: str
+
+
+@router.post("/executions/{execution_id}/artifacts")
+def api_execution_artifact_upload(
+    execution_id: str, payload: AuxiliaryArtifactPayload
+) -> dict:
+    """Attach an auxiliary (non-result) artifact — logs, diffs, JSON — to a
+    task_execution. See service.create_auxiliary_artifact for allowlist and
+    size cap.
+    """
+    service = get_service()
+    try:
+        return service.create_auxiliary_artifact(
+            execution_id=execution_id,
+            label=payload.label,
+            content_type=payload.content_type,
+            content=payload.content,
+        )
+    except OperatorError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/executions/{execution_id}/artifacts")
+def api_execution_artifacts_list(execution_id: str) -> dict:
+    """List auxiliary artifacts attached to this execution."""
+    service = get_service()
+    rec = service.db.get_task_execution(execution_id)
+    if rec is None:
+        raise HTTPException(status_code=404, detail=f"unknown execution_id: {execution_id}")
+    return {
+        "execution_id": execution_id,
+        "task_id": rec.task_id,
+        "artifacts": service.db.list_artifacts_for_execution(execution_id),
+    }
+
+
 @router.get("/audit")
 def api_audit(limit: int = 50, domain: Optional[str] = None, target: Optional[str] = None) -> dict:
     limit = _clamp_limit(limit)
@@ -351,15 +447,76 @@ def api_cancel(approval_id: str, payload: ApprovalDecisionPayload) -> dict:
 @router.post("/executions/callback")
 def api_execution_callback(payload: ExecutionCallbackPayload) -> dict:
     """
-    Receive ACP agent output and complete the execution pipeline.
+    Receive agent callback and complete the execution pipeline.
 
-    The agent output must contain RESULT_START...RESULT_END markers and
-    TASK_DONE: <task_id>. Edge cases:
-    - Unknown task_id (after session_key fallback): 400
-    - Already terminal task: 200 { status: already_terminal }
-    - Duplicate submission (operation_key dedup): 200 { status: success, idempotent: true }
+    Dual-shape (detected by presence of `execution_id`):
+      - v2: {task_id, execution_id, status, result?, session_key?, metrics?}
+        — execution-keyed, structured, first-terminal-wins.
+      - v1 (legacy): {task_id, output, session_key?} — output contains
+        RESULT_START/RESULT_END + TASK_DONE markers.
+
+    Both paths log `callback_shape_version` in the audit payload for
+    deprecation telemetry. Edge cases:
+    - Unknown task_id/execution_id: 400
+    - Already terminal: 200 { status: already_terminal }
+    - Duplicate: 200 { status: success, idempotent: true }
     - Any internal error: 200 { status: error, reason: ... } — never 5xx
     """
+    paths = default_paths()
+
+    # v2 path — execution-keyed structured callback
+    if payload.execution_id:
+        try:
+            result = receive_execution_result_v2(
+                task_id=payload.task_id,
+                execution_id=payload.execution_id,
+                status=payload.status or "",
+                result=payload.result,
+                session_key=payload.session_key,
+                metrics=payload.metrics,
+                paths=paths,
+            )
+        except Exception as exc:
+            return {
+                "status": "error",
+                "reason": str(exc),
+                "callback_shape_version": "v2",
+            }
+        if result.task_not_found:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "status": "error",
+                    "reason": result.error or "execution not found",
+                    "callback_shape_version": "v2",
+                },
+            )
+        if result.already_terminal:
+            return {
+                "status": "already_terminal",
+                "task_id": result.task_id,
+                "task_status": result.terminal_status,
+                "idempotent": result.idempotent,
+                "callback_shape_version": "v2",
+            }
+        return {
+            "status": "success" if result.success else "error",
+            "task_id": result.task_id,
+            "artifact_id": result.artifact_id,
+            "idempotent": result.idempotent,
+            "error": result.error,
+            "callback_shape_version": "v2",
+        }
+
+    # v1 path — unchanged behavior
+    if payload.output is None:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "status": "error",
+                "reason": "v1 callback requires `output`; v2 callback requires `execution_id`",
+            },
+        )
     if len(payload.output.encode("utf-8", errors="replace")) > _MAX_CALLBACK_OUTPUT_BYTES:
         raise HTTPException(
             status_code=413,
@@ -368,7 +525,6 @@ def api_execution_callback(payload: ExecutionCallbackPayload) -> dict:
                 "reason": f"output exceeds maximum size ({_MAX_CALLBACK_OUTPUT_BYTES // (1024*1024)} MB)",
             },
         )
-    paths = default_paths()
     try:
         result = receive_execution_result(
             payload.output,
@@ -397,6 +553,7 @@ def api_execution_callback(payload: ExecutionCallbackPayload) -> dict:
                 "status": "already_terminal",
                 "task_id": result.task_id,
                 "task_status": result.terminal_status,
+                "callback_shape_version": "v1",
             }
         return {
             "status": "success" if result.success else "error",
@@ -404,6 +561,7 @@ def api_execution_callback(payload: ExecutionCallbackPayload) -> dict:
             "artifact_id": result.artifact_id,
             "idempotent": result.idempotent,
             "error": result.error,
+            "callback_shape_version": "v1",
         }
     except HTTPException:
         raise

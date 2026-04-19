@@ -64,6 +64,11 @@ EVENT_TYPES = (
     "reconciler_action_taken",
     "reconciler_comment_ignored",
     "paperclip_status_mirrored",
+    # Task-execution lifecycle (boundary corrections, Option A)
+    "task_execution_allocated",
+    "task_execution_dispatch_collided_with_inflight",
+    "task_execution_transitioned",
+    "task_execution_callback_conflict",
 )
 
 

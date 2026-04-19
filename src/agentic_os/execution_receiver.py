@@ -308,6 +308,7 @@ def receive_execution_result(
             task_id=task_id,
             event_type="execution_callback_received",
             payload={
+                "callback_shape_version": "v1",
                 "task_id": task_id,
                 "execution_id": reloaded_task.operation_key or "",
                 "approval_id": approval_id,
@@ -329,6 +330,173 @@ def receive_execution_result(
             success=False,
             error=str(e),
         )
+
+
+_V2_ACCEPTED_STATUSES = frozenset({"succeeded", "failed", "blocked"})
+
+
+def receive_execution_result_v2(
+    *,
+    task_id: str,
+    execution_id: str,
+    status: str,
+    result: Optional[str],
+    session_key: str,
+    metrics: Optional[dict],
+    paths: Paths,
+) -> ExecutionResult:
+    """v2 callback handler: execution-keyed, structured payload.
+
+    Contract (spelled out in §4.1 of the plan):
+      - key on execution_id; verify task_id matches the allocation row
+      - first-terminal-wins: if execution is already terminal, return
+        idempotent=True on identical status+result, otherwise emit a
+        task_execution_callback_conflict audit event and return
+        success=False with reason
+      - writes artifact + updates task only on first terminal transition
+    """
+    if status not in _V2_ACCEPTED_STATUSES:
+        return ExecutionResult(
+            task_id=task_id,
+            artifact_id="",
+            success=False,
+            error=f"invalid v2 status: {status}",
+        )
+    if status == "succeeded" and not (result or "").strip():
+        return ExecutionResult(
+            task_id=task_id,
+            artifact_id="",
+            success=False,
+            error="v2 callback with status=succeeded requires non-empty result",
+        )
+
+    config = load_app_config(paths)
+    service = AgenticOSService(paths, config)
+
+    execution = service.db.get_task_execution(execution_id)
+    if execution is None:
+        return ExecutionResult(
+            task_id=task_id,
+            artifact_id="",
+            success=False,
+            task_not_found=True,
+            error=f"unknown execution_id: {execution_id}",
+        )
+    if execution.task_id != task_id:
+        service._append_event(
+            task_id=execution.task_id,
+            event_type="task_execution_callback_conflict",
+            payload={
+                "reason": "task_id_mismatch",
+                "execution_id": execution_id,
+                "callback_task_id": task_id,
+                "allocation_task_id": execution.task_id,
+            },
+        )
+        return ExecutionResult(
+            task_id=task_id,
+            artifact_id="",
+            success=False,
+            error="task_id does not match execution allocation",
+        )
+
+    task = service.db.get_task(execution.task_id)
+
+    # First-terminal-wins on the execution row.
+    try:
+        service.db.transition_task_execution(
+            execution_id,
+            status=status,
+            reason=(None if status == "succeeded" else f"v2 callback: {status}"),
+            session_key=session_key if session_key != "unknown" else None,
+        )
+    except ValueError:
+        # Already terminal. Treat same status as idempotent; differing status
+        # emits a conflict event and reports back to the agent.
+        current = service.db.get_task_execution(execution_id)
+        if current is not None and current.status == status:
+            return ExecutionResult(
+                task_id=task.id,
+                artifact_id=task.artifact_ref or "",
+                success=True,
+                idempotent=True,
+                already_terminal=True,
+                terminal_status=current.status,
+            )
+        service._append_event(
+            task_id=task.id,
+            event_type="task_execution_callback_conflict",
+            payload={
+                "reason": "terminal_status_mismatch",
+                "execution_id": execution_id,
+                "stored_status": current.status if current else None,
+                "callback_status": status,
+            },
+        )
+        return ExecutionResult(
+            task_id=task.id,
+            artifact_id=task.artifact_ref or "",
+            success=False,
+            already_terminal=True,
+            terminal_status=current.status if current else None,
+            error="execution already terminal with different status",
+        )
+
+    # First terminal transition: write artifact (succeeded) and update task.
+    artifact_id = task.artifact_ref or ""
+    result_summary: Optional[str]
+    if status == "succeeded":
+        content = result or ""
+        artifact_type = _artifact_type_for_domain(task.domain, task.intent_type)
+        artifact_store = ArtifactStore(paths.artifacts_dir)
+        artifact_record = artifact_store.write(
+            task_id=task.id,
+            artifact_type=artifact_type,
+            content=content,
+        )
+        artifact_id = artifact_record.id
+        service.db.insert_artifact(
+            artifact_id=artifact_record.id,
+            task_id=artifact_record.task_id,
+            artifact_type=artifact_record.artifact_type,
+            path=artifact_record.path,
+            version=artifact_record.version,
+            content_preview=artifact_record.content_preview,
+            created_at=artifact_record.created_at,
+        )
+        result_summary = (content[:200] if content else "Execution completed")
+        service.complete_task(
+            task.id,
+            result_summary=result_summary,
+            artifact_ref=artifact_id,
+        )
+    else:
+        # failed | blocked — task fails; agent-authored Paperclip comment is
+        # the operator-visible signal on the Paperclip side (per §4.2).
+        reason = f"execution {status}"
+        service.fail_task(task.id, reason=reason)
+        result_summary = reason
+
+    service._append_event(
+        task_id=task.id,
+        event_type="execution_callback_received",
+        payload={
+            "callback_shape_version": "v2",
+            "task_id": task.id,
+            "execution_id": execution_id,
+            "ordinal": execution.ordinal,
+            "status": status,
+            "session_key": session_key,
+            "artifact_id": artifact_id,
+            "result_summary": result_summary,
+            "metrics": metrics or {},
+        },
+    )
+    return ExecutionResult(
+        task_id=task.id,
+        artifact_id=artifact_id,
+        success=True,
+    )
 
 
 def receive_execution_failure(
