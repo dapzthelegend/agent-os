@@ -29,6 +29,26 @@ APPROVAL_RECORD_STATES = ("pending", "approved", "denied", "cancelled")
 APPROVAL_SUBJECT_TYPES = ("artifact", "action")
 EXECUTION_STATES = ("executed", "duplicate_rejected")
 
+# Task execution lifecycle — per-dispatch records, distinct from the legacy
+# approval-keyed `executions` table. A task can have many task_executions.
+TASK_EXECUTION_STATUSES = (
+    "dispatched",
+    "running",
+    "succeeded",
+    "failed",
+    "blocked",
+    "stall_timeout",
+)
+TERMINAL_TASK_EXECUTION_STATUSES = frozenset(
+    {"succeeded", "failed", "blocked", "stall_timeout"}
+)
+TASK_EXECUTION_TRIGGERS = (
+    "initial_dispatch",
+    "redispatch",
+    "operator_redispatch",
+    "legacy_import",
+)
+
 
 def validate_choice(value: str, allowed: tuple[str, ...], field_name: str) -> str:
     if value not in allowed:
@@ -159,6 +179,31 @@ class ExecutionRecord:
     def validate(self) -> "ExecutionRecord":
         validate_choice(self.status, EXECUTION_STATES, "status")
         return self
+
+
+@dataclass(frozen=True)
+class TaskExecutionRecord:
+    """Per-dispatch lifecycle record. One task : many task_executions."""
+    execution_id: str
+    task_id: str
+    ordinal: int
+    trigger: str
+    parent_execution_id: Optional[str]
+    status: str
+    session_key: Optional[str]
+    started_at: Optional[str]
+    terminal_at: Optional[str]
+    reason: Optional[str]
+    created_at: str
+    updated_at: str
+
+    def validate(self) -> "TaskExecutionRecord":
+        validate_choice(self.status, TASK_EXECUTION_STATUSES, "status")
+        validate_choice(self.trigger, TASK_EXECUTION_TRIGGERS, "trigger")
+        return self
+
+    def is_terminal(self) -> bool:
+        return self.status in TERMINAL_TASK_EXECUTION_STATUSES
 
 
 @dataclass(frozen=True)

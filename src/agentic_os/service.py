@@ -377,10 +377,18 @@ class AgenticOSService:
 
     def ensure_task_for_paperclip_issue(self, paperclip_issue_id: str) -> dict[str, Any]:
         """
-        Resolve or import a backend task for the given Paperclip issue.
+        Resolve or import a backend task for the given Paperclip issue and
+        allocate a task_execution for the incoming dispatch.
 
-        Returns the task record plus deterministic callback instructions so the
-        agent runtime never depends on a separate brief document existing.
+        §3 decision rule (boundary-preserving):
+          - No task → import, allocate execution with trigger=initial_dispatch.
+          - Task exists, no prior execution → allocate initial_dispatch.
+          - Task exists, latest execution terminal → allocate redispatch.
+          - Task exists, latest execution in-flight → return the in-flight
+            callback; do NOT allocate. Emit dispatch_collided_with_inflight.
+
+        The backend never reads Paperclip status here — the only inputs are
+        (1) the agent's call, (2) backend-owned task_execution state.
         """
         issue_id = (paperclip_issue_id or "").strip()
         if not issue_id:
@@ -388,12 +396,15 @@ class AgenticOSService:
 
         existing = self.db.get_task_by_paperclip_issue_id(issue_id)
         if existing is not None:
+            execution, collision = self._allocate_execution_for_resolve(existing)
             return {
                 "found": True,
                 "created": False,
                 "task_id": existing.id,
                 "task": asdict(existing),
-                "callback": self._build_callback_instructions(existing),
+                "execution": asdict(execution),
+                "collision_with_inflight": collision,
+                "callback": self._build_callback_instructions(existing, execution),
             }
 
         cp = self._cp
@@ -429,30 +440,124 @@ class AgenticOSService:
             labels=getattr(issue, "labels", None) or [],
         )
         task = payload["task"]
+        execution, collision = self._allocate_execution_for_resolve(task)
         return {
             "found": False,
             "created": True,
             "task_id": task.id,
             "task": asdict(task),
-            "callback": self._build_callback_instructions(task),
+            "execution": asdict(execution),
+            "collision_with_inflight": collision,
+            "callback": self._build_callback_instructions(task, execution),
         }
 
-    @staticmethod
-    def _build_callback_instructions(task: "TaskRecord") -> dict[str, str]:
-        """Deterministic callback instructions derived from the task record.
+    def _allocate_execution_for_resolve(
+        self, task: TaskRecord
+    ) -> tuple[Any, bool]:
+        """Apply the §3 decision rule. Returns (execution, collision_with_inflight).
 
-        Returned inline with the resolve response so agents never depend on a
-        separate brief document existing in Paperclip.
+        collision_with_inflight=True means an agent requested dispatch while a
+        prior execution is still running. We return the existing in-flight
+        execution (no new allocation) and emit an audit event so operators can
+        observe the symptom. Stall watchdog (separate phase) will clear stuck
+        rows.
         """
-        return {
+        latest = self.db.latest_task_execution(task.id)
+        if latest is None:
+            execution = self.db.allocate_task_execution(
+                task_id=task.id, trigger="initial_dispatch"
+            )
+            self._append_event(
+                task_id=task.id,
+                event_type="task_execution_allocated",
+                payload={
+                    "execution_id": execution.execution_id,
+                    "ordinal": execution.ordinal,
+                    "trigger": execution.trigger,
+                    "parent_execution_id": execution.parent_execution_id,
+                },
+            )
+            return execution, False
+        if latest.is_terminal():
+            execution = self.db.allocate_task_execution(
+                task_id=task.id,
+                trigger="redispatch",
+                parent_execution_id=latest.execution_id,
+            )
+            self._append_event(
+                task_id=task.id,
+                event_type="task_execution_allocated",
+                payload={
+                    "execution_id": execution.execution_id,
+                    "ordinal": execution.ordinal,
+                    "trigger": execution.trigger,
+                    "parent_execution_id": execution.parent_execution_id,
+                },
+            )
+            return execution, False
+        # Latent-trap mitigation: record the collision so it is observable.
+        self._append_event(
+            task_id=task.id,
+            event_type="task_execution_dispatch_collided_with_inflight",
+            payload={
+                "inflight_execution_id": latest.execution_id,
+                "inflight_ordinal": latest.ordinal,
+                "inflight_status": latest.status,
+                "inflight_started_at": latest.started_at,
+            },
+        )
+        return latest, True
+
+    def _build_callback_instructions(
+        self, task: "TaskRecord", execution: Optional[Any] = None
+    ) -> dict[str, Any]:
+        """Callback instructions returned inline from resolve-by-paperclip-issue.
+
+        Dual-shape during Option A migration:
+          - v1 fields (submit_result_cmd, submit_plan_cmd, result_file,
+            plan_file) remain present so unmigrated skills and bin/ helpers
+            continue to work.
+          - v2 block adds execution_id, an HTTP writeback contract, and a
+            fallback CLI with execution_id.
+
+        Agents that understand v2 key on `writeback.url` + `execution_id`;
+        legacy agents keep using the flat submit_*_cmd fields.
+        """
+        instructions: dict[str, Any] = {
             "task_id": task.id,
             "domain": task.domain,
             "mode": task.task_mode,
+            # v1 shape (legacy clients)
             "submit_result_cmd": f"/Users/dara/agents/bin/submit-result {task.id}",
             "submit_plan_cmd": f"/Users/dara/agents/bin/submit-plan {task.id}",
             "result_file": f"/tmp/task_result_{task.id}.md",
             "plan_file": f"/tmp/task_plan_{task.id}.md",
         }
+        if execution is not None:
+            instructions["execution_id"] = execution.execution_id
+            instructions["ordinal"] = execution.ordinal
+            instructions["trigger"] = execution.trigger
+            instructions["callback_shape_version"] = "v2"
+            instructions["writeback"] = {
+                "url": "http://127.0.0.1:8080/api/executions/callback",
+                "method": "POST",
+                "schema": {
+                    "task_id": "required, string, must match",
+                    "execution_id": "required, string, must match",
+                    "session_key": "optional, string",
+                    "status": "required, enum: succeeded | failed | blocked",
+                    "result": "required when status=succeeded, string (markdown)",
+                    "metrics": "optional, {duration_seconds, cost_estimate_usd}",
+                },
+                "retry": {"max_attempts": 3, "backoff_seconds": [1, 4, 16]},
+            }
+            instructions["fallback_cli"] = (
+                f"/Users/dara/agents/bin/submit-result {task.id} "
+                f"--execution-id {execution.execution_id}"
+            )
+        else:
+            instructions["callback_shape_version"] = "v1"
+        return instructions
 
     def record_openclaw_read(
         self,
@@ -1842,6 +1947,51 @@ class AgenticOSService:
     def flag_stalled_tasks(self, threshold_hours: float = 2.0) -> dict:
         return {"scanned": 0, "flagged": 0, "already_stalled": 0, "threshold_hours": threshold_hours}
 
+    def sweep_stalled_executions(self, *, stall_timeout_seconds: int = 3600) -> dict:
+        """Watchdog: transition in-flight task_executions older than
+        stall_timeout_seconds to failed[stall_timeout] and fail their tasks.
+
+        Backend-internal only. Never reads Paperclip fields to decide staleness.
+        Returns {swept: int, execution_ids: [...], task_ids: [...]}.
+        """
+        swept = self.db.sweep_stalled_task_executions(stall_timeout_seconds)
+        task_ids_seen: set[str] = set()
+        for rec in swept:
+            self._append_event(
+                task_id=rec.task_id,
+                event_type="task_execution_transitioned",
+                payload={
+                    "execution_id": rec.execution_id,
+                    "ordinal": rec.ordinal,
+                    "from": "in_flight",
+                    "to": "failed",
+                    "reason": "stall_timeout",
+                    "stall_timeout_seconds": stall_timeout_seconds,
+                },
+            )
+            if rec.task_id in task_ids_seen:
+                continue
+            task_ids_seen.add(rec.task_id)
+            try:
+                current = self.db.get_task(rec.task_id)
+            except Exception:
+                continue
+            if current.status == "done":
+                continue
+            try:
+                self.fail_task(rec.task_id, reason="stall_timeout")
+            except Exception as exc:
+                _log.warning(
+                    "sweep_stalled_executions: fail_task(%s) failed: %s",
+                    rec.task_id, exc,
+                )
+        return {
+            "swept": len(swept),
+            "execution_ids": [r.execution_id for r in swept],
+            "task_ids": sorted(task_ids_seen),
+            "stall_timeout_seconds": stall_timeout_seconds,
+        }
+
     def retry_task(self, task_id: str, *, feedback: str = "operator retry") -> dict:
         task = self.reset_task_for_retry(task_id, feedback=feedback)
         return {"task_id": task.id, "new_status": task.status, "retry_count": task.retry_count}
@@ -1878,6 +2028,105 @@ class AgenticOSService:
             payload={"artifact": self.artifacts.to_payload(artifact)},
         )
         return artifact
+
+    # Auxiliary artifacts — Phase 11. Bound to a specific task_execution so
+    # operators can trace attachments to the exact run that produced them.
+    _AUX_CONTENT_TYPES: dict[str, str] = {
+        "text/plain": "txt",
+        "text/markdown": "md",
+        "text/x-diff": "diff",
+        "text/x-log": "log",
+        "application/json": "json",
+    }
+    _AUX_MAX_BYTES = 262_144  # 256 KiB
+
+    def create_auxiliary_artifact(
+        self,
+        *,
+        execution_id: str,
+        label: str,
+        content_type: str,
+        content: str,
+    ) -> dict:
+        """Attach an auxiliary (non-result) artifact to a task_execution.
+
+        Validates content-type allowlist and size cap. Persists under the
+        owning task's artifact dir, tagged with execution_id so auxiliary
+        artifacts are queryable per execution.
+        """
+        if content_type not in self._AUX_CONTENT_TYPES:
+            raise OperatorError(
+                code="unsupported_content_type",
+                message=(
+                    f"unsupported content_type: {content_type}. "
+                    f"Allowed: {sorted(self._AUX_CONTENT_TYPES)}"
+                ),
+            )
+        if not isinstance(content, str) or not content:
+            raise OperatorError(
+                code="empty_content",
+                message="content must be a non-empty string",
+            )
+        if len(content.encode("utf-8")) > self._AUX_MAX_BYTES:
+            raise OperatorError(
+                code="content_too_large",
+                message=f"content exceeds {self._AUX_MAX_BYTES}-byte limit",
+            )
+        safe_label = "".join(c for c in label if c.isalnum() or c in "._-")[:64]
+        if not safe_label:
+            raise OperatorError(
+                code="invalid_label",
+                message="label must contain at least one alphanumeric character",
+            )
+
+        rec = self.db.get_task_execution(execution_id)
+        if rec is None:
+            raise OperatorError(
+                code="unknown_execution",
+                message=f"unknown execution_id: {execution_id}",
+            )
+        task_id = rec.task_id
+
+        extension = self._AUX_CONTENT_TYPES[content_type]
+        artifact_type = f"aux:{safe_label}"
+        artifact = self.artifacts.write(
+            task_id=task_id,
+            artifact_type=artifact_type,
+            content=content,
+            version=1,
+            extension=extension,
+        )
+        self.db.insert_artifact(
+            artifact_id=artifact.id,
+            task_id=task_id,
+            artifact_type=artifact.artifact_type,
+            path=artifact.path,
+            version=artifact.version,
+            content_preview=artifact.content_preview,
+            created_at=artifact.created_at,
+            execution_id=execution_id,
+        )
+        self._append_event(
+            task_id=task_id,
+            event_type="artifact_updated",
+            payload={
+                "artifact": self.artifacts.to_payload(artifact),
+                "execution_id": execution_id,
+                "label": safe_label,
+                "content_type": content_type,
+                "source": "auxiliary",
+            },
+        )
+        return {
+            "artifact_id": artifact.id,
+            "task_id": task_id,
+            "execution_id": execution_id,
+            "artifact_type": artifact.artifact_type,
+            "path": artifact.path,
+            "content_type": content_type,
+            "bytes": len(content.encode("utf-8")),
+            "created_at": artifact.created_at,
+        }
 
     def _create_approval_for_task(
         self,

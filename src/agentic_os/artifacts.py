@@ -36,11 +36,14 @@ class ArtifactStore:
         artifact_type: str,
         content: Any,
         version: int = 1,
+        *,
+        extension: Optional[str] = None,
     ) -> ArtifactRecord:
         task_dir = self.base_dir / task_id
         task_dir.mkdir(parents=True, exist_ok=True)
         artifact_id = f"art_{uuid4().hex[:12]}"
-        extension = "json" if isinstance(content, (dict, list)) else "md"
+        if extension is None:
+            extension = "json" if isinstance(content, (dict, list)) else "md"
         path = task_dir / f"{artifact_id}.v{version}.{extension}"
         serialized = self._serialize(content)
         path.write_text(serialized, encoding="utf-8")

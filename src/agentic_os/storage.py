@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import secrets
 import sqlite3
 from pathlib import Path
 from typing import Any, Optional
@@ -8,8 +9,15 @@ from .models import (
     ApprovalRecord,
     ExecutionRecord,
     RequestClassification,
+    TaskExecutionRecord,
     TaskRecord,
+    TERMINAL_TASK_EXECUTION_STATUSES,
 )
+
+
+def generate_execution_id() -> str:
+    """Mint a fresh execution id. Prefix `exec_` + 16 hex chars."""
+    return f"exec_{secrets.token_hex(8)}"
 
 
 def utc_now_sql() -> str:
@@ -110,6 +118,27 @@ CREATE TABLE IF NOT EXISTS executions (
     FOREIGN KEY(task_id) REFERENCES tasks(id)
 );
 
+-- Per-dispatch execution lifecycle. Distinct from the legacy `executions`
+-- table (which is approval-keyed). A task may have many task_executions:
+-- one per dispatch, with ordinal ordering and explicit trigger.
+CREATE TABLE IF NOT EXISTS task_executions (
+    execution_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    trigger TEXT NOT NULL,
+    parent_execution_id TEXT,
+    status TEXT NOT NULL,
+    session_key TEXT,
+    started_at TEXT,
+    terminal_at TEXT,
+    reason TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    FOREIGN KEY(task_id) REFERENCES tasks(id),
+    FOREIGN KEY(parent_execution_id) REFERENCES task_executions(execution_id),
+    UNIQUE(task_id, ordinal)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_domain ON tasks(domain, created_at);
@@ -124,6 +153,9 @@ CREATE INDEX IF NOT EXISTS idx_audit_events_created_at ON audit_events(created_a
 CREATE INDEX IF NOT EXISTS idx_artifacts_task_id ON artifacts(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_approvals_task_id ON approvals(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_task_executions_task_id ON task_executions(task_id, ordinal);
+CREATE INDEX IF NOT EXISTS idx_task_executions_status ON task_executions(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_task_executions_session_key ON task_executions(session_key);
 """
 
 class Database:
@@ -153,6 +185,70 @@ class Database:
                 connection.execute("ALTER TABLE tasks ADD COLUMN paperclip_status TEXT")
             except sqlite3.OperationalError:
                 pass
+            try:
+                connection.execute("ALTER TABLE artifacts ADD COLUMN execution_id TEXT")
+            except sqlite3.OperationalError:
+                pass
+        self._backfill_task_executions()
+
+    def _backfill_task_executions(self) -> None:
+        """Idempotently backfill task_executions for tasks created before the
+        table existed.
+
+        Each pre-existing task that has no task_executions row gets exactly one
+        synthetic row with ordinal=1 and trigger=legacy_import. Status is
+        derived conservatively from the task's current state.
+
+        Safe to re-run: only tasks with zero existing rows are touched.
+        """
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT t.id, t.status, t.dispatch_session_key, t.created_at, t.updated_at
+                FROM tasks t
+                LEFT JOIN task_executions te ON te.task_id = t.id
+                WHERE te.execution_id IS NULL
+                """
+            ).fetchall()
+            if not rows:
+                return
+            for row in rows:
+                task_status = row["status"]
+                # Backend pipeline 'done' maps to execution 'succeeded' for
+                # the backfill snapshot. This is conservative: we cannot
+                # recover real per-execution outcomes from the task state
+                # alone. Operators can still read the task's result_summary.
+                if task_status == "done":
+                    exec_status = "succeeded"
+                    terminal_at = row["updated_at"]
+                elif task_status == "in_progress":
+                    exec_status = "running"
+                    terminal_at = None
+                else:
+                    # to_do and anything else: mark as a historical failed
+                    # dispatch so the decision rule treats it as terminal
+                    # and a fresh redispatch is allowed.
+                    exec_status = "failed"
+                    terminal_at = row["updated_at"]
+                connection.execute(
+                    """
+                    INSERT INTO task_executions (
+                        execution_id, task_id, ordinal, trigger, parent_execution_id,
+                        status, session_key, started_at, terminal_at, reason,
+                        created_at, updated_at
+                    ) VALUES (?, ?, 1, 'legacy_import', NULL, ?, ?, ?, ?, 'backfilled from task state', ?, ?)
+                    """,
+                    (
+                        generate_execution_id(),
+                        row["id"],
+                        exec_status,
+                        row["dispatch_session_key"],
+                        row["created_at"],
+                        terminal_at,
+                        row["created_at"],
+                        row["updated_at"],
+                    ),
+                )
 
     @staticmethod
     def _next_task_id(connection: sqlite3.Connection) -> str:
@@ -319,15 +415,29 @@ class Database:
         version: int,
         content_preview: Optional[str],
         created_at: str,
+        execution_id: Optional[str] = None,
     ) -> None:
         with self.connect() as connection:
             connection.execute(
                 """
-                INSERT INTO artifacts (id, task_id, artifact_type, path, version, content_preview, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO artifacts (id, task_id, artifact_type, path, version, content_preview, created_at, execution_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (artifact_id, task_id, artifact_type, path, version, content_preview, created_at),
+                (artifact_id, task_id, artifact_type, path, version, content_preview, created_at, execution_id),
             )
+
+    def list_artifacts_for_execution(self, execution_id: str) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, task_id, artifact_type, path, version, content_preview, created_at, execution_id
+                FROM artifacts
+                WHERE execution_id = ?
+                ORDER BY created_at ASC, id ASC
+                """,
+                (execution_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def insert_audit_event(self, *, task_id: str, event_type: str, payload_json: str) -> int:
         with self.connect() as connection:
@@ -801,6 +911,207 @@ class Database:
         if row is None:
             raise KeyError(f"execution with operation_key {operation_key} not found")
         return self._row_to_execution(row)
+
+    # ── Task-execution lifecycle (v2) ─────────────────────────────────────────
+
+    def allocate_task_execution(
+        self,
+        *,
+        task_id: str,
+        trigger: str,
+        parent_execution_id: Optional[str] = None,
+        session_key: Optional[str] = None,
+    ) -> TaskExecutionRecord:
+        """Insert a new task_execution with status=dispatched and ordinal=N+1.
+
+        Uses BEGIN IMMEDIATE to prevent two concurrent dispatches from
+        allocating the same ordinal for the same task.
+        """
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT COALESCE(MAX(ordinal), 0) + 1 AS next_ordinal "
+                "FROM task_executions WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            next_ordinal = int(row["next_ordinal"])
+            execution_id = generate_execution_id()
+            connection.execute(
+                """
+                INSERT INTO task_executions (
+                    execution_id, task_id, ordinal, trigger, parent_execution_id,
+                    status, session_key, started_at, terminal_at, reason
+                ) VALUES (?, ?, ?, ?, ?, 'dispatched', ?, NULL, NULL, NULL)
+                """,
+                (
+                    execution_id,
+                    task_id,
+                    next_ordinal,
+                    trigger,
+                    parent_execution_id,
+                    session_key,
+                ),
+            )
+            fetched = connection.execute(
+                "SELECT * FROM task_executions WHERE execution_id = ?",
+                (execution_id,),
+            ).fetchone()
+        return self._row_to_task_execution(fetched)
+
+    def get_task_execution(self, execution_id: str) -> Optional[TaskExecutionRecord]:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM task_executions WHERE execution_id = ?",
+                (execution_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_task_execution(row)
+
+    def latest_task_execution(self, task_id: str) -> Optional[TaskExecutionRecord]:
+        """Return the most recent task_execution for the given task, or None."""
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM task_executions
+                WHERE task_id = ?
+                ORDER BY ordinal DESC
+                LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_task_execution(row)
+
+    def list_task_executions(self, task_id: str) -> list[TaskExecutionRecord]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM task_executions WHERE task_id = ? ORDER BY ordinal ASC",
+                (task_id,),
+            ).fetchall()
+        return [self._row_to_task_execution(row) for row in rows]
+
+    def transition_task_execution(
+        self,
+        execution_id: str,
+        *,
+        status: str,
+        reason: Optional[str] = None,
+        session_key: Optional[str] = None,
+        mark_started: bool = False,
+        mark_terminal: Optional[bool] = None,
+    ) -> TaskExecutionRecord:
+        """Update a task_execution's status.
+
+        First-terminal-wins: if the row is already in a terminal status, raises
+        ValueError. Callers handle the conflict and decide whether to log an
+        audit anomaly. This prevents silent overwrites of completed work.
+        """
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute(
+                "SELECT * FROM task_executions WHERE execution_id = ?",
+                (execution_id,),
+            ).fetchone()
+            if current is None:
+                raise KeyError(f"unknown execution_id: {execution_id}")
+            if current["status"] in TERMINAL_TASK_EXECUTION_STATUSES:
+                raise ValueError(
+                    f"execution {execution_id} already terminal "
+                    f"({current['status']}); refusing to overwrite"
+                )
+            is_terminal = (
+                mark_terminal
+                if mark_terminal is not None
+                else status in TERMINAL_TASK_EXECUTION_STATUSES
+            )
+            updates = ["status = ?", f"updated_at = {utc_now_sql()}"]
+            values: list[Any] = [status]
+            if reason is not None:
+                updates.append("reason = ?")
+                values.append(reason)
+            if session_key is not None:
+                updates.append("session_key = ?")
+                values.append(session_key)
+            if mark_started and current["started_at"] is None:
+                updates.append(f"started_at = {utc_now_sql()}")
+            if is_terminal:
+                updates.append(f"terminal_at = {utc_now_sql()}")
+            values.append(execution_id)
+            connection.execute(
+                f"UPDATE task_executions SET {', '.join(updates)} WHERE execution_id = ?",
+                values,
+            )
+            refreshed = connection.execute(
+                "SELECT * FROM task_executions WHERE execution_id = ?",
+                (execution_id,),
+            ).fetchone()
+        return self._row_to_task_execution(refreshed)
+
+    def count_task_executions(self, task_id: str) -> int:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS c FROM task_executions WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+        return int(row["c"])
+
+    def sweep_stalled_task_executions(
+        self,
+        stall_timeout_seconds: int,
+    ) -> list[TaskExecutionRecord]:
+        """Find in-flight task_executions older than stall_timeout_seconds and
+        transition them to failed[stall_timeout].
+
+        In-flight = status in ('dispatched', 'running'). Staleness is measured
+        against created_at (dispatched moment). Uses transition_task_execution
+        so first-terminal-wins still applies: if a real callback arrives during
+        the sweep, ValueError is swallowed and that row is left alone.
+        """
+        cutoff_sql = f"datetime('now', '-{int(stall_timeout_seconds)} seconds')"
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT execution_id FROM task_executions
+                WHERE status IN ('dispatched', 'running')
+                  AND trigger != 'legacy_import'
+                  AND created_at < {cutoff_sql}
+                """
+            ).fetchall()
+        affected: list[TaskExecutionRecord] = []
+        for row in rows:
+            eid = row["execution_id"]
+            try:
+                rec = self.transition_task_execution(
+                    eid,
+                    status="failed",
+                    reason="stall_timeout",
+                )
+            except ValueError:
+                # Already terminal — real callback landed before sweep.
+                continue
+            except KeyError:
+                continue
+            affected.append(rec)
+        return affected
+
+    @staticmethod
+    def _row_to_task_execution(row: sqlite3.Row) -> TaskExecutionRecord:
+        return TaskExecutionRecord(
+            execution_id=row["execution_id"],
+            task_id=row["task_id"],
+            ordinal=int(row["ordinal"]),
+            trigger=row["trigger"],
+            parent_execution_id=row["parent_execution_id"],
+            status=row["status"],
+            session_key=row["session_key"],
+            started_at=row["started_at"],
+            terminal_at=row["terminal_at"],
+            reason=row["reason"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        ).validate()
 
     @staticmethod
     def _row_to_task(row: sqlite3.Row) -> TaskRecord:

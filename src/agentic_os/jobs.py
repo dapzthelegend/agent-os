@@ -106,6 +106,25 @@ def _make_backup_job(paths: "Paths", config: "AppConfig") -> ScheduledJob:
     )
 
 
+def _make_execution_stall_watchdog_job(paths: "Paths", config: "AppConfig") -> ScheduledJob:
+    """Backend-internal watchdog: transition in-flight task_executions whose
+    created_at exceeds the stall timeout to failed[stall_timeout]. Never reads
+    Paperclip fields — staleness is measured against execution dispatch time.
+    """
+    def _run():
+        from .service import AgenticOSService
+        return AgenticOSService(paths, config).sweep_stalled_executions(
+            stall_timeout_seconds=3600,
+        )
+
+    return ScheduledJob(
+        name="execution-stall-watchdog",
+        func=_run,
+        next_run_at=_every(300),
+        run_immediately=False,
+    )
+
+
 def _make_discord_approval_poll_job(paths: "Paths", config: "AppConfig") -> ScheduledJob:
     def _run():
         from .discord_approval_poller import poll_discord_approvals
@@ -138,6 +157,7 @@ def register_all_jobs(scheduler: BackgroundScheduler, paths: "Paths", config: "A
     scheduler.register(_make_health_check_job(paths, config))
     scheduler.register(_make_backup_job(paths, config))
     scheduler.register(_make_discord_approval_poll_job(paths, config))
+    scheduler.register(_make_execution_stall_watchdog_job(paths, config))
     # Daily recap is owned by the Paperclip routine:
     # http://127.0.0.1:3100/FRA/routines/8d3baf2d-4615-4461-aa11-f2886f41237d
 
